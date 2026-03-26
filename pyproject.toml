@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparton"
+version = "0.1.0"
+description = "Sparton: Fast and Memory-Efficient Triton Kernel for Learned Sparse Retrieval"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name="Your Name", email="you@example.com"}]
+
+dependencies = [
+    "triton>=3.3.1",
+    "torch>=2.7.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/thongnt99/sparton"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
