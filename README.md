@@ -21,7 +21,7 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 from sparton import SpartonHead
 
 # Load a SPLADE model
-llm = AutoModelForMaskedLM.from_pretrained("naver/splade-v3")
+llm = AutoModelForMaskedLM.from_pretrained("naver/splade-v3").cuda()
 tokenizer = AutoTokenizer.from_pretrained("naver/splade-v3")
 
 # Create SpartonHead and tie weights to the pretrained decoder
