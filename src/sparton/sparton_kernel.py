@@ -9,7 +9,7 @@ import torch.amp as amp
 from torch import nn
 from torch.autograd import gradcheck
 import torch._dynamo as dynamo
-from typing import Tuple
+from typing import Optional, Tuple
 
 torch.set_float32_matmul_precision('high')
 
@@ -483,6 +483,7 @@ def fused_sparton_bwd_kernel_with_bias(
     seq_len, # S, 
     hidden_dim: tl.constexpr, # D, 
     vocab_size: tl.constexpr, # V, 
+    HAS_BIAS: tl.constexpr,
     BLOCK_B: tl.constexpr, # batch-block
     BLOCK_V: tl.constexpr, # seq-block
     BLOCK_D: tl.constexpr, # hidden-dim-block
@@ -531,9 +532,9 @@ def fused_sparton_bwd_kernel_with_bias(
     relu_log1p_grad = tl.where(block_max_logits > 0, grad_out * tl.exp(-block_max_logits), 0.0).to(tl.float32)
 
     
-    # calculate gradient with regard to bias:
     mask_v = offs_v < vocab_size
-    tl.atomic_add(bias_grad_ptr + offs_v, tl.sum(relu_log1p_grad, axis=0), mask = mask_v, sem = "relaxed")
+    if HAS_BIAS:
+        tl.atomic_add(bias_grad_ptr + offs_v, tl.sum(relu_log1p_grad, axis=0), mask = mask_v, sem = "relaxed")
 
     # address of the vocab emb block
     e_ptrs = embed_ptr + offs_v[:, None] * hidden_dim + offs_d[None, :]
@@ -572,7 +573,8 @@ def fused_sparton_bwd_with_bias(
     embed,
     hidden_grad, 
     embed_grad,
-    bias_grad):
+    bias_grad,
+    has_bias: bool):
     B, S, D = hidden.shape
     V, D_e = embed.shape
     assert D == D_e
@@ -591,7 +593,8 @@ def fused_sparton_bwd_with_bias(
         batch_size=B,
         seq_len=S,
         hidden_dim=D,
-        vocab_size=V
+        vocab_size=V,
+        HAS_BIAS=has_bias,
     )
     # print("Best backward config:", fused_sparton_bwd_kernel_with_bias.best_config)
     return hidden_grad, embed_grad, bias_grad, None
@@ -640,11 +643,15 @@ def fused_sparton_bwd_with_bias(
 # fused_mlm_splade = FusedSparton.apply
 
 # register new op
-@torch.library.custom_op("sparton::fused_sparton_fwd", mutates_args=())
+@torch.library.custom_op(
+    "sparton::fused_sparton_fwd",
+    mutates_args=(),
+    schema="(Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)",
+)
 def fused_sparton_fwd_op(
     hidden: torch.Tensor,   # [B,S,D], cuda
     embed: torch.Tensor,    # [V,D],   cuda
-    bias: torch.Tensor,     # [V],     cuda  (if you sometimes have None, see note below)
+    bias: Optional[torch.Tensor],     # [V] or None
     mask: torch.Tensor,     # [B,S],   cuda
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden.is_cuda, "sparton::fused_sparton_fwd only supports CUDA"
@@ -660,29 +667,41 @@ def _(hidden, embed, bias, mask):
     out_idx = torch.empty((B, V), device=hidden.device, dtype=torch.int64)
     return out_scores, out_idx
 
-@torch.library.custom_op("sparton::fused_sparton_bwd", mutates_args=())
+@torch.library.custom_op(
+    "sparton::fused_sparton_bwd",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_out, Tensor max_scores, Tensor max_idx, Tensor hidden, "
+        "Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor, Tensor?)"
+    ),
+)
 def fused_sparton_bwd_op(
     grad_out: torch.Tensor,     # [B,V]
     max_scores: torch.Tensor,   # [B,V]
     max_idx: torch.Tensor,      # [B,V] int64
     hidden: torch.Tensor,       # [B,S,D]
     embed: torch.Tensor,        # [V,D]
-    bias: torch.Tensor,         # [V]
+    bias: Optional[torch.Tensor],         # [V] or None
     mask: torch.Tensor,         # [B,S] (not used by your bwd kernel, but included for signature symmetry)
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert grad_out.is_cuda, "sparton::fused_sparton_bwd only supports CUDA"
     grad_out = grad_out.contiguous()
 
     hidden_grad = torch.zeros_like(hidden, dtype=torch.float32)
     embed_grad  = torch.zeros_like(embed,  dtype=torch.float32)
-    bias_grad   = torch.zeros_like(bias,   dtype=torch.float32)
+    bias_grad = (
+        torch.zeros_like(bias, dtype=torch.float32)
+        if bias is not None
+        else torch.empty((), device=grad_out.device, dtype=torch.float32)
+    )
 
     hidden_grad, embed_grad, bias_grad, _ = fused_sparton_bwd_with_bias(
         grad_out, max_scores, max_idx,
         hidden, embed,
-        hidden_grad, embed_grad, bias_grad
+        hidden_grad, embed_grad, bias_grad,
+        bias is not None,
     )
-    return hidden_grad, embed_grad, bias_grad
+    return hidden_grad, embed_grad, bias_grad if bias is not None else None
 
 @fused_sparton_bwd_op.register_fake
 def _(grad_out, max_scores, max_idx, hidden, embed, bias, mask):
@@ -690,7 +709,7 @@ def _(grad_out, max_scores, max_idx, hidden, embed, bias, mask):
     return (
         torch.empty_like(hidden, dtype=torch.float32),
         torch.empty_like(embed,  dtype=torch.float32),
-        torch.empty_like(bias,   dtype=torch.float32),
+        torch.empty_like(bias, dtype=torch.float32) if bias is not None else None,
     )
 
 def _setup_context(ctx, inputs, output):

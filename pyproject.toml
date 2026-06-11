@@ -7,7 +7,7 @@ name = "sparton"
 version = "0.1.0"
 description = "Sparton: Fast and Memory-Efficient Triton Kernel for Learned Sparse Retrieval"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name="Your Name", email="you@example.com"}]
 
@@ -16,8 +16,31 @@ dependencies = [
     "torch>=2.7.1",
 ]
 
+[dependency-groups]
+test = [
+    "pytest>=9.0,<10",
+]
+
 [project.urls]
 Homepage = "https://github.com/thongnt99/sparton"
+
+[tool.pytest]
+minversion = "9.0"
+addopts = [
+    "-ra",
+    "--import-mode=importlib",
+]
+testpaths = ["tests"]
+pythonpath = ["src"]
+strict = true
+strict_config = true
+strict_markers = true
+strict_parametrization_ids = true
+strict_xfail = true
+markers = [
+    "cuda: tests that require a CUDA device",
+    "slow: tests that are comparatively expensive",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
