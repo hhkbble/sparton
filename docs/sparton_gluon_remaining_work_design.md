@@ -19,31 +19,43 @@ probe provenance and rerun commands are in Appendices A and B.
 
 ### 1.1 Repository state
 
-- Branch `codex/milestone2-bias-none-docs`, latest commit
-  `48b55fa Fix no-bias backward and add milestone docs`.
-- Milestones 1 and 2 of the review's revised order are complete:
+- Branch `codex/milestone2-bias-none-docs`, latest committed baseline
+  `48b55fa Fix no-bias backward and add milestone docs`; M3-M5 are complete in
+  the current working tree and documented in
+  [sparton_milestone5_naive_triton_memo.md](sparton_milestone5_naive_triton_memo.md).
+- Milestones 1 through 5 of the review's revised order are complete:
   - PyTorch semantic reference and pytest 9 coverage
-    (`tests/test_sparton_kernel.py`, 11 tests) matching the kernel's
+    (`tests/test_sparton_kernel.py`, 25 tests) matching the kernel's
     zero-baseline, strict-`>` index semantics.
   - `bias=None` backward fixed in the hybrid path; custom-op schemas declare
     optional bias.
-- The only implemented backend is the hybrid path:
+  - Hybrid implementation extracted to `_backend_hybrid.py`; `sparton_kernel.py`
+    is the public router/facade.
+  - Backend selection via `SpartonHead(..., backend=...)` and import-time
+    `SPARTON_BACKEND`, with hybrid as the default.
+  - Triton-only `naive` fused forward registered as `sparton::naive_fwd`; it
+    reuses the current hybrid backward through custom-op autograd.
+- The production/default backend is still the hybrid path:
   `SpartonHead.forward -> fused_sparton_fwd_op ->
   fused_sparton_fwd_with_indices` (compiled `matmul`/`matmul_bias` per vocab
   tile) `-> reduce_seq_max_log1p_relu_with_indices` (Triton reduction), with
   `fused_sparton_bwd_op` -> `fused_sparton_bwd_kernel_with_bias`
   (`HAS_BIAS: tl.constexpr`).
-- `SpartonHead` has **no** `backend` argument. There is no backend routing, no
-  `_backend_hybrid.py`, no naive Triton fused forward, and no Gluon code in the
-  repository.
+- `SpartonHead` now accepts `backend=None|"hybrid"|"naive"`; `None` resolves to
+  the import-time `SPARTON_BACKEND` value or `"hybrid"`. `backend="optimized"`
+  raises until the Gluon milestones land. There is still no Gluon runtime or
+  optimized backend in the repository.
 
 ### 1.2 Validation ledger (exact results, this session)
 
 ```bash
 PYTHONPATH=src /workspace/venvs/sparton/bin/python -m py_compile \
   src/sparton/__init__.py src/sparton/sparton_kernel.py \
-  training/model.py training/train.py tests/conftest.py tests/test_sparton_kernel.py
-# -> passed
+  src/sparton/_backend_hybrid.py src/sparton/_backend_naive_triton.py \
+  training/model.py training/train.py tests/conftest.py tests/test_sparton_kernel.py \
+  benchmarks/bench_sparton_baseline.py \
+  benchmarks/bench_hybrid_baseline.py benchmarks/bench_naive_baseline.py
+# -> passed after M5
 
 TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas /workspace/venvs/sparton/bin/python -m pytest -q
 # run 1 (concurrent with another Triton-compiling process):
@@ -52,11 +64,26 @@ TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas /workspace/venvs/sparton/bin/py
 # focused rerun of bias-bf16 alone: 1 passed
 # run 2 (serial):                   11 passed, 1 warning in 3.14s
 # run 3 (hardened env, see §2.4):   11 passed, 1 warning in 20.47s (cold Inductor cache)
+# M5 hardened env run:              25 passed, 1 warning in 7.26s
+
+PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_naive_baseline.py
+# M5 compatibility wrapper shape B=4 S=64 D=64 V=4096:
+#   hybrid fwd bias/no-bias: 0.019 / 0.014 ms
+#   naive  fwd bias/no-bias: 0.008 / 0.008 ms
+#   peak extra memory: hybrid 2.31 MiB, naive 0.16 MiB, full logits 2.00 MiB
+
+PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
+# Canonical merged benchmark after M5: defaults model naver/splade-code-06B
+# (D=1024, V=151936, bf16), uses all-ones masks, and reports exactly one row
+# for each fixed B/S pair in B={4,8,16}, S={256,512,768}.
+# Full default run completed and emitted the 9-row Markdown table recorded in
+# sparton_milestone5_naive_triton_memo.md.
 
 # custom-op schemas:
 sparton::fused_sparton_fwd(Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)
 sparton::fused_sparton_bwd(Tensor grad_out, Tensor max_scores, Tensor max_idx, Tensor hidden,
                            Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor, Tensor?)
+sparton::naive_fwd(Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)
 ```
 
 The `bias-bf16` failure is **not** a kernel defect and is **not** random; see
@@ -544,15 +571,12 @@ added per milestone. Nothing moves until M3's no-behavior-change gate passes.
 
 ## 5. Public API stance
 
-- **Now (M3–M5):** `SpartonHead(vocab_size, hidden_dim, use_bias=False)` —
-  unchanged. No backend argument. Experiments select backends via
-  `SPARTON_BACKEND` only. CUDA-only export behavior of
-  `src/sparton/__init__.py` unchanged.
-- **At M4 (routing proven):** add keyword-only `backend: str = "hybrid"` to
-  `SpartonHead.__init__`. Adding the argument with a hybrid default is
-  non-breaking; `"naive"`/`"optimized"` raise until their milestones land.
-  Public names stay implementation-descriptive (`hybrid`, `naive`,
-  `optimized`) and architecture-neutral.
+- **After M5:** `SpartonHead(vocab_size, hidden_dim, use_bias=False, *,
+  backend: str | None = None)`. `None` resolves to `SPARTON_BACKEND` as read at
+  import time, or `"hybrid"` when the env var is unset. `"hybrid"` remains the
+  default production path; `"naive"` selects the M5 Triton-only fused-forward
+  baseline; `"optimized"` raises until the Gluon milestones land. CUDA-only
+  export behavior of `src/sparton/__init__.py` is unchanged.
 - **Default switch to `optimized`:** only via the promotion gates in §12, as a
   deliberate, changelog-documented release decision. Until then every public
   default remains the hybrid path.
@@ -567,13 +591,14 @@ added per milestone. Nothing moves until M3's no-behavior-change gate passes.
 ## 6. Corrected milestone order
 
 M1 (reference + tests) and M2 (`bias=None` backward) are **done** (commit
-`48b55fa`). Remaining order, each with entry/exit gates:
+`48b55fa`). M3-M5 are **done** in the current working tree. Remaining order,
+each with entry/exit gates:
 
 | # | Milestone | Exit gates |
 |---|---|---|
-| M3 | Extract `_backend_hybrid.py`, no behavior change | pytest 11/11; schema strings identical; dev-shape fwd and fwd+bwd timings within noise (±5%) of §3.2; no new imports at package import time |
-| M4 | Router + `SPARTON_BACKEND` + `backend="hybrid"` kwarg | routing unit tests; default proven hybrid; unavailable backend raises with reason |
-| M5 | `_backend_naive_triton.py` fused forward (`tl.dot`, no Gluon); backward is NOT reimplemented — the naive backend registers its own autograd that calls the current Triton backward (B1) | matches reference on the full §10 correctness matrix incl. ties/tails/masks/no-bias/BF16; allocator check shows no `[B,S,V_tile]`; measured and recorded vs hybrid (expected slower; no perf gate) |
+| M3 | Extract `_backend_hybrid.py`, no behavior change | **Done.** Hybrid op names and schemas preserved; public facade re-exports existing helpers. |
+| M4 | Router + `SPARTON_BACKEND` + `backend` kwarg | **Done.** Default proven hybrid; `naive` selectable; invalid/`optimized` selections raise with reason. |
+| M5 | `_backend_naive_triton.py` fused forward (`tl.dot`, no Gluon); backward is NOT reimplemented — the naive backend registers its own autograd that calls the current Triton backward (B1) | **Done.** Correctness/router/schema/memory tests pass; allocator check shows output-only peak on the measured shape; benchmark recorded vs hybrid. |
 | M6 | `_gluon_runtime.py` shim + Gluon smoke test (probe/bench scripts already live in `benchmarks/`; extend as needed) | shim imports lazily; capability whitelist unit-tested; `mma_v2` smoke kernel passes on RTX 5090; smoke is skipped cleanly where Gluon/CUDA absent |
 | M7 | In-repo Gluon GEMM microbenchmark + policy generator + tuning sweep | correctness vs cuBLAS on dev shapes fp16 **and bf16**; **>= 85% of cuBLAS** on at least `M=4096, K=768, N=30522` and one stress shape; policy generator only emits configs satisfying §7.2 constraints |
 | M8 | Gluon fused forward O1 (non-persistent) | epilogue probe (§3.6 item 1) passed first; full correctness matrix vs reference incl. index policy; memory gate: peak extra < 2x outputs (vs hybrid's ~140 MiB); perf recorded, no gate |
@@ -873,8 +898,10 @@ ncu --nvtx --nvtx-include "hybrid_fwd/" \
 The probe and benchmark scripts were promoted into the repository at
 `benchmarks/` on 2026-06-11 (see `benchmarks/README.md`):
 `probe_mma_matrix.py` (MMA availability), `bench_gluon_gemm.py` (TMA+mma_v2
-GEMM, subprocess-per-config with timeouts), `bench_hybrid_baseline.py`,
-`repro_inductor_env_defects.py` (environment-defect reproduction),
+GEMM, subprocess-per-config with timeouts), `bench_sparton_baseline.py`
+(merged hybrid/naive fixed-grid baselines),
+`bench_hybrid_baseline.py` and `bench_naive_baseline.py` (compatibility
+wrappers), `repro_inductor_env_defects.py` (environment-defect reproduction),
 `ncu_runner.py` and `ncu_targets.py` (fixed-config launchers and NVTX ranges
 for the §3.5 counter profiles). The load-bearing kernel, verbatim
 as validated (best config: `BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
@@ -967,6 +994,7 @@ env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -c "import torch; im
 # Probes and benchmarks (see benchmarks/README.md):
 env $ENV /workspace/venvs/sparton/bin/python -u benchmarks/probe_mma_matrix.py
 env $ENV /workspace/venvs/sparton/bin/python -u benchmarks/bench_gluon_gemm.py
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_hybrid_baseline.py
 
 # nsys timeline + per-kernel summary:

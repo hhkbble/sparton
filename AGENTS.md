@@ -102,9 +102,12 @@ the source-grounded operating guide for future agents and contributors.
 
 ## Core Kernel Invariants
 
-- Main runtime path: `SpartonHead.forward` calls `fused_sparton_fwd_op`, which
-  calls `fused_sparton_fwd_with_indices`, tiled matmul helpers, and
-  `reduce_seq_max_log1p_relu_with_indices`.
+- `SpartonHead.forward` resolves a backend at construction and calls the bound
+  forward wrapper. The default `hybrid` path calls `fused_sparton_fwd_op`,
+  which calls `fused_sparton_fwd_with_indices`, tiled matmul helpers, and
+  `reduce_seq_max_log1p_relu_with_indices`; the M5 `naive` path calls
+  `sparton::naive_fwd` for a Triton-only fused forward and reuses the hybrid
+  backward.
 - Autograd registration saves max scores, max indices, hidden states, decoder
   weights, bias, and mask. Backward uses `fused_sparton_bwd_op` and accumulates
   `hidden_grad`, `embed_grad`, and `bias_grad` in `float32`.
@@ -124,8 +127,9 @@ the source-grounded operating guide for future agents and contributors.
 - There are two forward-style reduction helpers: one returns max values plus
   indices for autograd, and one returns only values. Keep their intended memory
   tradeoff clear when editing.
-- If adding a `backend` argument later, preserve current behavior as the
-  `hybrid` baseline and do not introduce silent hardware-feature fallbacks.
+- Preserve current behavior as the `hybrid` baseline and do not introduce
+  silent hardware-feature fallbacks. `backend="optimized"` should continue to
+  fail clearly until the Gluon milestones are implemented and validated.
 
 ## Training and Hugging Face References
 

@@ -45,6 +45,25 @@ sparse_reps = head(hidden, inputs["attention_mask"])  # [1, vocab_size]
 
 See [model.py](training/model.py) for a full example integrating Sparton into a SPLADE model.
 
+### Backend Selection
+
+`SpartonHead` defaults to the current hybrid backend:
+
+```python
+head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="hybrid")
+```
+
+For backend-refactor debugging, M5 adds an experimental Triton-only fused
+forward baseline:
+
+```python
+head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="naive")
+```
+
+You can also set `SPARTON_BACKEND=naive` before importing `sparton` to change
+the default for newly constructed heads. The `optimized` Gluon backend is still
+under development and is not selectable yet.
+
 ## How It Works
 
 Standard SPLADE computes sparse representations in multiple steps:

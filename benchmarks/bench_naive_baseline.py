@@ -1,4 +1,4 @@
-"""Compatibility wrapper for the old hybrid SPLADE dev-shape baseline."""
+"""Compatibility wrapper for the M5 moderate-shape naive baseline."""
 
 from __future__ import annotations
 
@@ -11,17 +11,17 @@ if __name__ == "__main__":
     main(
         [
             "--batch-sizes",
-            "32",
+            "4",
             "--seq-lens",
-            "128",
+            "64",
             "--dim",
-            "768",
+            "64",
             "--vocab",
-            "30522",
+            "4096",
             "--dtype",
             "fp16",
             "--naive-policy",
-            "off",
+            "on",
         ]
         + sys.argv[1:]
     )
