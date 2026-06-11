@@ -8,8 +8,23 @@ the source-grounded operating guide for future agents and contributors.
 - `src/sparton/` is the installable Python package. Its public surface is
   currently `SpartonHead`, exported from `src/sparton/__init__.py` only when
   CUDA is available.
-- `src/sparton/sparton_kernel.py` contains the Triton and PyTorch custom-op
-  implementation for the fused SPLADE-style projection head.
+- `src/sparton/sparton_kernel.py` is the public facade and backend router
+  (`resolve_backend`, `SpartonHead`, re-exports, lazy `optimized` symbols).
+  Backend implementations live beside it:
+  - `_backend_hybrid.py` — default backend (compiled tiled matmul + Triton
+    reduction + the single Triton backward used by all backends);
+  - `_backend_naive_triton.py` — `tl.dot` fused-forward debug baseline with
+    bounded autotune;
+  - `_backend_optimized_gluon.py` — experimental Gluon TMA + `mma_v2` fused
+    forward with policy autotune;
+  - `_gluon_runtime.py` — the only module allowed to import
+    `triton.experimental.gluon`; lazy shim plus capability whitelist;
+  - `_gluon_policy_runtime.py` — lazy host-side policy/config/descriptor
+    helpers shared by the optimized backend and the GEMM benchmark;
+  - `_runtime_policy.py` — pure-Python policy generation (no torch/triton at
+    module level; imported by tests on CPU-only machines);
+  - `_validation.py` — shared input-contract validation used by the
+    per-backend forward wrappers.
 - `training/` is a Hugging Face training/benchmark example, not a separate
   package. `training/model.py` wraps Hugging Face MLM backbones, and
   `training/train.py` wires dataset loading, tokenization, contrastive loss,
@@ -17,9 +32,11 @@ the source-grounded operating guide for future agents and contributors.
 - `tests/` contains the pytest 9 kernel/reference test suite. Pytest is
   configured in `pyproject.toml`.
 - `benchmarks/` contains validated probe/benchmark scripts for the backend
-  refactor (MMA availability, Gluon GEMM microbenchmark, hybrid baselines,
-  profiler launchers); usage in `benchmarks/README.md`, interpretation in
-  `docs/sparton_gluon_remaining_work_design.md`.
+  refactor (MMA availability, Gluon GEMM microbenchmark, merged backend
+  baselines, profiler launchers); usage in `benchmarks/README.md`. The forward
+  plan and interpretation live in `docs/sparton_remaining_work_design_v2.md`;
+  `docs/sparton_gluon_remaining_work_design.md` remains authoritative for
+  platform facts and measured evidence.
 - There is currently no lint config, typecheck config, CI config, or lockfile.
 
 ## Orientation Before Changes
@@ -103,11 +120,14 @@ the source-grounded operating guide for future agents and contributors.
 ## Core Kernel Invariants
 
 - `SpartonHead.forward` resolves a backend at construction and calls the bound
-  forward wrapper. The default `hybrid` path calls `fused_sparton_fwd_op`,
-  which calls `fused_sparton_fwd_with_indices`, tiled matmul helpers, and
-  `reduce_seq_max_log1p_relu_with_indices`; the M5 `naive` path calls
-  `sparton::naive_fwd` for a Triton-only fused forward and reuses the hybrid
-  backward.
+  per-backend wrapper. The layering rule is: wrapper (`hybrid_forward`,
+  `naive_forward`, `optimized_forward`) → shared `_validation.py` contract
+  checks → `.contiguous()` canonicalization → custom op (`sparton::
+  fused_sparton_fwd`, `sparton::naive_fwd`, `sparton::optimized_fwd`).
+  Wrappers are the only public callables; the ops assume validated, contiguous
+  inputs, and raw-op callers (for example profiling targets) bypass validation
+  by design — do not "fix" that by validating inside the ops. All three
+  forwards delegate backward to `fused_sparton_bwd_op`.
 - Autograd registration saves max scores, max indices, hidden states, decoder
   weights, bias, and mask. Backward uses `fused_sparton_bwd_op` and accumulates
   `hidden_grad`, `embed_grad`, and `bias_grad` in `float32`.
@@ -128,8 +148,16 @@ the source-grounded operating guide for future agents and contributors.
   indices for autograd, and one returns only values. Keep their intended memory
   tradeoff clear when editing.
 - Preserve current behavior as the `hybrid` baseline and do not introduce
-  silent hardware-feature fallbacks. `backend="optimized"` should continue to
-  fail clearly until the Gluon milestones are implemented and validated.
+  silent hardware-feature fallbacks. `optimized` is an experimental opt-in
+  (CUDA sm_80+ plus importable `triton.experimental.gluon`); hybrid remains
+  the default until the promotion gates in
+  `docs/sparton_remaining_work_design_v2.md` (M10) pass. An unavailable
+  selected backend must keep raising with the reason.
+- Index semantics across backends: indices are meaningful only where the score
+  is positive; within a backend ties resolve to the lowest sequence index;
+  across backends with different accumulation precision the near-tie winner is
+  unspecified. Random-input tests must use the tie-aware
+  `assert_index_contract` helper, not exact index equality.
 
 ## Training and Hugging Face References
 
@@ -158,10 +186,11 @@ the source-grounded operating guide for future agents and contributors.
 - For brand-new untracked docs, use `git diff --no-index`, for example:
   `git diff --no-index -- /dev/null CHANGELOG.md`
 - Syntax check for the current Python files:
-  `/workspace/venvs/sparton/bin/python -m py_compile src/sparton/__init__.py src/sparton/sparton_kernel.py training/model.py training/train.py tests/conftest.py tests/test_sparton_kernel.py`
+  `/workspace/venvs/sparton/bin/python -m py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py`
 - Import check from source:
   `PYTHONPATH=src /workspace/venvs/sparton/bin/python -c "import sparton; print(sparton.__all__)"`
-- Pytest suite:
+- Pytest suite (full; append `-m "not slow"` for the quick loop that skips the
+  non-tiny shape and torch.compile coverage):
   `TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas /workspace/venvs/sparton/bin/python -m pytest -v`
 - CUDA/Triton probes in this workspace should include:
   `TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas`.
@@ -174,19 +203,16 @@ the source-grounded operating guide for future agents and contributors.
 
 ## Known Sharp Edges
 
-- `pyproject.toml` declares `license = {text = "MIT"}`, while `LICENSE` and the
-  upstream repository indicate Apache-2.0. Do not silently "fix" this in
-  unrelated work.
 - The local Git remote is `https://github.com/hhkbble/sparton.git`; the README
   and package metadata reference `https://github.com/thongnt99/sparton` and the
   citation references `https://github.com/thongnt99/lsr-kernel`.
-- `training/model.py` error text for invalid heads mentions older names
-  (`pytorch`, `triton`) even though the accepted values are `torch`,
-  `compiled`, and `sparton`.
-- `SpartonHead.load` prints `"no bias"` when a bias is absent; preserve or
-  change this only as part of an explicit logging/API cleanup.
-- Importing `sparton_kernel.py` prints the active device. Account for this in
-  tests or command output comparisons.
+- The `pyproject.toml` `authors` field is still the upstream placeholder; the
+  Homepage URL points at the upstream repository. Changing either is an
+  ownership decision, not a cleanup.
+- Importing `sparton` is silent on stdout; diagnostics go through the
+  `"sparton"` `logging` logger at DEBUG level (device banner,
+  `SpartonHead.load` missing-bias note). A regression test enforces the
+  silent import.
 - `SpartonHead` has no CPU fallback. CPU-only environments should use PyTorch
   reference paths, not the Sparton kernel.
 

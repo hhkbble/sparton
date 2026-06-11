@@ -6,6 +6,7 @@ import torch
 
 from ._backend_hybrid import fused_sparton_bwd_op
 from ._gluon_runtime import autotune, gl, gluon, mbarrier, mma_v2, tma
+from ._validation import validate_forward_inputs
 from ._gluon_policy_runtime import (
     configs_for_policies,
     element_ty_for_dtype,
@@ -43,6 +44,11 @@ def get_optimized_forward_configs():
 
 def _problem_from_autotune_args(named_args, kwargs) -> ProblemSpec:
     get_arg = lambda name: kwargs[name] if name in kwargs else named_args[name]
+    # Policy derivation consumes only the element byte-size, and both supported
+    # dtypes (fp16/bf16) are 16-bit, so "fp16" stands in for either. fp16 and
+    # bf16 never share an autotune cache entry because Triton appends the
+    # tensor-argument dtypes to its cache key. _launch_optimized_fwd asserts
+    # the 16-bit assumption.
     return ProblemSpec(
         M=int(get_arg("B")) * int(get_arg("S")),
         N=int(get_arg("V")),
@@ -65,6 +71,12 @@ def _argmax_strict_combine(value_a, index_a, value_b, index_b):
     return gl.where(take_b, value_b, value_a), gl.where(take_b, index_b, index_a)
 
 
+# The TMA + mma_v2 mainloop below intentionally mirrors the GEMM benchmark
+# kernel in benchmarks/bench_gluon_gemm.py; the kernels stay separate because
+# this one runs the Sparton max/argmax epilogue while the benchmark
+# materializes C, and the planned persistent rewrite will diverge them
+# further. See docs/sparton_remaining_work_design_v2.md (D2) before
+# deduplicating.
 @autotune(
     configs=get_optimized_forward_configs(),
     key=["B", "S", "D", "V"],
@@ -289,6 +301,9 @@ def _launch_optimized_fwd(
     assert mask.shape == (B, S)
     if bias is not None:
         assert bias.shape == (V,)
+    assert hidden.element_size() == 2, (
+        "policy derivation assumes 16-bit elements (fp16/bf16)"
+    )
 
     scores = torch.empty((B, V), device=hidden.device, dtype=hidden.dtype)
     indices = torch.empty((B, V), device=hidden.device, dtype=torch.int64)
@@ -376,6 +391,7 @@ def optimized_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    validate_forward_inputs(hidden, embed, bias, mask, backend="optimized")
     hidden = hidden.contiguous()
     embed = embed.contiguous()
     mask = mask.contiguous()

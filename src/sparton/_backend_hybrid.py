@@ -1,18 +1,16 @@
-import gc
-import time
+import logging
 
 import triton
 import triton.language as tl
 import torch
-import torch.amp as amp
-from torch.autograd import gradcheck
-import torch._dynamo as dynamo
 from typing import Optional, Tuple
 
-torch.set_float32_matmul_precision('high')
+from ._validation import validate_forward_inputs
+
+logger = logging.getLogger("sparton")
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-print(f"Sparton using device: {DEVICE}")
+logger.debug("Sparton using device: %s", DEVICE)
 
 
 def get_fast_forward_configs():
@@ -391,23 +389,6 @@ def fused_sparton_fwd(hidden, embed, bias, mask):
     sparse_reps = torch.cat(sparse_reps_tiles, dim=1)  # [B, V]
     return sparse_reps
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 4, 'BLOCK_D': 16, 'GROUP_SIZE': 16}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 4, 'BLOCK_D': 16, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 1, 'BLOCK_D': 16, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 16, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 32, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 32, 'BLOCK_V': 2, 'BLOCK_D': 32, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 256, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 256, 'GROUP_SIZE': 8}, num_stages=1, num_warps=4),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 4, 'BLOCK_D': 256, 'GROUP_SIZE': 8}, num_stages=1, num_warps=4),
-#         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 2, 'BLOCK_D': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-#     ],
-#     key=['batch_size', 'vocab_size', 'seq_len', 'hidden_dim'],
-#     reset_to_zero=['hidden_grad_ptr', 'embed_grad_ptr', 'bias_grad_ptr']
-# )
 def get_fast_bwd_configs():
     return [
         triton.Config({'BLOCK_B': 16, 'BLOCK_V': 16, 'BLOCK_D': 32, 'GROUP_SIZE': 8}, num_stages=2, num_warps=4),
@@ -594,51 +575,8 @@ def fused_sparton_bwd_with_bias(
         vocab_size=V,
         HAS_BIAS=has_bias,
     )
-    # print("Best backward config:", fused_sparton_bwd_kernel_with_bias.best_config)
-    return hidden_grad, embed_grad, bias_grad, None
+    return hidden_grad, embed_grad, bias_grad
 
-
-# class FusedSparton(torch.autograd.Function):
-#     @staticmethod
-#     @amp.custom_fwd(device_type='cuda')
-#     def forward(ctx, hidden, embed, bias, mask):
-#         if hidden.requires_grad or embed.requires_grad:
-#             max_scores, max_idx = fused_sparton_fwd_with_indices(hidden, embed, bias, mask)
-#             ctx.save_for_backward(
-#                 max_scores,
-#                 max_idx,
-#                 hidden,
-#                 embed,
-#                 bias
-#             )
-#         else:
-#             # to just squeeze out some memory s
-#             max_scores = fused_sparton_fwd(hidden, embed, bias, mask)
-#         return max_scores
-
-#     @staticmethod
-#     @amp.custom_bwd(device_type='cuda')
-#     def backward(ctx, grad_output):
-#         # grad_output = grad_output
-#         grad_output = grad_output.contiguous()
-#         max_scores, max_idx, hidden, embed, bias = ctx.saved_tensors
-#         B, S, D = hidden.shape
-#         V, D_e = embed.shape
-#         assert D == D_e
-#         assert max_scores.shape == (B, V)
-#         assert max_idx.shape == (B, V)
-#         if hidden.requires_grad or embed.requires_grad:
-#             hidden = hidden.contiguous()
-#             embed = embed.contiguous()
-#             bias = bias.contiguous()
-#             hidden_grad = torch.zeros_like(hidden, dtype=torch.float32) # should be in float 32 for gradient accumulation
-#             embed_grad = torch.zeros_like(embed, dtype=torch.float32) # should be in float 32 for gradient accumulation
-#             bias_grad = torch.zeros_like(bias, dtype=torch.float32) # should be in float 32 for gradient accumulation
-#             return fused_sparton_bwd_with_bias(grad_output, max_scores, max_idx, hidden, embed, hidden_grad, embed_grad, bias_grad)
-#         else:
-#             return None, None, None, None
-
-# fused_mlm_splade = FusedSparton.apply
 
 # register new op
 @torch.library.custom_op(
@@ -693,7 +631,7 @@ def fused_sparton_bwd_op(
         else torch.empty((), device=grad_out.device, dtype=torch.float32)
     )
 
-    hidden_grad, embed_grad, bias_grad, _ = fused_sparton_bwd_with_bias(
+    hidden_grad, embed_grad, bias_grad = fused_sparton_bwd_with_bias(
         grad_out, max_scores, max_idx,
         hidden, embed,
         hidden_grad, embed_grad, bias_grad,
@@ -722,3 +660,20 @@ def _backward(ctx, grad_scores, grad_idx):
     return hidden_g, embed_g, bias_g, None
 
 fused_sparton_fwd_op.register_autograd(_backward, setup_context=_setup_context)
+
+
+def hybrid_forward(
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    validate_forward_inputs(hidden, embed, bias, mask, backend="hybrid")
+    # Canonicalize before the op so autograd saves contiguous tensors; the
+    # backward kernel computes flat offsets that assume dense [B, S, D] strides.
+    hidden = hidden.contiguous()
+    embed = embed.contiguous()
+    mask = mask.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    return fused_sparton_fwd_op(hidden, embed, bias, mask)

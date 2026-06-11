@@ -65,7 +65,7 @@ class ProjectionPyTorch(nn.Module):
 class ProjectionSparton(nn.Module):
     """Wraps the MLM transform + SpartonHead (Triton kernel) with weight tying."""
 
-    def __init__(self, transform, decoder):
+    def __init__(self, transform, decoder, sparton_backend=None):
         super().__init__()
         self.transform = transform
 
@@ -74,9 +74,12 @@ class ProjectionSparton(nn.Module):
         vocab_size = decoder.out_features
         hidden_dim = decoder.in_features
         device = decoder.weight.device
-        self.sparton_head = SpartonHead(vocab_size, hidden_dim, use_bias=True).to(
-            device=device
-        )
+        self.sparton_head = SpartonHead(
+            vocab_size,
+            hidden_dim,
+            use_bias=True,
+            backend=sparton_backend,
+        ).to(device=device)
         self.sparton_head.tie_weights(decoder)
 
     def forward(self, hidden_states, attention_mask):
@@ -93,9 +96,18 @@ class SpladeModel(nn.Module):
         model_name_or_path: HuggingFace model identifier or local path
         head: "torch", "sparton", or "compiled" (torch.compile'd PyTorch head)
         model_kwargs: optional dict passed to from_pretrained
+        sparton_backend: optional Sparton backend name for head="sparton"
+            ("hybrid", "naive", or "optimized"); None keeps the Sparton
+            default resolution (SPARTON_BACKEND env var or "hybrid")
     """
 
-    def __init__(self, model_name_or_path, head="torch", model_kwargs=None):
+    def __init__(
+        self,
+        model_name_or_path,
+        head="torch",
+        model_kwargs=None,
+        sparton_backend=None,
+    ):
         super().__init__()
         self.head = head
         self.model_name_or_path = model_name_or_path
@@ -115,10 +127,14 @@ class SpladeModel(nn.Module):
         elif head == "sparton":
             backbone, transform, decoder = _get_backbone_and_head(llm)
             self.backbone = backbone
-            self.projection = ProjectionSparton(transform, decoder)
+            self.projection = ProjectionSparton(
+                transform,
+                decoder,
+                sparton_backend=sparton_backend,
+            )
         else:
             raise ValueError(
-                f"head must be 'pytorch', 'compiled', or 'triton', got '{head}'"
+                f"head must be 'torch', 'compiled', or 'sparton', got '{head}'"
             )
 
     def forward(self, input_ids, attention_mask, **kwargs):

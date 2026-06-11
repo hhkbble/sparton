@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 from typing import Optional
@@ -16,6 +17,7 @@ from ._backend_hybrid import (
     get_fast_forward_configs,
     get_slow_bwd_configs,
     get_slow_forward_configs,
+    hybrid_forward,
     matmul,
     matmul_bias,
     reduce_seq_max_log1p_relu,
@@ -27,21 +29,26 @@ from ._backend_hybrid import (
 from ._backend_naive_triton import naive_forward, naive_fwd_op
 
 
+logger = logging.getLogger("sparton")
+
 _ENV_BACKEND = os.environ.get("SPARTON_BACKEND", "hybrid").strip().lower() or "hybrid"
 
 
 def resolve_backend(backend: Optional[str]) -> str:
-    selected = _ENV_BACKEND if backend is None else backend.strip().lower()
+    from_env = backend is None
+    selected = _ENV_BACKEND if from_env else backend.strip().lower()
     if selected in {"hybrid", "naive", "optimized"}:
         return selected
+    source = "SPARTON_BACKEND environment variable" if from_env else "backend argument"
     raise ValueError(
-        f"Unknown Sparton backend {selected!r}; expected 'hybrid', 'naive', or 'optimized'."
+        f"Unknown Sparton backend {selected!r} from {source}; "
+        "expected 'hybrid', 'naive', or 'optimized'."
     )
 
 
 def _forward_op_for_backend(backend: str):
     if backend == "hybrid":
-        return fused_sparton_fwd_op
+        return hybrid_forward
     if backend == "naive":
         return naive_forward
     if backend == "optimized":
@@ -95,7 +102,7 @@ class SpartonHead(nn.Module):
             if self.bias is not None and "bias" in weights_dict:
                 self.bias.copy_(weights_dict["bias"])
             else:
-                print("no bias")
+                logger.debug("SpartonHead.load: checkpoint has no bias for this head")
 
     def init_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -126,6 +133,7 @@ __all__ = [
     "get_fast_forward_configs",
     "get_slow_bwd_configs",
     "get_slow_forward_configs",
+    "hybrid_forward",
     "matmul",
     "matmul_bias",
     "naive_forward",

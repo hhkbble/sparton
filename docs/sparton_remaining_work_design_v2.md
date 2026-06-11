@@ -3,6 +3,12 @@
 Date: 2026-06-12.
 Status: **active guide for subsequent backend-refactor development.**
 
+Update, 2026-06-12: **M9 is complete** — every finding scheduled for it is
+fixed and gated; see
+[sparton_milestone9_production_readiness_memo.md](sparton_milestone9_production_readiness_memo.md)
+for the finding→fix mapping, red→green F1 evidence, benchmark A/B, and the
+exit-checklist transcript. The next milestone is M10 (promotion decision).
+
 This document supersedes
 [sparton_gluon_remaining_work_design.md](sparton_gluon_remaining_work_design.md)
 (referred to below as "v1") as the forward plan. v1 remains authoritative for

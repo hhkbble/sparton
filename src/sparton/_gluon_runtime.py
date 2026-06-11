@@ -86,8 +86,10 @@ def is_gluon_backend_available(device: torch.device | int | None = None) -> tupl
     available, reason = is_gluon_available(device)
     if not available:
         return False, reason
+    global _STATE
     try:
-        _load_gluon()
+        if _STATE is None:
+            _STATE = _load_gluon()
     except (AttributeError, ImportError, RuntimeError) as exc:
         return False, str(exc)
     return True, reason
@@ -104,7 +106,6 @@ def _load_gluon() -> SimpleNamespace:
             "triton.experimental.gluon.language.nvidia.hopper"
         )
         hopper_host = importlib.import_module("triton.experimental.gluon.nvidia.hopper")
-        layouts = importlib.import_module("triton.experimental.gluon.language._layouts")
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Sparton optimized Gluon backend requires "
@@ -119,7 +120,7 @@ def _load_gluon() -> SimpleNamespace:
         tma=hopper_lang.tma,
         mbarrier=hopper_lang.mbarrier,
         TensorDescriptor=hopper_host.TensorDescriptor,
-        NVMMASharedLayout=layouts.NVMMASharedLayout,
+        NVMMASharedLayout=gl.NVMMASharedLayout,
         fence_async_shared=hopper_lang.fence_async_shared,
         mma_v2=ampere.mma_v2,
     )

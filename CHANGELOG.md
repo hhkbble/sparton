@@ -5,6 +5,105 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-12
 
+### M9 production readiness
+
+#### Added
+
+- Added `hybrid_forward`, a public per-backend wrapper for the hybrid path
+  that validates and canonicalizes inputs before `sparton::fused_sparton_fwd`,
+  making all three backends symmetric (wrapper → validation → contiguity →
+  op). `SpartonHead` now binds wrappers for every backend;
+  `fused_sparton_fwd_op` remains exported for raw-op callers.
+- Added `src/sparton/_validation.py` with `validate_forward_inputs`: shared
+  contract checks (ranks, cross-shapes, devices, per-backend dtype sets,
+  dtype equality, complex-mask rejection, and the optimized backend's TMA
+  16-byte row-alignment rule) raising `ValueError`/`TypeError` that name the
+  argument, the actual value, and the requirement. Mixed-dtype and
+  unaligned-D inputs now fail with contract errors instead of a bare
+  `AssertionError` or a mid-kernel `CompilationError`.
+- Added the tie-aware `assert_index_contract` test helper implementing the
+  index contract of record (design v2 §6.2) and converted the random-input
+  index assertions for `naive`/`optimized` to it; deterministic constructed
+  cases and the hybrid random case keep exact index equality.
+- Added `@pytest.mark.slow` non-tiny forward tests (six shapes covering
+  V-tail, batch-crossing S-tail, single-K-tile, and long-S cases, fp16 and
+  bf16) for `naive` and `optimized`, including an assertion that the
+  optimized runtime-derived candidate set is the non-fallback production
+  policy bank.
+- Added regression tests for non-contiguous inputs across all three backends,
+  a silent-`import sparton` stdout test, backend-resolution error-source
+  tests, an fp32-hybrid coverage test, validation-rule tests, and a
+  `torch.compile(fullgraph=True)` capture test per backend.
+- Added `SpladeModel(..., sparton_backend=...)` and a matching
+  `--sparton_backend` training argument threaded to
+  `SpartonHead(..., backend=...)`; the default `None` preserves existing
+  behavior.
+
+#### Fixed
+
+- Fixed silently wrong gradients for non-contiguous inputs on the hybrid
+  autograd path (design v2 finding F1): the op saved raw tensors while the
+  backward kernel assumes dense strides; `hidden.grad`/`embed.grad` could be
+  corrupted without any error. The hybrid wrapper now canonicalizes inputs
+  before the op, matching naive/optimized.
+- Fixed `training/model.py` invalid-head error text to name the accepted
+  values (`'torch', 'compiled', or 'sparton'`).
+- `resolve_backend` errors now say whether the invalid value came from the
+  `SPARTON_BACKEND` environment variable or the `backend` argument.
+
+#### Changed
+
+- Changed `pyproject.toml` license metadata from MIT to Apache-2.0 to match
+  the repository `LICENSE` and upstream (deliberate fix of the previously
+  documented mismatch).
+- Replaced the import-time `print("Sparton using device: ...")` and the
+  `SpartonHead.load` `print("no bias")` with DEBUG-level records on the
+  `"sparton"` logger; `import sparton` is now silent on stdout.
+- Removed the import-time `torch.set_float32_matmul_precision('high')` global
+  side effect. The supported fp16/bf16 paths are unaffected (the knob governs
+  fp32 matmuls); fp32 hybrid users now inherit the application's own
+  precision setting.
+- `fused_sparton_bwd_with_bias` now returns a 3-tuple
+  `(hidden_grad, embed_grad, bias_grad)` instead of a 4-tuple with a vestigial
+  trailing `None` (the symbol is re-exported; its only in-repo caller was
+  `fused_sparton_bwd_op`).
+- `benchmarks/bench_sparton_baseline.py` hybrid columns now measure
+  `hybrid_forward` (the user-visible path) instead of the raw op; A/B runs
+  showed no measurable difference on the dev shape.
+- `_gluon_runtime` now uses the public `gl.NVMMASharedLayout` instead of the
+  private `language._layouts` module and caches the loaded Gluon namespace in
+  `is_gluon_backend_available`.
+- Updated `AGENTS.md` (project map with all backend modules, the
+  wrapper/op layering invariant, index-contract rule, refreshed sharp edges,
+  glob `py_compile` command) and `benchmarks/README.md`/`README.md` pointers
+  and index-semantics documentation for the post-M8 state.
+
+#### Removed
+
+- Removed dead code from `_backend_hybrid.py`: unused imports (`gc`, `time`,
+  `torch.amp`, `gradcheck`, `torch._dynamo`), the commented-out
+  `FusedSparton` autograd class and `fused_mlm_splade` alias, a stale
+  commented autotune block, and a commented debug print.
+
+#### Validation
+
+- Added
+  [docs/sparton_milestone9_production_readiness_memo.md](docs/sparton_milestone9_production_readiness_memo.md)
+  with the finding→fix mapping, the captured red→green non-contiguous
+  gradient evidence, the benchmark A/B for the wrapper switch, and the
+  exit-checklist transcript.
+- Exit checklist (hardened env, serial): glob `py_compile` passed; full
+  pytest `105 passed, 15 warnings` (quick loop `90 passed, 15 deselected`);
+  dev-shape benchmark within ±5% of the recorded baselines
+  (hybrid+b 1.177 ms, naive+b 1.260 ms, optimized+b 0.898 ms vs
+  1.176/1.301/0.898); `import sparton` produces no stdout;
+  `git diff --check` clean.
+- Verified all three pytest invocation modes collect and pass:
+  `python -m pytest`, the venv `pytest` console script from the repo root,
+  and `pytest /workspace/sparton/tests` from a foreign working directory.
+- Verified `torch.compile(fullgraph=True)` capture for all three backends
+  with input validation in the traced path (suite test plus smoke).
+
 ### Added
 
 - Added

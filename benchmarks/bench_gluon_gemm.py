@@ -163,6 +163,11 @@ def build_autotuned_kernel(args):
     def early_config_prune(configs, named_args, **kwargs):
         return prune_gemm_autotune_configs(configs, args)
 
+    # The TMA + mma_v2 mainloop below intentionally mirrors the optimized
+    # forward kernel in src/sparton/_backend_optimized_gluon.py; the kernels
+    # stay separate because this one materializes C while the production
+    # kernel runs the Sparton max/argmax epilogue. See
+    # docs/sparton_remaining_work_design_v2.md (D2) before deduplicating.
     @autotune(
         configs=configs,
         key=["M", "N", "K"],

@@ -28,6 +28,13 @@ class LSRModelArguments:
         default="torch",
         metadata={"help": "'torch', 'compiled', or 'sparton' for SpartonHead kernel"},
     )
+    sparton_backend: str = field(
+        default=None,
+        metadata={
+            "help": "Sparton backend for head='sparton' ('hybrid', 'naive', or "
+            "'optimized'); default keeps Sparton's own resolution"
+        },
+    )
 
 
 @dataclass
@@ -256,6 +263,7 @@ def main():
     model = SpladeModel(
         model_name_or_path=model_args.model_name_or_path,
         head=model_args.head,
+        sparton_backend=model_args.sparton_backend,
     )
 
     # Dataset

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -19,8 +20,12 @@ from sparton._runtime_policy import (
     optimized_forward_fallback_policy,
     optimized_forward_policy_universe,
     policy_config_kwargs,
+    torch_device_profile,
 )
 
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC_PATH = str(_REPO_ROOT / "src")
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 requires_cuda = pytest.mark.skipif(
@@ -58,6 +63,17 @@ def optimized_gluon_available() -> None:
     available, reason = _optimized_gluon_availability()
     if not available:
         pytest.skip(reason)
+
+
+ALL_BACKENDS = ("hybrid", "naive", "optimized")
+
+
+def _forward_for_backend(sparton_kernel, backend: str):
+    if backend == "optimized":
+        available, reason = _optimized_gluon_availability()
+        if not available:
+            pytest.skip(reason)
+    return getattr(sparton_kernel, f"{backend}_forward")
 
 FORWARD_CASES = [
     pytest.param(True, torch.float16, id="bias-fp16"),
@@ -107,6 +123,51 @@ def sparton_reference(
     if bias is not None:
         logits = logits + bias
     return _reference_from_logits(logits, mask)
+
+
+def reference_masked_logits(
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    logits = hidden @ embed.T
+    if bias is not None:
+        logits = logits + bias
+    return logits * mask.to(dtype=logits.dtype)[:, :, None]
+
+
+def assert_index_contract(
+    scores: torch.Tensor,
+    idx: torch.Tensor,
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    mask: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Index contract of record (design v2 §6.2).
+
+    Wherever the returned score is positive, the chosen sequence index must
+    hold a masked input-dtype logit within tolerance of the per-(b, v)
+    maximum. Positions with score == 0 carry no index meaning (zero-baseline
+    policy). Backends with different accumulation precision may legitimately
+    pick different near-tie winners, so exact index equality is asserted only
+    in deterministic constructed cases.
+    """
+
+    masked = reference_masked_logits(hidden, embed, bias, mask)
+    ref_max = masked.max(dim=1).values
+    chosen = masked.gather(1, idx.unsqueeze(1)).squeeze(1)
+    active = scores.float() > 0
+    gap = (ref_max.float() - chosen.float())[active]
+    limit = atol + rtol * ref_max.float()[active].abs()
+    assert bool((gap <= limit).all()), (
+        "index contract violated: chosen logit trails the reference max by "
+        f"{gap.max().item():.6f} (tolerance atol={atol}, rtol={rtol})"
+    )
 
 
 def _make_kernel_inputs(
@@ -228,7 +289,7 @@ def test_reference_multiplies_mask_values_before_reduction() -> None:
 
 def test_gluon_runtime_import_is_lazy() -> None:
     env = os.environ.copy()
-    env["PYTHONPATH"] = "src"
+    env["PYTHONPATH"] = _SRC_PATH
     result = subprocess.run(
         [
             sys.executable,
@@ -246,7 +307,7 @@ def test_gluon_runtime_import_is_lazy() -> None:
         ],
         check=True,
         env=env,
-        cwd=os.getcwd(),
+        cwd=str(_REPO_ROOT),
         text=True,
         capture_output=True,
     )
@@ -470,7 +531,7 @@ def test_fused_forward_matches_reference(
         use_bias=use_bias,
     )
 
-    scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    scores, idx = sparton_kernel.hybrid_forward(hidden, embed, bias, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -494,10 +555,10 @@ def test_naive_forward_matches_reference(
     )
 
     scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
-    expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
+    expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
-    assert torch.equal(idx, expected_idx)
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
 @requires_optimized_gluon
@@ -518,10 +579,10 @@ def test_optimized_forward_matches_reference(
     )
 
     scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
-    expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
+    expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
-    assert torch.equal(idx, expected_idx)
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
 @requires_cuda
@@ -681,10 +742,94 @@ def test_optimized_forward_handles_multiple_sequence_chunks_small_d(
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
     scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
-    expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
+    expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
-    assert torch.equal(idx, expected_idx)
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, atol=2e-3, rtol=2e-3)
+
+
+NONTINY_FORWARD_CASES = [
+    pytest.param(8, 128, 768, 1283, True, torch.float16, id="8x128x768x1283-bias-fp16"),
+    pytest.param(8, 128, 768, 1283, False, torch.float16, id="8x128x768x1283-no_bias-fp16"),
+    pytest.param(3, 345, 768, 2048, True, torch.float16, id="3x345x768x2048-bias-fp16"),
+    pytest.param(3, 345, 768, 2048, True, torch.bfloat16, id="3x345x768x2048-bias-bf16"),
+    pytest.param(9, 120, 64, 1024, True, torch.float16, id="9x120x64x1024-bias-fp16"),
+    pytest.param(2, 513, 1024, 1536, False, torch.float16, id="2x513x1024x1536-no_bias-fp16"),
+]
+
+
+def _make_nontiny_inputs(
+    device: torch.device,
+    B: int,
+    S: int,
+    D: int,
+    V: int,
+    dtype: torch.dtype,
+    use_bias: bool,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(101 + V)
+    hidden = torch.randn((B, S, D), device=device, dtype=dtype, generator=generator) * 0.05
+    embed = torch.randn((V, D), device=device, dtype=dtype, generator=generator) * 0.05
+    bias = None
+    if use_bias:
+        bias = torch.randn((V,), device=device, dtype=dtype, generator=generator) * 0.05
+    mask = (torch.rand((B, S), device=device, generator=generator) > 0.25).to(torch.int32)
+    return hidden, embed, bias, mask
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.slow
+@pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_FORWARD_CASES)
+def test_naive_forward_nontiny_shapes(
+    sparton_kernel,
+    cuda_device: torch.device,
+    B: int,
+    S: int,
+    D: int,
+    V: int,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    _skip_if_unsupported_dtype(dtype)
+    hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
+
+    scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+
+    assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
+
+
+@requires_optimized_gluon
+@pytest.mark.cuda
+@pytest.mark.optimized_gluon
+@pytest.mark.slow
+@pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_FORWARD_CASES)
+def test_optimized_forward_nontiny_shapes(
+    sparton_kernel,
+    cuda_device: torch.device,
+    B: int,
+    S: int,
+    D: int,
+    V: int,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    _skip_if_unsupported_dtype(dtype)
+    # F3 coverage proof: these shapes escape the tiny-problem fallback, so the
+    # runtime-derived candidate set is the non-fallback production bank.
+    problem = ProblemSpec(M=B * S, N=V, K=D, dtype_name="fp16")
+    policies = derive_optimized_forward_policies(problem, torch_device_profile())
+    assert len(policies) > 1
+
+    hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
+
+    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+
+    assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
 @requires_cuda
@@ -792,6 +937,63 @@ def test_optimized_backward_matches_reference(
 
 @requires_cuda
 @pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["hybrid", "naive", "optimized"])
+def test_forward_backward_handles_noncontiguous_inputs(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+) -> None:
+    forward = _forward_for_backend(sparton_kernel, backend)
+    generator = torch.Generator(device=cuda_device).manual_seed(23)
+    base_hidden = torch.randn(
+        (2, 10, 16),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    base_embed = torch.randn(
+        (38, 16),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    base_bias = torch.randn(
+        (38,),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    hidden = base_hidden[:, ::2, :].detach().requires_grad_(True)
+    embed = base_embed[::2, :].detach().requires_grad_(True)
+    bias = base_bias[::2].detach().requires_grad_(True)
+    mask = torch.tensor(
+        [[1, 1, 0, 1, 0], [0, 1, 1, 0, 1]],
+        device=cuda_device,
+        dtype=torch.int32,
+    )
+    assert not hidden.is_contiguous()
+    assert not embed.is_contiguous()
+    assert not bias.is_contiguous()
+
+    ref_hidden = hidden.detach().clone().contiguous().requires_grad_(True)
+    ref_embed = embed.detach().clone().contiguous().requires_grad_(True)
+    ref_bias = bias.detach().clone().contiguous().requires_grad_(True)
+
+    scores, _idx = forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, ref_bias, mask)
+    upstream = torch.randn_like(scores)
+
+    scores.backward(upstream)
+    expected_scores.backward(upstream.detach().clone())
+
+    assert_close(scores.float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
+    assert_close(hidden.grad.float(), ref_hidden.grad.float(), atol=2e-3, rtol=2e-3)
+    assert_close(embed.grad.float(), ref_embed.grad.float(), atol=2e-3, rtol=2e-3)
+    assert_close(bias.grad.float(), ref_bias.grad.float(), atol=2e-3, rtol=2e-3)
+
+
+@requires_cuda
+@pytest.mark.cuda
 def test_sparton_head_backend_routing(
     sparton_kernel,
     cuda_device: torch.device,
@@ -863,9 +1065,26 @@ def test_sparton_head_optimized_backend_routing(
 
 @requires_cuda
 @pytest.mark.cuda
+def test_import_emits_no_stdout(cuda_device: torch.device) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _SRC_PATH
+    result = subprocess.run(
+        [sys.executable, "-c", "import sparton"],
+        check=True,
+        env=env,
+        cwd=str(_REPO_ROOT),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.stdout == ""
+
+
+@requires_cuda
+@pytest.mark.cuda
 def test_sparton_backend_env_selects_default(cuda_device: torch.device) -> None:
     env = os.environ.copy()
-    env["PYTHONPATH"] = "src"
+    env["PYTHONPATH"] = _SRC_PATH
     env["SPARTON_BACKEND"] = "naive"
     result = subprocess.run(
         [
@@ -879,7 +1098,7 @@ def test_sparton_backend_env_selects_default(cuda_device: torch.device) -> None:
         ],
         check=True,
         env=env,
-        cwd=os.getcwd(),
+        cwd=str(_REPO_ROOT),
         text=True,
         capture_output=True,
     )
@@ -887,12 +1106,45 @@ def test_sparton_backend_env_selects_default(cuda_device: torch.device) -> None:
     assert result.stdout.strip().splitlines()[-1] == "naive"
 
 
+@requires_cuda
+@pytest.mark.cuda
+def test_resolve_backend_invalid_kwarg_names_argument(sparton_kernel) -> None:
+    with pytest.raises(ValueError, match=r"'bogus' from backend argument"):
+        sparton_kernel.resolve_backend("bogus")
+
+
+@requires_cuda
+@pytest.mark.cuda
+def test_resolve_backend_invalid_env_names_env_var(cuda_device: torch.device) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _SRC_PATH
+    env["SPARTON_BACKEND"] = "bogus"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sparton.sparton_kernel as sk; "
+                "sk.SpartonHead(19, 16)"
+            ),
+        ],
+        check=False,
+        env=env,
+        cwd=str(_REPO_ROOT),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "SPARTON_BACKEND environment variable" in result.stderr
+
+
 @requires_optimized_gluon
 @pytest.mark.cuda
 @pytest.mark.optimized_gluon
 def test_sparton_backend_env_selects_optimized_default(cuda_device: torch.device) -> None:
     env = os.environ.copy()
-    env["PYTHONPATH"] = "src"
+    env["PYTHONPATH"] = _SRC_PATH
     env["SPARTON_BACKEND"] = "optimized"
     result = subprocess.run(
         [
@@ -906,7 +1158,7 @@ def test_sparton_backend_env_selects_optimized_default(cuda_device: torch.device
         ],
         check=True,
         env=env,
-        cwd=os.getcwd(),
+        cwd=str(_REPO_ROOT),
         text=True,
         capture_output=True,
     )
@@ -1041,3 +1293,211 @@ def test_optimized_custom_op_schema_exposes_optional_bias(sparton_kernel) -> Non
     optimized_schema = str(torch.ops.sparton.optimized_fwd.default._schema)
 
     assert "Tensor? bias" in optimized_schema
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.slow
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_sparton_head_torch_compile_fullgraph(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+) -> None:
+    _forward_for_backend(sparton_kernel, backend)  # skip when unavailable
+    hidden, embed, bias, mask = _make_kernel_inputs(
+        device=cuda_device,
+        dtype=torch.float16,
+        use_bias=True,
+    )
+    head = sparton_kernel.SpartonHead(19, 16, use_bias=True, backend=backend).to(
+        device=cuda_device,
+        dtype=torch.float16,
+    )
+    with torch.no_grad():
+        head.weight.copy_(embed)
+        assert head.bias is not None
+        head.bias.copy_(bias)
+
+    eager_out = head(hidden, mask)
+    compiled_out = torch.compile(head, fullgraph=True)(hidden, mask)
+
+    assert_close(compiled_out.float(), eager_out.float(), atol=2e-3, rtol=2e-3)
+
+
+def _base_validation_inputs(device: torch.device) -> dict[str, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(29)
+    return {
+        "hidden": torch.randn(
+            (2, 5, 16), device=device, dtype=torch.float16, generator=generator
+        ),
+        "embed": torch.randn(
+            (19, 16), device=device, dtype=torch.float16, generator=generator
+        ),
+        "bias": torch.randn(
+            (19,), device=device, dtype=torch.float16, generator=generator
+        ),
+        "mask": torch.ones((2, 5), device=device, dtype=torch.int32),
+    }
+
+
+VALIDATION_ERROR_CASES = [
+    pytest.param(
+        "hidden",
+        lambda inputs: inputs["hidden"][:, 0, :],
+        ValueError,
+        r"hidden must be a 3-D \[B, S, D\] tensor",
+        id="hidden_rank",
+    ),
+    pytest.param(
+        "embed",
+        lambda inputs: inputs["embed"][None],
+        ValueError,
+        r"embed must be a 2-D \[V, D\] tensor",
+        id="embed_rank",
+    ),
+    pytest.param(
+        "mask",
+        lambda inputs: inputs["mask"][0],
+        ValueError,
+        r"mask must be a 2-D \[B, S\] tensor",
+        id="mask_rank",
+    ),
+    pytest.param(
+        "embed",
+        lambda inputs: torch.randn(
+            (19, 32), device=inputs["embed"].device, dtype=inputs["embed"].dtype
+        ),
+        ValueError,
+        r"embed\.shape\[1\] must equal hidden\.shape\[2\]",
+        id="embed_dim_mismatch",
+    ),
+    pytest.param(
+        "mask",
+        lambda inputs: inputs["mask"][:, :4],
+        ValueError,
+        r"mask\.shape must equal \(B, S\)",
+        id="mask_shape_mismatch",
+    ),
+    pytest.param(
+        "bias",
+        lambda inputs: inputs["bias"][:18],
+        ValueError,
+        r"bias\.shape must equal \(V,\)",
+        id="bias_shape_mismatch",
+    ),
+    pytest.param(
+        "embed",
+        lambda inputs: inputs["embed"].cpu(),
+        ValueError,
+        r"embed\.device must equal hidden\.device",
+        id="embed_cross_device",
+    ),
+    pytest.param(
+        "embed",
+        lambda inputs: inputs["embed"].float(),
+        TypeError,
+        r"embed\.dtype must equal hidden\.dtype",
+        id="embed_dtype_mismatch",
+    ),
+    pytest.param(
+        "bias",
+        lambda inputs: inputs["bias"].float(),
+        TypeError,
+        r"bias\.dtype must equal hidden\.dtype",
+        id="bias_dtype_mismatch",
+    ),
+    pytest.param(
+        "mask",
+        lambda inputs: inputs["mask"].to(torch.complex64),
+        TypeError,
+        r"mask\.dtype must be bool, integer, or floating point",
+        id="mask_complex",
+    ),
+]
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize(("field", "mutate", "exc", "match"), VALIDATION_ERROR_CASES)
+def test_validation_rejects_bad_inputs(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+    field: str,
+    mutate,
+    exc: type,
+    match: str,
+) -> None:
+    forward = _forward_for_backend(sparton_kernel, backend)
+    inputs = _base_validation_inputs(cuda_device)
+    inputs[field] = mutate(inputs)
+
+    with pytest.raises(exc, match=match):
+        forward(inputs["hidden"], inputs["embed"], inputs["bias"], inputs["mask"])
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_validation_rejects_cpu_tensors(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+) -> None:
+    forward = _forward_for_backend(sparton_kernel, backend)
+    inputs = {name: tensor.cpu() for name, tensor in _base_validation_inputs(cuda_device).items()}
+
+    with pytest.raises(ValueError, match=r"hidden must be a CUDA tensor"):
+        forward(inputs["hidden"], inputs["embed"], inputs["bias"], inputs["mask"])
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["naive", "optimized"])
+def test_validation_rejects_fp32_on_fused_backends(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+) -> None:
+    forward = _forward_for_backend(sparton_kernel, backend)
+    inputs = _base_validation_inputs(cuda_device)
+    for name in ("hidden", "embed", "bias"):
+        inputs[name] = inputs[name].float()
+
+    with pytest.raises(TypeError, match=r"hidden\.dtype must be one of"):
+        forward(inputs["hidden"], inputs["embed"], inputs["bias"], inputs["mask"])
+
+
+@requires_cuda
+@pytest.mark.cuda
+def test_validation_allows_fp32_hybrid(
+    sparton_kernel,
+    cuda_device: torch.device,
+) -> None:
+    inputs = _base_validation_inputs(cuda_device)
+    hidden = inputs["hidden"].float()
+    embed = inputs["embed"].float()
+    bias = inputs["bias"].float()
+    mask = inputs["mask"]
+
+    scores, _idx = sparton_kernel.hybrid_forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+
+    assert_close(scores, expected_scores, atol=1e-3, rtol=1e-3)
+
+
+@requires_optimized_gluon
+@pytest.mark.cuda
+@pytest.mark.optimized_gluon
+def test_optimized_validation_rejects_unaligned_d(
+    sparton_kernel,
+    cuda_device: torch.device,
+) -> None:
+    hidden = torch.randn((2, 64, 10), device=cuda_device, dtype=torch.float16)
+    embed = torch.randn((19, 10), device=cuda_device, dtype=torch.float16)
+    mask = torch.ones((2, 64), device=cuda_device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=r"multiple of 16 bytes"):
+        sparton_kernel.optimized_forward(hidden, embed, None, mask)

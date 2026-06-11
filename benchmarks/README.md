@@ -1,8 +1,11 @@
 # Sparton benchmarks and probes
 
 Validated probe/benchmark scripts for the Gluon backend refactor, promoted
-from session scratch on 2026-06-11. The canonical interpretation of their
-results, the profiling methodology, and the rerun command catalogue live in
+from session scratch on 2026-06-11. The forward plan and current rerun
+command catalogue live in
+[../docs/sparton_remaining_work_design_v2.md](../docs/sparton_remaining_work_design_v2.md);
+the platform facts, profiling methodology, and original measured evidence
+remain in
 [../docs/sparton_gluon_remaining_work_design.md](../docs/sparton_gluon_remaining_work_design.md)
 (§2.2, §3.1, §3.2, §3.5, §11, Appendices A and B).
 

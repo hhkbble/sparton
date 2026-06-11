@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+# Make `import benchmarks.<script>` resolve as a namespace package regardless
+# of how pytest is invoked (`python -m pytest` adds the CWD; the console
+# script does not).
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 @pytest.fixture(scope="session")

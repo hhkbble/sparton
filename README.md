@@ -76,6 +76,15 @@ available for local Gluon experiments. Hybrid remains the production default;
 `optimized` requires CUDA sm_80+ plus importable `triton.experimental.gluon`,
 is validated in this workspace with Triton 3.6.0, and is not promoted.
 
+Index semantics across backends: the returned index for a vocabulary entry is
+meaningful only where its score is greater than zero (zero-baseline policy).
+Within one backend, ties resolve to the lowest sequence index. Across
+backends, `naive` and `optimized` accumulate logits in fp32 while `hybrid`
+produces input-dtype logits, so at near-ties (logit gaps within input-dtype
+rounding) different backends may legitimately return different winners. The
+guaranteed contract, enforced by the test suite, is that the chosen position's
+masked logit stays within score tolerance of the true maximum.
+
 ## How It Works
 
 Standard SPLADE computes sparse representations in multiple steps:

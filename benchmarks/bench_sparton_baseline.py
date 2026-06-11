@@ -122,10 +122,10 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
     )
 
     def hybrid_bias():
-        return sk.fused_sparton_fwd_op(hidden, embed, bias, mask)
+        return sk.hybrid_forward(hidden, embed, bias, mask)
 
     def hybrid_nobias():
-        return sk.fused_sparton_fwd_op(hidden, embed, None, mask)
+        return sk.hybrid_forward(hidden, embed, None, mask)
 
     def gemm_full():
         return torch.matmul(hidden.reshape(spec.batch_size * spec.seq_len, args.dim), embed.T)
@@ -134,7 +134,7 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         h = hidden.detach().requires_grad_(True)
         e = embed.detach().requires_grad_(True)
         b = bias.detach().requires_grad_(True)
-        scores, _idx = sk.fused_sparton_fwd_op(h, e, b, mask)
+        scores, _idx = sk.hybrid_forward(h, e, b, mask)
         scores.float().sum().backward()
         return scores
 
