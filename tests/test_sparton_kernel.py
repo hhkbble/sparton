@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -900,6 +901,108 @@ def test_naive_backward_matches_reference(
         assert bias is None
 
 
+AUTOCAST_DTYPES = [
+    pytest.param(torch.float16, id="fp16"),
+    pytest.param(torch.bfloat16, id="bf16"),
+]
+
+
+@requires_optimized_gluon
+@pytest.mark.cuda
+@pytest.mark.optimized_gluon
+@pytest.mark.slow
+def test_training_parity_smoke_autocast(
+    sparton_kernel,
+    cuda_device: torch.device,
+) -> None:
+    """Short head-only training run: hybrid and optimized stay in lockstep.
+
+    A trimmed version of benchmarks/probe_training_smoke.py (the M10 tier-1
+    gate); reuses its run_mode so the gate logic stays single-sourced.
+    """
+
+    from benchmarks.probe_training_smoke import run_mode
+
+    failures = run_mode(
+        mode="bf16",
+        steps=30,
+        batch=8,
+        seq_len=32,
+        dim=64,
+        vocab=512,
+        seed=3,
+        lr=1e-3,
+        temperature=0.05,
+        lambda_flops=1e-3,
+        parity_tolerance=0.1,
+    )
+
+    assert failures == []
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("autocast_dtype", AUTOCAST_DTYPES)
+def test_forward_backward_under_autocast(
+    sparton_kernel,
+    cuda_device: torch.device,
+    backend: str,
+    autocast_dtype: torch.dtype,
+) -> None:
+    _skip_if_unsupported_dtype(autocast_dtype)
+    forward = _forward_for_backend(sparton_kernel, backend)
+    generator = torch.Generator(device=cuda_device).manual_seed(37)
+    # fp32 master tensors, as produced by AMP training setups.
+    hidden = torch.randn(
+        (2, 5, 16),
+        device=cuda_device,
+        dtype=torch.float32,
+        generator=generator,
+        requires_grad=True,
+    )
+    embed = torch.randn(
+        (19, 16),
+        device=cuda_device,
+        dtype=torch.float32,
+        generator=generator,
+        requires_grad=True,
+    )
+    bias = torch.randn(
+        (19,),
+        device=cuda_device,
+        dtype=torch.float32,
+        generator=generator,
+        requires_grad=True,
+    )
+    mask = torch.tensor(
+        [[1, 1, 0, 1, 0], [0, 1, 1, 0, 1]],
+        device=cuda_device,
+        dtype=torch.int32,
+    )
+
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        scores, idx = forward(hidden, embed, bias, mask)
+
+    assert scores.dtype == autocast_dtype
+
+    cast_hidden = hidden.detach().to(autocast_dtype)
+    cast_embed = embed.detach().to(autocast_dtype)
+    cast_bias = bias.detach().to(autocast_dtype)
+    expected_scores, _ = sparton_reference(cast_hidden, cast_embed, cast_bias, mask)
+    tolerances = _score_tolerances(autocast_dtype)
+    assert_close(scores.float(), expected_scores.float(), **tolerances)
+    assert_index_contract(
+        scores, idx, cast_hidden, cast_embed, cast_bias, mask, **tolerances
+    )
+
+    scores.float().sum().backward()
+    for leaf in (hidden, embed, bias):
+        assert leaf.grad is not None
+        assert leaf.grad.dtype == torch.float32
+        assert bool(torch.isfinite(leaf.grad).all())
+
+
 @requires_optimized_gluon
 @pytest.mark.cuda
 @pytest.mark.optimized_gluon
@@ -1024,7 +1127,10 @@ def test_sparton_head_backend_routing(
 
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
-    assert default_head.backend == "hybrid"
+    # M10 promotion: the default is adaptive — optimized where the Gluon
+    # backend is available, hybrid (with a one-time warning) elsewhere.
+    expected_default = "optimized" if _optimized_gluon_availability()[0] else "hybrid"
+    assert default_head.backend == expected_default
     assert hybrid_head.backend == "hybrid"
     assert naive_head.backend == "naive"
     assert_close(default_head(hidden, mask).float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
@@ -1137,6 +1243,62 @@ def test_resolve_backend_invalid_env_names_env_var(cuda_device: torch.device) ->
 
     assert result.returncode != 0
     assert "SPARTON_BACKEND environment variable" in result.stderr
+
+
+@requires_optimized_gluon
+@pytest.mark.cuda
+@pytest.mark.optimized_gluon
+def test_default_backend_prefers_optimized_when_available(
+    cuda_device: torch.device,
+) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _SRC_PATH
+    env.pop("SPARTON_BACKEND", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sparton.sparton_kernel as sk; "
+                "head = sk.SpartonHead(19, 16); "
+                "print(head.backend)"
+            ),
+        ],
+        check=True,
+        env=env,
+        cwd=str(_REPO_ROOT),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "optimized"
+
+
+@requires_cuda
+@pytest.mark.cuda
+def test_default_backend_falls_back_to_hybrid_with_one_warning(
+    sparton_kernel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sparton._gluon_runtime as gluon_runtime
+
+    monkeypatch.setattr(
+        gluon_runtime,
+        "is_gluon_backend_available",
+        lambda device=None: (False, "forced unavailable for test"),
+    )
+    monkeypatch.setattr(sparton_kernel, "_ENV_BACKEND", None)
+    monkeypatch.setattr(sparton_kernel, "_DEFAULT_FALLBACK_WARNED", False)
+
+    with pytest.warns(RuntimeWarning, match=r"falling back to 'hybrid'"):
+        head = sparton_kernel.SpartonHead(19, 16)
+    assert head.backend == "hybrid"
+
+    # The fallback warning is one-time per process.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        second = sparton_kernel.SpartonHead(19, 16)
+    assert second.backend == "hybrid"
 
 
 @requires_optimized_gluon

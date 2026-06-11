@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from ._backend_hybrid import fused_sparton_bwd_op
-from ._validation import validate_forward_inputs
+from ._validation import autocast_canonicalize, validate_forward_inputs
 
 
 def _naive_config(block_s: int, block_v: int, block_d: int, warps: int, stages: int):
@@ -224,6 +224,7 @@ def naive_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
     validate_forward_inputs(hidden, embed, bias, mask, backend="naive")
     hidden = hidden.contiguous()
     embed = embed.contiguous()

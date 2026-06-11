@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import warnings
 from typing import Optional
 
 import torch
@@ -31,10 +32,42 @@ from ._backend_naive_triton import naive_forward, naive_fwd_op
 
 logger = logging.getLogger("sparton")
 
-_ENV_BACKEND = os.environ.get("SPARTON_BACKEND", "hybrid").strip().lower() or "hybrid"
+# None when SPARTON_BACKEND is unset or empty; an explicit value otherwise.
+_ENV_BACKEND = os.environ.get("SPARTON_BACKEND", "").strip().lower() or None
+
+_DEFAULT_FALLBACK_WARNED = False
+
+
+def _default_backend() -> str:
+    """Adaptive default (M10 promotion): optimized where available.
+
+    This availability-gated fallback applies ONLY to default resolution (no
+    ``backend`` argument and no ``SPARTON_BACKEND``); an explicitly selected
+    backend that is unavailable still raises with the reason.
+    """
+
+    global _DEFAULT_FALLBACK_WARNED
+    from . import _gluon_runtime
+
+    available, reason = _gluon_runtime.is_gluon_backend_available()
+    if available:
+        return "optimized"
+    if not _DEFAULT_FALLBACK_WARNED:
+        warnings.warn(
+            "Sparton default backend 'optimized' is unavailable on this "
+            f"platform ({reason}); falling back to 'hybrid'. Select a backend "
+            "explicitly via SPARTON_BACKEND or SpartonHead(backend=...) to "
+            "silence this warning.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        _DEFAULT_FALLBACK_WARNED = True
+    return "hybrid"
 
 
 def resolve_backend(backend: Optional[str]) -> str:
+    if backend is None and _ENV_BACKEND is None:
+        return _default_backend()
     from_env = backend is None
     selected = _ENV_BACKEND if from_env else backend.strip().lower()
     if selected in {"hybrid", "naive", "optimized"}:

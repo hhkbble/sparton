@@ -6,7 +6,7 @@ import torch
 
 from ._backend_hybrid import fused_sparton_bwd_op
 from ._gluon_runtime import autotune, gl, gluon, mbarrier, mma_v2, tma
-from ._validation import validate_forward_inputs
+from ._validation import autocast_canonicalize, validate_forward_inputs
 from ._gluon_policy_runtime import (
     configs_for_policies,
     element_ty_for_dtype,
@@ -391,6 +391,7 @@ def optimized_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
     validate_forward_inputs(hidden, embed, bias, mask, backend="optimized")
     hidden = hidden.contiguous()
     embed = embed.contiguous()

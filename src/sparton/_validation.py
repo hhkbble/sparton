@@ -118,4 +118,36 @@ def validate_forward_inputs(
             )
 
 
-__all__ = ["validate_forward_inputs"]
+def autocast_canonicalize(
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Mirror ``torch.autocast`` semantics for the Sparton forwards.
+
+    The custom ops are not autocast-registered, so under an active CUDA
+    autocast region a head with fp32 master parameters would otherwise hand
+    mixed dtypes to ``validate_forward_inputs``. Cast the floating inputs to
+    the autocast dtype — exactly what autocast does for ``torch.matmul`` —
+    and leave everything unchanged outside autocast. ``mask`` is never cast.
+    Gradients flow back to the original (e.g. fp32 master) tensors through
+    the cast, as with any autocast op.
+    """
+
+    if not torch.is_autocast_enabled("cuda"):
+        return hidden, embed, bias
+    target = torch.get_autocast_dtype("cuda")
+    if target not in (torch.float16, torch.bfloat16):
+        return hidden, embed, bias
+
+    def _cast(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None or not tensor.is_floating_point():
+            return tensor
+        if tensor.dtype == target:
+            return tensor
+        return tensor.to(target)
+
+    return _cast(hidden), _cast(embed), _cast(bias)
+
+
+__all__ = ["autocast_canonicalize", "validate_forward_inputs"]

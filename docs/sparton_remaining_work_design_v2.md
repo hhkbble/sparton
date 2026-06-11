@@ -1,13 +1,32 @@
 # Sparton Remaining-Work Design v2 (post-M8)
 
 Date: 2026-06-12.
-Status: **active guide for subsequent backend-refactor development.**
+Status: **superseded as the forward plan by
+[sparton_remaining_work_design_v3.md](sparton_remaining_work_design_v3.md)
+(2026-06-12, post-M10).** This document remains authoritative for the
+post-M8 review findings (F1–F20), the design-evolution ledger (§2), the
+architecture rules of record (§4, including the policy-bank mechanics that
+M12's launcher v2 will replace), and the executed M9/M10 specifications and
+gates. The incomplete milestones (M11 backward track, M12 forward
+scheduling/launcher) moved to v3 in refined form; their original wording
+here is replaced by pointers.
 
 Update, 2026-06-12: **M9 is complete** — every finding scheduled for it is
 fixed and gated; see
 [sparton_milestone9_production_readiness_memo.md](sparton_milestone9_production_readiness_memo.md)
 for the finding→fix mapping, red→green F1 evidence, benchmark A/B, and the
-exit-checklist transcript. The next milestone is M10 (promotion decision).
+exit-checklist transcript.
+
+Update, 2026-06-12 (later): **M10 is complete — the promotion decision is
+YES.** All gates passed and the default backend is now availability-adaptive
+`optimized` (hybrid with a one-time warning where Gluon is unavailable;
+explicit selections never fall back). Gate 6 surfaced and fixed a latent AMP
+gap: the wrappers now mirror `torch.autocast` semantics so fp32 master
+parameters work under fp16/bf16 autocast on every backend (the M9 dtype
+validation had made this a hard error, including for hybrid). Evidence,
+gate-by-gate numbers, and the rollback procedure are in
+[sparton_milestone10_promotion_memo.md](sparton_milestone10_promotion_memo.md).
+The next milestone is M11 (backward track).
 
 This document supersedes
 [sparton_gluon_remaining_work_design.md](sparton_gluon_remaining_work_design.md)
@@ -585,61 +604,20 @@ This keeps CPU-less/old-Triton installs importable and is the single
 deviation from "no fallbacks", confined to default resolution and loudly
 warned.
 
-### M11 — Backward track (now the largest lever)
+### M11 — Backward track
 
-Evidence: backward ≈ 1.46 ms on the dev shape at 6.0% compute / 9.6% DRAM
-utilization, 167 MB read / 66 MB written (v1 §3.5) — latency/atomic-bound,
-~62% of optimized fwd+bwd.
+**Moved to [v3 §3](sparton_remaining_work_design_v3.md) in refined form**
+(re-profiling entry step, capture-to-disk real index distributions from the
+M10 tier-2 infrastructure, determinism protocol, explicit B2a/B2b decision
+criteria). The shape-dependent backward-share evidence that re-grounds the
+milestone is in v3 §1.2.
 
-1. **Distribution harness first** (entry gate): extend
-   `bench_sparton_baseline.py` (or a sibling) with a backward benchmark over
-   index distributions: uniform (today's tests), Zipfian over vocab with hot
-   tokens (documented proxy), and — when available — indices captured from a
-   real SPLADE checkpoint forward (naver/splade-v3 is license-gated; a
-   few-hundred-step trained model from M10-tier-2 is the fallback source).
-   Uniform-random understates atomic conflicts; no backward change is
-   accepted on uniform evidence alone (v1 §8 rule, restated).
-2. **Two prototypes, one decision** (timeboxed): (a) *Triton B2a* — keep the
-   kernel family, add per-CTA aggregation of `d_bias`/`d_embed` in
-   registers/smem before atomics and re-tune block shapes (the 6%-util kernel
-   leaves enormous room without new technology); (b) *Gluon B2b* — direct
-   port with TMA loads and the same aggregation. Pick by measured fwd+bwd on
-   the harness; correctness matrix identical to forward gates plus
-   `scores == 0 → zero gradient` and AMP smoke.
-3. B3 (deeper aggregation, duplicate-`d_hidden` handling) only if the harness
-   shows atomic conflict still dominant after B2x.
-4. Exit: backward ≥ 1.5× faster than current on the realistic-distribution
-   harness without regressing uniform; gradient matrix green; fwd+bwd
-   re-recorded in the M11 memo. New op name (`sparton::optimized_bwd` or a
-   versioned name) if and only if saved-tensor needs change — autograd
-   `setup_context` is backend-private, so swapping the backward op inside
-   existing autograd registrations is schema-safe.
+### M12 — Forward scheduling and launch overhead
 
-### M12 — Forward scheduling and launch overhead (tail-chase, optional)
-
-Entry gate: profiling shows ≥10% recoverable forward time on shapes someone
-cares about, after M10/M11. Candidates, in measured-priority order:
-
-1. **Launcher v2 (also fixes F9)**: replace decorator autotune with an owned
-   two-phase selector — derive candidates (`derive_optimized_forward_policies`
-   already ranks), benchmark once per `(B,S,D,V,dtype)` key with the existing
-   do_bench infra, memoize, then build **one** descriptor pair per call and
-   call a single-pair kernel (22-arg bank and if-chain deleted). This is the
-   elegant end-state the bank approximated under Triton's autotune API;
-   keep `cache_results`-style on-disk memoization optional. Exit: host
-   overhead ≤ 0.02 ms/call; identical kernel selection on the canonical grid.
-2. **Persistent + warp-specialized mainloop** (v1 O2/O3): `gl.warp_specialize`
-   probe on sm_120 first (still unprobed — v1 §3.6 item 2); persistent flat
-   tile loop with L2-aware rasterization; producer/consumer barriers replace
-   the per-iteration CTA barrier; epilogue unchanged. Targets: forward ≤
-   1.05× the per-row GEMM floor on the canonical grid (currently ~1.10×);
-   tensor-pipe utilization toward the 86.6% cuBLAS reference. The per-s-tile
-   pipeline drain and embed-tile re-read of the O1 kernel disappear naturally
-   in the persistent formulation; measure, don't assume.
-3. Mask-density sweep (v1 §10.3) folded into the M12 measurement set.
-
-Each candidate keeps v1 §9's rejection criteria (measured A/B on dev + grid,
->5% regression anywhere → rejected without a >10% win elsewhere).
+**Moved to [v3 §3](sparton_remaining_work_design_v3.md) in refined form**
+(launcher v2 decoupled from the kernel-rewrite entry gate, selection-parity
+gate before bank deletion, warp-specialize probe as a hard entry gate for
+the persistent rewrite, D2 decision point attached to the rewrite).
 
 ---
 

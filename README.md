@@ -47,34 +47,44 @@ See [model.py](training/model.py) for a full example integrating Sparton into a 
 
 ### Backend Selection
 
-`SpartonHead` defaults to the current hybrid backend:
+`SpartonHead` defaults to the `optimized` Gluon fused-forward backend wherever
+it is available (CUDA sm_80+ plus a Triton with importable
+`triton.experimental.gluon`; validated with Triton 3.6.0). On platforms where
+it is unavailable, the default resolves to the `hybrid` backend with a
+one-time `RuntimeWarning`. This availability-adaptive behavior applies only
+to the *default*: an explicitly selected backend never falls back and raises
+with the reason when unavailable.
+
+The `optimized` forward is a single TMA + `mma_v2` Gluon kernel with bounded
+autotune (a fixed production policy universe pruned at launch from the actual
+CUDA device profile and problem shape). It was promoted to the default after
+the M10 gates in
+[docs/sparton_remaining_work_design_v2.md](docs/sparton_remaining_work_design_v2.md):
+it is faster than hybrid on every measured shape, uses output-only memory
+(~14x less peak than hybrid on the dev shape), and matches the reference on
+the full correctness matrix; evidence in
+[docs/sparton_milestone10_promotion_memo.md](docs/sparton_milestone10_promotion_memo.md).
+
+To pin a backend explicitly (rollback path), pass the constructor argument or
+set the environment variable before importing `sparton`:
 
 ```python
 head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="hybrid")
 ```
 
-For backend-refactor debugging, M5 adds an experimental Triton-only fused
-forward baseline. The current naive backend uses a bounded Triton autotune
-search over forward tile sizes:
-
-```python
-head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="naive")
+```bash
+SPARTON_BACKEND=hybrid python train.py ...
 ```
 
-M8 adds an experimental Gluon fused-forward backend with bounded autotune. The
-decorator uses a fixed production policy universe for stable descriptor slots;
-the active candidates are pruned at launch from the actual CUDA device profile
-and problem shape:
+Available backends: `optimized` (default where available), `hybrid` (the
+previous default — compiled tiled matmul + Triton reduction; the
+compatibility path), and `naive` (a Triton-only `tl.dot` debug baseline).
+All three share the same Triton backward and the same numerics contract.
 
-```python
-head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="optimized")
-```
-
-You can also set `SPARTON_BACKEND=naive` before importing `sparton` to change
-the default for newly constructed heads. `SPARTON_BACKEND=optimized` is also
-available for local Gluon experiments. Hybrid remains the production default;
-`optimized` requires CUDA sm_80+ plus importable `triton.experimental.gluon`,
-is validated in this workspace with Triton 3.6.0, and is not promoted.
+Mixed precision: the forward wrappers mirror `torch.autocast` semantics —
+under an active CUDA autocast region, fp32 master parameters are cast to the
+autocast dtype (fp16/bf16) like any autocast-aware matmul, so standard AMP
+training works with every backend.
 
 Index semantics across backends: the returned index for a vocabulary entry is
 meaningful only where its score is greater than zero (zero-baseline policy).

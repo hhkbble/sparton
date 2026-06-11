@@ -5,7 +5,7 @@ import triton.language as tl
 import torch
 from typing import Optional, Tuple
 
-from ._validation import validate_forward_inputs
+from ._validation import autocast_canonicalize, validate_forward_inputs
 
 logger = logging.getLogger("sparton")
 
@@ -668,6 +668,7 @@ def hybrid_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
     validate_forward_inputs(hidden, embed, bias, mask, backend="hybrid")
     # Canonicalize before the op so autograd saves contiguous tensors; the
     # backward kernel computes flat offsets that assume dense [B, S, D] strides.

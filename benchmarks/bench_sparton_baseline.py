@@ -164,6 +164,7 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
 
     optimized_bias_ms = None
     optimized_nobias_ms = None
+    optimized_fwd_bwd_ms = None
     optimized_peak = None
     if args.optimized_policy == "on":
         def optimized_bias():
@@ -171,6 +172,14 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
 
         def optimized_nobias():
             return sk.optimized_forward(hidden, embed, None, mask)
+
+        def optimized_fwd_bwd():
+            h = hidden.detach().requires_grad_(True)
+            e = embed.detach().requires_grad_(True)
+            b = bias.detach().requires_grad_(True)
+            scores, _idx = sk.optimized_forward(h, e, b, mask)
+            scores.float().sum().backward()
+            return scores
 
         optimized_bias_ms = bench_ms(
             optimized_bias,
@@ -181,6 +190,11 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
             optimized_nobias,
             warmup=args.optimized_warmup,
             rep=args.optimized_rep,
+        )
+        optimized_fwd_bwd_ms = bench_ms(
+            optimized_fwd_bwd,
+            warmup=args.bwd_warmup,
+            rep=args.bwd_rep,
         )
         optimized_peak = peak_extra_memory(optimized_bias)
 
@@ -205,6 +219,7 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         "naive_peak_mib": None if naive_peak is None else bytes_to_mib(naive_peak),
         "optimized_bias_ms": optimized_bias_ms,
         "optimized_nobias_ms": optimized_nobias_ms,
+        "optimized_fwd_bwd_ms": optimized_fwd_bwd_ms,
         "optimized_peak_mib": None if optimized_peak is None else bytes_to_mib(optimized_peak),
         "output_mib": bytes_to_mib(output_bytes),
         "logits_mib": bytes_to_mib(logits_bytes),
@@ -235,6 +250,7 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
         ("naive MiB", "right"),
         ("opt+b ms", "right"),
         ("opt ms", "right"),
+        ("opt f+b ms", "right"),
         ("opt MiB", "right"),
         ("out MiB", "right"),
         ("logits MiB", "right"),
@@ -258,6 +274,7 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
             fmt(row["naive_peak_mib"], precision=2),
             fmt(row["optimized_bias_ms"]),
             fmt(row["optimized_nobias_ms"]),
+            fmt(row["optimized_fwd_bwd_ms"]),
             fmt(row["optimized_peak_mib"], precision=2),
             fmt(row["output_mib"], precision=2),
             fmt(row["logits_mib"], precision=1),

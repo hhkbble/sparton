@@ -5,6 +5,131 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-12
 
+### Remaining-work design v3
+
+- Added
+  [docs/sparton_remaining_work_design_v3.md](docs/sparton_remaining_work_design_v3.md),
+  the post-M10 forward plan carrying the incomplete milestones out of design
+  v2 in refined form. M11 (backward track) gains a re-profiling entry step,
+  a capture-to-disk distribution harness spec that uses the now-cached M10
+  tier-2 model/data for real index distributions, mask-density dimensions,
+  a determinism measurement protocol (with bitwise determinism explicitly
+  rejected as a gate), and ordered B2a/B2b decision criteria; M12 decouples
+  launcher v2 (with a selection-parity gate before the descriptor bank is
+  deleted) from the entry-gated persistent/warp-specialized rewrite, whose
+  warp-specialize subprocess probe is a hard entry gate and which owns the
+  D2 dedup decision point. The v2 headline "backward ≈ 62% of fwd+bwd" is
+  refined to the measured shape-dependent range (24–64% across the M10
+  grid, 61% on the dev shape); a numbers-provenance appendix maps every
+  headline figure to the session or memo that measured it.
+- Marked
+  [docs/sparton_remaining_work_design_v2.md](docs/sparton_remaining_work_design_v2.md)
+  superseded as the forward plan (it remains authoritative for the post-M8
+  review findings, the evolution ledger, the §4 architecture rules, and the
+  executed M9/M10 specifications); its M11/M12 sections are replaced by
+  pointers to v3 so the future work has exactly one specification. Updated
+  the active-design-doc references in `AGENTS.md` (project map, orientation,
+  documentation-system table, task routing, exemplar table) and
+  `benchmarks/README.md`.
+
+### AGENTS.md method refactor
+
+- Refactored `AGENTS.md` from a facts-and-invariants file into the full
+  operating guide, distilling the engineering method that produced the
+  M8→M10 arc so future agents reproduce it: a new Operating Loop section
+  (probe-before-design, scope declared as will-NOT-touch lists, red→green
+  bug fixes with captured failing output, numeric gates per task, efficiency
+  rules); an Evidence/Measurement/Gates section (second-consecutive-run
+  judging, same-config noise bands before cross-config verdicts,
+  do_bench/ncu/nsys regime separation, classify-failures-before-fixing with
+  the three possible verdicts); a Testing Doctrine section (tests must prove
+  what they appear to prove, coverage-activation assertions,
+  deterministic-vs-random assertion strength, error templates as tested API,
+  single-sourced gate logic, the three pytest invocation modes); a House
+  Style section with an exemplar table mapping each artifact type to its
+  best in-repo instance (gate script, probe, contract checker, validation
+  template, design doc, memos) plus the symmetry/one-seam/no-silent-fallback
+  rules; and a Documentation System section formalizing the five-document
+  role table, the supersession-chain practice, and the
+  every-number-was-measured rule. Rules cite the memo or design section that
+  taught them.
+- Refreshed stale facts while refactoring: `transformers` 5.11.0 and
+  `accelerate` 1.14.0 are now present in the venv (installed at M10 with
+  torch/triton verified untouched); the training section records the
+  tied-weight `torch.save` requirement, the transformers-5 smoke-only
+  validation status, and the cached M10 model/dataset; Known Sharp Edges
+  gains the atomic-add training non-determinism band and the expected
+  GradScaler early-skip behavior; Validation routes optimized-surface
+  changes to the shape soak and autograd/AMP changes to the training smoke.
+
+### M10 promotion: optimized is the default backend
+
+#### Changed
+
+- **The default backend is now `optimized`** wherever the Gluon backend is
+  available (CUDA sm_80+ plus importable `triton.experimental.gluon`). With
+  no `backend` argument and no `SPARTON_BACKEND`, default resolution falls
+  back to `hybrid` with a one-time `RuntimeWarning` when optimized is
+  unavailable — the only adaptive fallback in the package; explicitly
+  selected backends still raise with the reason. Rollback:
+  `SPARTON_BACKEND=hybrid` or `SpartonHead(..., backend="hybrid")` (the
+  hybrid path is unchanged). Promotion evidence per the design v2 §5 M10
+  gates is in
+  [docs/sparton_milestone10_promotion_memo.md](docs/sparton_milestone10_promotion_memo.md):
+  optimized forward is 19–27% faster than hybrid on the dev shape and all
+  nine canonical-grid rows, fwd+bwd is 11–20% faster, and peak extra memory
+  is 1.0–1.06× outputs (hybrid: 6.2–23×).
+- The forward wrappers now mirror `torch.autocast` semantics
+  (`_validation.autocast_canonicalize`): under an active CUDA autocast
+  region, floating inputs are cast to the autocast dtype so fp32 master
+  parameters work under fp16/bf16 AMP with every backend. This fixes a
+  latent gap surfaced by the M10 training gate — the M9 dtype-equality
+  validation had made AMP training a hard `TypeError` on all backends
+  (hybrid had only ever worked pre-M9 via TorchInductor's autocast-aware
+  matmul; the fused backends never supported AMP).
+- `benchmarks/bench_sparton_baseline.py` gained an `opt f+b ms` column
+  (optimized forward+backward timing) alongside the existing optimized
+  columns.
+- `training/train.py`: `LSRTrainer.save_model` now serializes the model with
+  `torch.save` — `SpladeModel` ties the head weight to the backbone word
+  embeddings, and transformers 5 removed `TrainingArguments.save_safetensors`,
+  so the stock `Trainer._save` can never write this model via safetensors.
+- README Backend Selection, AGENTS.md invariants, and the benchmarks README
+  were updated for the new default, the adaptive-fallback exception, the AMP
+  behavior, and the new gate scripts.
+
+#### Added
+
+- Added `benchmarks/soak_optimized_correctness.py` (M10 gate 5): a 384-case
+  S/B/D/V/bias/dtype sweep with random masks including fully zeroed rows,
+  checking optimized scores against a vectorized reference plus the
+  tie-aware index contract. Full-sweep result: `384/384 passed, max score
+  err 0.001953, max index gap 0.000000`.
+- Added `benchmarks/probe_training_smoke.py` (M10 gate 6 tier 1): 300-step
+  head-only contrastive+FLOPS training from identical fp32 master weights
+  under fp16 AMP (GradScaler) and bf16 autocast; hybrid-vs-optimized loss
+  parity 0.03–0.24%, far inside the 5% gate.
+- Added autocast forward/backward tests for all three backends (fp16 and
+  bf16), an adaptive-default subprocess test, a one-time-fallback-warning
+  test, and a slow training-parity test that reuses the smoke script's
+  `run_mode`; the routing test is now availability-aware. Suite: 105 → 114.
+- Added
+  [docs/sparton_milestone10_promotion_memo.md](docs/sparton_milestone10_promotion_memo.md)
+  with the gate-by-gate evidence, the tier-2 real-model runs (transformers
+  5.11 + accelerate 1.14 installed; torch/triton untouched), the decision
+  record, and residual risks.
+
+#### Validation
+
+- Hardened-env exit run: glob `py_compile` passed; full pytest `114 passed`
+  (quick loop `98 passed, 16 deselected`); shape soak `384/384`; 300-step
+  training smoke passed both modes; dev-shape benchmark run 2 `hyb+b 1.181 /
+  opt+b 0.900 / hyb f+b 2.642 / opt f+b 2.325 ms`; canonical grid 9/9 rows
+  optimized faster for forward and fwd+bwd; five 150-step
+  `training/train.py` runs (hybrid×3, optimized×2) finite and decreasing
+  with backend parity within run-to-run noise (seed-43 mean losses match to
+  0.3%); `import sparton` silent; `git diff --check` clean.
+
 ### M9 production readiness
 
 #### Added
