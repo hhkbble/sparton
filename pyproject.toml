@@ -39,6 +39,7 @@ strict_parametrization_ids = true
 strict_xfail = true
 markers = [
     "cuda: tests that require a CUDA device",
+    "optimized_gluon: tests that require the experimental optimized Gluon backend",
     "slow: tests that are comparatively expensive",
 ]
 

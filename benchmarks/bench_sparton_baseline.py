@@ -5,7 +5,10 @@ Defaults model the projection-head dimensions of naver/splade-code-06B:
   - vocab size 151936
   - bf16 tensors
 
-The benchmark runs one row per (B, S) pair with all-ones attention masks.
+The benchmark runs one row per (B, S) pair with all-ones attention masks. The
+naive backend uses production Triton autotune; pass ``--optimized-policy on``
+to include the experimental Gluon forward with runtime GPU-derived active
+autotune candidates.
 Needs PYTHONPATH=src and the hardened env prefix from
 docs/sparton_gluon_remaining_work_design.md section 2.4.
 """
@@ -159,6 +162,28 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         naive_nobias_ms = bench_ms(naive_nobias, warmup=args.naive_warmup, rep=args.naive_rep)
         naive_peak = peak_extra_memory(naive_bias)
 
+    optimized_bias_ms = None
+    optimized_nobias_ms = None
+    optimized_peak = None
+    if args.optimized_policy == "on":
+        def optimized_bias():
+            return sk.optimized_forward(hidden, embed, bias, mask)
+
+        def optimized_nobias():
+            return sk.optimized_forward(hidden, embed, None, mask)
+
+        optimized_bias_ms = bench_ms(
+            optimized_bias,
+            warmup=args.optimized_warmup,
+            rep=args.optimized_rep,
+        )
+        optimized_nobias_ms = bench_ms(
+            optimized_nobias,
+            warmup=args.optimized_warmup,
+            rep=args.optimized_rep,
+        )
+        optimized_peak = peak_extra_memory(optimized_bias)
+
     elem_size = tensor_element_size(dtype)
     output_bytes = spec.batch_size * args.vocab * (
         elem_size + torch.empty((), dtype=torch.int64).element_size()
@@ -178,6 +203,9 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         "naive_bias_ms": naive_bias_ms,
         "naive_nobias_ms": naive_nobias_ms,
         "naive_peak_mib": None if naive_peak is None else bytes_to_mib(naive_peak),
+        "optimized_bias_ms": optimized_bias_ms,
+        "optimized_nobias_ms": optimized_nobias_ms,
+        "optimized_peak_mib": None if optimized_peak is None else bytes_to_mib(optimized_peak),
         "output_mib": bytes_to_mib(output_bytes),
         "logits_mib": bytes_to_mib(logits_bytes),
         "tokens_per_s": tokens / (hybrid_bias_ms / 1000.0),
@@ -205,6 +233,9 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
         ("naive+b ms", "right"),
         ("naive ms", "right"),
         ("naive MiB", "right"),
+        ("opt+b ms", "right"),
+        ("opt ms", "right"),
+        ("opt MiB", "right"),
         ("out MiB", "right"),
         ("logits MiB", "right"),
         ("tok/s", "right"),
@@ -225,6 +256,9 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
             fmt(row["naive_bias_ms"]),
             fmt(row["naive_nobias_ms"]),
             fmt(row["naive_peak_mib"], precision=2),
+            fmt(row["optimized_bias_ms"]),
+            fmt(row["optimized_nobias_ms"]),
+            fmt(row["optimized_peak_mib"], precision=2),
             fmt(row["output_mib"], precision=2),
             fmt(row["logits_mib"], precision=1),
             fmt(row["tokens_per_s"], precision=0),
@@ -247,6 +281,9 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--naive-warmup", type=int, default=4)
     parser.add_argument("--naive-rep", type=int, default=16)
     parser.add_argument("--naive-policy", choices=("on", "off"), default="on")
+    parser.add_argument("--optimized-warmup", type=int, default=4)
+    parser.add_argument("--optimized-rep", type=int, default=16)
+    parser.add_argument("--optimized-policy", choices=("on", "off"), default="off")
     return parser.parse_args(argv)
 
 
@@ -258,6 +295,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     dtype = parse_dtype(args.dtype)
     if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("default bf16 benchmark requires CUDA BF16 support; pass --dtype fp16")
+    if args.optimized_policy == "on":
+        from sparton._gluon_runtime import is_gluon_backend_available
+
+        available, reason = is_gluon_backend_available()
+        if not available:
+            raise RuntimeError(
+                "bench_sparton_baseline.py --optimized-policy on requires the "
+                "optimized Gluon backend (CUDA sm_80+ and importable "
+                f"triton.experimental.gluon): {reason}"
+            )
 
     import sparton.sparton_kernel as sk
 
@@ -267,7 +314,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"D={args.dim} V={args.vocab} dtype={dtype_name(dtype)} "
         f"B={','.join(map(str, args.batch_sizes))} "
         f"S={','.join(map(str, args.seq_lens))} "
-        f"warmup/rep={args.warmup}/{args.rep} naive={args.naive_policy}"
+        f"warmup/rep={args.warmup}/{args.rep} naive={args.naive_policy} "
+        f"optimized={args.optimized_policy}"
     )
     print("Times are milliseconds per fixed (B, S) row; masks are all ones.")
 

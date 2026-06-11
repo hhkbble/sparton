@@ -3,6 +3,110 @@
 All notable repository changes should be recorded here. Entries are grouped by
 the date they land in the repository unless a formal release tag exists.
 
+## 2026-06-12
+
+### Added
+
+- Added
+  [docs/sparton_remaining_work_design_v2.md](docs/sparton_remaining_work_design_v2.md),
+  the post-M8 forward plan produced by a line-by-line review of the M5/M8
+  implementation commits against the original design. It records the verified
+  current state, the design-evolution ledger, the review findings (including
+  a probe-verified wrong `embed_grad` for non-contiguous hidden on the hybrid
+  autograd path, the near-tie index-contract gap, and the missing non-fallback
+  optimized test coverage), and the revised milestone order: M9 production
+  readiness, M10 promotion decision, M11 backward track, M12 forward
+  scheduling/launch overhead.
+  [docs/sparton_gluon_remaining_work_design.md](docs/sparton_gluon_remaining_work_design.md)
+  is now marked superseded as the forward plan while remaining authoritative
+  for its platform facts and measured evidence.
+- Added the M8 experimental Gluon `optimized` backend. It registers
+  `sparton::optimized_fwd`, uses a non-persistent TMA + `mma_v2` fused forward
+  with online max/argmax, selects from runtime GPU-derived active autotune
+  candidates, keeps hybrid as the default, and delegates backward to the
+  existing hybrid backward.
+- Added `_gluon_runtime.py`, a lazy Gluon compatibility shim with static
+  sm_80+ `mma_v2` capability dispatch, a Triton 3.6.0 validation warning, and
+  a Gluon autotune compatibility export that falls back to `triton.autotune`.
+- Added `_runtime_policy.py`, a resource-derived policy generator used by the
+  Gluon GEMM benchmark, M7 tuning gate, and runtime GPU-derived optimized
+  forward autotune pruning, including the public optimized-forward fallback
+  policy helper used by tests.
+- Added `benchmarks/probe_gluon_epilogue.py` for optimized-forward epilogue
+  correctness across fp16/bf16 and bias/no-bias cases.
+- Added optimized-backend routing, correctness, backward-smoke, schema,
+  environment-default, S-tail, and allocator tests.
+- Added
+  [docs/sparton_milestone8_gluon_forward_memo.md](docs/sparton_milestone8_gluon_forward_memo.md)
+  summarizing M6-M8 implementation, M7 GEMM gate evidence, optimized-forward
+  memory/performance, validation, and remaining M9+ risks.
+
+### Changed
+
+- Changed `SpartonHead(..., backend="optimized")` and
+  `SPARTON_BACKEND=optimized` to select the M8 experimental Gluon
+  fused-forward backend.
+- Changed the optimized Gluon forward from a fixed O1 policy to bounded
+  autotune keyed by `(B, S, D, V)`: Triton sees a fixed production policy
+  universe for stable descriptor slots, while the active candidate set is
+  derived at launch from the actual CUDA device profile and problem shape.
+- Changed optimized-backend tests, probes, and opt-in benchmark paths to gate
+  on optimized Gluon availability (CUDA sm_80+ and importable Gluon symbols)
+  instead of assuming every CUDA device or only RTX 5090 can run the backend.
+- Changed the M5 `naive` Triton forward from a single fixed
+  `16x32x32/4w/3s` launch to bounded Triton autotune over ten forward tile
+  configs keyed by `(S, D, V)`, while keeping the original config as a
+  candidate.
+- Changed `benchmarks/ncu_runner.py` to profile the autotuned Gluon GEMM path
+  using the shared policy/descriptor helpers instead of a removed fixed-kernel
+  launcher.
+- Extended `benchmarks/bench_gluon_gemm.py` to use generated policy objects,
+  support fp16 and bf16, include BK=32/64-byte-swizzle candidates, enforce
+  ratio gates, and use Triton/Gluon autotune as the M7 gate by converting the
+  `_runtime_policy.py` GEMM policy universe to `triton.Config` objects with
+  shared host-side policy/config/descriptor helpers.
+- Extended `benchmarks/bench_sparton_baseline.py` with optional optimized
+  forward timing and memory columns.
+- Updated
+  [docs/sparton_gluon_remaining_work_design.md](docs/sparton_gluon_remaining_work_design.md)
+  to point to the M8 memo and note that M6-M8 are complete while `optimized`
+  remains experimental.
+
+### Validation
+
+- Verified `py_compile` for package, training, tests, and benchmark files.
+- Verified pytest result after M8, naive autotune, optimized autotune, and
+  optimized-Gluon availability gates: `47 passed, 15 warnings in 8.71s` with
+  the hardened CUDA/Triton environment.
+- Verified M6 MMA smoke: `mma_v2` passed with max-abs error `0.000006` vs
+  fp32 matmul; WGMMA and TCGen05 failed in the expected isolated subprocesses.
+- Verified M7 Gluon GEMM autotune gate on dev shape
+  `M=4096, K=768, N=30522`: fp16 selected `POLICY_ID=8` at `86.452%` of
+  cuBLAS and bf16 selected `POLICY_ID=8` at `86.343%` of cuBLAS, both using
+  the `64x64x64/3/2x2` policy.
+- Verified M7 stress GEMM gate on `M=4096, K=1024, N=50257`, fp16: best ratio
+  `173.585%` of cuBLAS in the L2-flushed benchmark regime.
+- Verified `benchmarks/probe_gluon_epilogue.py`: fp16/bf16 bias/no-bias passed.
+- Verified availability-gated benchmark/profiler smokes:
+  `bench_gluon_gemm.py`, `ncu_runner.py`, and a
+  tiny `bench_sparton_baseline.py --optimized-policy on` run all passed.
+- Verified `benchmarks/bench_naive_baseline.py` after naive autotune:
+  `B=4, S=64, D=64, V=4096`, fp16, hybrid+b `0.018 ms`, naive+b
+  `0.006 ms`, naive no-bias `0.006 ms`, and naive peak extra `0.16 MiB`.
+- Verified optimized dev-shape memory gate
+  `B=32, S=128, D=768, V=30522`, fp16: peak extra `9.86 MiB` vs `9.31 MiB`
+  outputs (`1.06x`, below the `2x` limit).
+- Verified one-row optimized benchmark on the same dev shape after optimized
+  autotune: hybrid+b `1.176 ms`, optimized+b `0.900 ms`, optimized no-bias
+  `0.896 ms`; optimized remains experimental and is not promoted.
+- Verified the full merged benchmark default with optimized enabled and
+  autotuned naive/optimized:
+  `D=1024`, `V=151936`, bf16, batch sizes `4,8,16`, sequence lengths
+  `256,512,768`, `naive-policy=on`, and `optimized-policy=on`; it emitted the
+  9-row Markdown table recorded in the M8 memo.
+- Verified custom-op schema:
+  `sparton::optimized_fwd(... Tensor? bias ...) -> (Tensor, Tensor)`.
+
 ## 2026-06-11
 
 ### Added
@@ -107,3 +211,4 @@ the date they land in the repository unless a formal release tag exists.
 - [Design review](docs/sparton_gluon_design_review.md)
 - [Milestone 2 memo](docs/sparton_milestone2_bias_none_backward_memo.md)
 - [Milestone 5 memo](docs/sparton_milestone5_naive_triton_memo.md)
+- [Milestone 8 memo](docs/sparton_milestone8_gluon_forward_memo.md)

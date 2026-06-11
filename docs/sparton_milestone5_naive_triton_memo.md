@@ -1,6 +1,7 @@
 # Sparton Milestone 5 Naive Triton Backend Memo
 
 Date: 2026-06-11.
+Last updated: 2026-06-12.
 
 ## Summary
 
@@ -43,11 +44,18 @@ hybrid backward kernel's contiguous-layout assumptions.
 The naive forward kernel is intentionally correctness-first:
 
 - one Triton program owns one batch row and one vocabulary block;
-- fixed tiles: `BLOCK_S=16`, `BLOCK_V=32`, `BLOCK_D=32`;
+- original fixed tiles: `BLOCK_S=16`, `BLOCK_V=32`, `BLOCK_D=32`;
 - K chunks are accumulated with `tl.dot` into fp32;
 - optional bias and sequence mask are applied before reduction;
 - running max starts at zero and updates only on strict `>`;
 - scores are stored as `log1p(relu(max))`, indices as `int64`.
+
+Update, 2026-06-12: the current working tree keeps the same naive kernel
+semantics and custom-op surface, but wraps the forward kernel in bounded Triton
+autotune over ten `(BLOCK_S, BLOCK_V, BLOCK_D, warps, stages)` candidates keyed
+by `(S, D, V)`. The original fixed `16x32x32/4w/3s` launch remains one of the
+autotune candidates. The benchmark table below is therefore historical M5
+evidence, not the current naive result of record.
 
 Backward is not reimplemented for M5. Naive custom-op autograd saves
 `scores`, `indices`, `hidden`, `embed`, `bias`, and `mask`, then calls the
@@ -115,7 +123,7 @@ Full default benchmark command:
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
 ```
 
-Full default results:
+Historical fixed-tile M5 results:
 
 | B | S | hyb+b ms | hyb ms | gemm ms | ovh % | hyb f+b ms | hyb MiB | naive+b ms | naive ms | naive MiB | out MiB | logits MiB | tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -135,8 +143,10 @@ current benchmark result of record should come from
 
 ## Remaining Risks
 
-- The naive kernel uses many small `tl.dot` operations and is not expected to
-  beat hybrid on large GEMM-dominated SPLADE shapes.
+- The original fixed-tile naive kernel used many small `tl.dot` operations and
+  was not expected to beat hybrid on large GEMM-dominated SPLADE shapes. The
+  current autotuned naive backend narrows that gap; see the M8 memo for current
+  benchmark results.
 - BF16 index equality is covered on deterministic tail/mask cases and the
   existing seeded small random case; arbitrary random BF16 inputs can create
   near-ties where exact indices are numerically unstable across matmul

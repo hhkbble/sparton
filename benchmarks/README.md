@@ -16,25 +16,43 @@ ENV='TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2
 ```
 
 Run scripts serially (no concurrent Triton/Inductor-compiling processes).
+Gluon-specific scripts check for CUDA sm_80+ and importable
+`triton.experimental.gluon` before launching; benchmark numbers remain
+hardware-specific to the validation machine named in the milestone docs.
 
 ## Scripts
 
 | Script | Purpose | Invocation |
 |---|---|---|
 | `probe_mma_matrix.py` | MMA availability matrix (`mma_v2` / `wgmma` / `tcgen05`), each probe in a subprocess because LLVM selection failures are fatal aborts | `env $ENV python -u probe_mma_matrix.py` |
-| `bench_gluon_gemm.py` | Standalone TMA+`mma_v2` GEMM on production Sparton layouts; per-config subprocesses with timeouts (deadlock-safe); correctness + throughput vs cuBLAS | `env $ENV python -u bench_gluon_gemm.py [--config N]` |
-| `bench_sparton_baseline.py` | Canonical merged hybrid/naive benchmark. Defaults model `naver/splade-code-06B` (`D=1024`, `V=151936`, bf16) on a fixed 3x3 grid: `B=4,8,16` and `S=256,512,768`, with all-ones masks | `env $ENV PYTHONPATH=../src python -u bench_sparton_baseline.py` (from this directory) |
+| `bench_gluon_gemm.py` | Standalone TMA+`mma_v2` GEMM on production Sparton layouts; uses Triton/Gluon autotune over the `_runtime_policy.py` GEMM policy universe, with runtime device/problem pruning and a ratio gate on the selected policy | `env $ENV python -u bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85` |
+| `bench_sparton_baseline.py` | Canonical merged hybrid/autotuned-naive benchmark. Defaults model `naver/splade-code-06B` (`D=1024`, `V=151936`, bf16) on a fixed 3x3 grid: `B=4,8,16` and `S=256,512,768`, with all-ones masks. Pass `--optimized-policy on` to include the experimental M8 Gluon forward with runtime GPU-derived active autotune candidates. | `env $ENV PYTHONPATH=../src python -u bench_sparton_baseline.py` (from this directory) |
 | `bench_hybrid_baseline.py` | Compatibility wrapper for the old hybrid dev shape (`B=32,S=128,D=768,V=30522`, fp16, naive disabled) using the canonical benchmark implementation | `env $ENV PYTHONPATH=../src python -u bench_hybrid_baseline.py` (from this directory) |
 | `bench_naive_baseline.py` | Compatibility wrapper for the M5 moderate naive shape (`B=4,S=64,D=64,V=4096`, fp16) using the canonical benchmark implementation | `env $ENV PYTHONPATH=../src python -u bench_naive_baseline.py` (from this directory) |
-| `ncu_runner.py` | Fixed-config Gluon GEMM launcher for `ncu --launch-skip`/`--launch-count` | see design doc §11 |
+| `probe_gluon_epilogue.py` | M8 optimized-forward epilogue correctness probe for fp16/bf16, bias/no-bias, row masks, strict ties, and S/V tails | `env $ENV python -u probe_gluon_epilogue.py` |
+| `ncu_runner.py` | Policy-derived Gluon GEMM launcher for `ncu --launch-skip`/`--launch-count` | see design doc §11 |
 | `ncu_targets.py` | NVTX-wrapped cuBLAS / hybrid-forward / direct-backward profiling targets | see design doc §11 |
 | `repro_inductor_env_defects.py` | Reproducer for the two cache-cold Inductor environment defects | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` + variants per its docstring |
 
 `python` above is the project venv interpreter,
 `/workspace/venvs/sparton/bin/python`.
 
+`bench_gluon_gemm.py` is the authoritative M7 gate path. It converts the
+bounded policy universe to `triton.Config` objects, lets Triton select a policy
+in-process, and reports the selected `POLICY_ID`, policy label, cache state,
+correctness error, and precise ratio vs cuBLAS. It is not subprocess-isolated;
+run it serially, and keep the generated candidate set bounded and previously
+validated.
+
 `bench_sparton_baseline.py` defaults to `--warmup 4 --rep 16` for forward and
 GEMM timing, `--bwd-warmup 4 --bwd-rep 16` for hybrid forward+backward, and
-`--naive-warmup 4 --naive-rep 16` for naive timing. Use `--naive-policy off`
-for hybrid-only sweeps. The canonical default emits exactly nine rows, one for
-each `(B, S)` pair, formatted as a Markdown table.
+`--naive-warmup 4 --naive-rep 16` for naive timing. The naive backend uses its
+production Triton autotune search keyed by `(S, D, V)`, so cache-cold runs also
+pay the compile/tune cost before timed repetitions. The optimized backend uses
+a fixed production policy universe for Triton/Gluon descriptor slots, then
+runtime GPU-derived active autotune candidates keyed by `(B, S, D, V)` when
+`--optimized-policy on` is passed, so cache-cold optimized runs also compile
+and tune before timed repetitions. Use `--naive-policy off` for hybrid-only
+runs. The optimized backend is excluded unless `--optimized-policy on` is
+passed. The canonical default emits exactly nine rows, one for each `(B, S)`
+pair, formatted as a Markdown table.

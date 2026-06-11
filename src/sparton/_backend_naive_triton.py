@@ -7,11 +7,34 @@ import triton.language as tl
 from ._backend_hybrid import fused_sparton_bwd_op
 
 
-_BLOCK_S = 16
-_BLOCK_V = 32
-_BLOCK_D = 32
+def _naive_config(block_s: int, block_v: int, block_d: int, warps: int, stages: int):
+    return triton.Config(
+        {"BLOCK_S": block_s, "BLOCK_V": block_v, "BLOCK_D": block_d},
+        num_warps=warps,
+        num_stages=stages,
+    )
 
 
+def get_naive_forward_configs():
+    return [
+        _naive_config(16, 32, 32, 4, 3),
+        _naive_config(16, 64, 32, 4, 3),
+        _naive_config(32, 32, 32, 4, 3),
+        _naive_config(32, 64, 32, 8, 3),
+        _naive_config(16, 32, 64, 4, 3),
+        _naive_config(16, 64, 64, 4, 3),
+        _naive_config(32, 32, 64, 4, 3),
+        _naive_config(32, 64, 64, 8, 3),
+        _naive_config(64, 16, 64, 4, 3),
+        _naive_config(64, 32, 64, 8, 3),
+    ]
+
+
+@triton.autotune(
+    configs=get_naive_forward_configs(),
+    key=["S", "D", "V"],
+    cache_results=True,
+)
 @triton.jit
 def sparton_naive_forward_kernel(
     hidden_ptr,
@@ -119,7 +142,9 @@ def _launch_naive_fwd(
     scores = torch.empty((B, V), device=hidden.device, dtype=hidden.dtype)
     indices = torch.empty((B, V), device=hidden.device, dtype=torch.int64)
 
-    grid = (B, triton.cdiv(V, _BLOCK_V))
+    def grid(meta):
+        return (B, triton.cdiv(V, meta["BLOCK_V"]))
+
     sparton_naive_forward_kernel[grid](
         hidden,
         embed,
@@ -141,11 +166,6 @@ def _launch_naive_fwd(
         scores.stride(0),
         scores.stride(1),
         HAS_BIAS=bias is not None,
-        BLOCK_S=_BLOCK_S,
-        BLOCK_V=_BLOCK_V,
-        BLOCK_D=_BLOCK_D,
-        num_warps=4,
-        num_stages=3,
     )
     return scores, indices
 
@@ -212,6 +232,7 @@ def naive_forward(
 
 
 __all__ = [
+    "get_naive_forward_configs",
     "naive_forward",
     "naive_fwd_op",
     "sparton_naive_forward_kernel",

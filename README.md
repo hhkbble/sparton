@@ -54,15 +54,27 @@ head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="hybrid")
 ```
 
 For backend-refactor debugging, M5 adds an experimental Triton-only fused
-forward baseline:
+forward baseline. The current naive backend uses a bounded Triton autotune
+search over forward tile sizes:
 
 ```python
 head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="naive")
 ```
 
+M8 adds an experimental Gluon fused-forward backend with bounded autotune. The
+decorator uses a fixed production policy universe for stable descriptor slots;
+the active candidates are pruned at launch from the actual CUDA device profile
+and problem shape:
+
+```python
+head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="optimized")
+```
+
 You can also set `SPARTON_BACKEND=naive` before importing `sparton` to change
-the default for newly constructed heads. The `optimized` Gluon backend is still
-under development and is not selectable yet.
+the default for newly constructed heads. `SPARTON_BACKEND=optimized` is also
+available for local Gluon experiments. Hybrid remains the production default;
+`optimized` requires CUDA sm_80+ plus importable `triton.experimental.gluon`,
+is validated in this workspace with Triton 3.6.0, and is not promoted.
 
 ## How It Works
 

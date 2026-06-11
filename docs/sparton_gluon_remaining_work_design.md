@@ -1,7 +1,29 @@
 # Sparton Gluon Remaining-Work Design
 
 Date: 2026-06-11.
-Status: **active guide for subsequent backend-refactor development.**
+Status: **superseded as the forward plan by
+[sparton_remaining_work_design_v2.md](sparton_remaining_work_design_v2.md)
+(2026-06-12, post-M8 review).** This document remains authoritative for the
+platform facts and measured evidence it records (MMA availability matrix,
+local Gluon API survey, environment-defect root cause, profiler notes, ncu
+counter evidence) and for M1-M8 design provenance; consult v2 for the current
+milestone plan, review findings, and validation matrix.
+
+Update, 2026-06-12: M6-M8 are complete in the working tree. The experimental
+`optimized` Gluon O1/policy-autotuned forward is selectable but not promoted; see
+[sparton_milestone8_gluon_forward_memo.md](sparton_milestone8_gluon_forward_memo.md)
+for implementation details, validation, and remaining M9+ risks. Sections that
+describe M6-M8 as future work are retained for design provenance. A later
+2026-06-12 fairness cleanup added bounded Triton autotune to the M5 `naive`
+forward baseline, migrated optimized forward to Gluon autotune with a fixed
+production policy universe plus runtime GPU-derived active candidates, and
+refreshed the M8 benchmark comparison. A follow-up cleanup made the
+optimized-forward fallback a `_runtime_policy.py` API, removed backend-private
+fallback-policy leakage from tests, and gates optimized functional tests/probes
+on CUDA sm_80+ plus importable Gluon symbols rather than on the RTX 5090
+benchmark host specifically. A later cleanup made `bench_gluon_gemm.py`
+autotune-only for the M7 ratio gate and moved shared host-side Gluon
+policy/config/descriptor helpers out of the benchmark and optimized backend.
 
 This document supersedes
 [sparton_gluon_current_platform_design.md](sparton_gluon_current_platform_design.md)
@@ -301,6 +323,14 @@ Results, dev shape `M=4096 (B=32, S=128), K=768, N=30522`, fp16 in / fp32 acc,
 | 128x256x64 / 2 / 4x2 | 1.488 ms — 129.0 | — | 57% |
 | 128x128x32 / 4 / 4x2 | rejected by descriptor layout: 128-byte swizzle requires `block_shape[-1] >= 64` (fp16) | — | — |
 
+Update, 2026-06-12: the current M7 gate uses Triton/Gluon autotune over the
+bounded `_runtime_policy.py` policy universe rather than this initial
+single-config table. On the same dev shape, the autotuned gate selected
+`64x64x64/3/2x2` and reached `86.452%` of cuBLAS for fp16 and `86.343%` for
+bf16. The fp16 stress shape `M=4096, K=1024, N=50257` selected
+`128x64x32/4/4x2` and reached `173.585%` of cuBLAS in the L2-flushed benchmark
+regime. See the M8 memo for command output and interpretation.
+
 Known, untried headroom: the per-K-iteration CTA barrier (replaceable with
 producer/consumer "empty-slot" barriers or warp specialization), L2-aware tile
 rasterization / persistent scheduling, instruction-level tuning. A first-cut
@@ -348,6 +378,11 @@ is 37%. Therefore:
   (§6, §12). The GEMM-throughput gate before fusion work is set at **>= 85% of
   cuBLAS** on dev shapes so the fused version has realistic slack to clear
   hybrid.
+
+Update, 2026-06-12: the policy-autotuned M8 forward exploited enough of that
+headroom to beat hybrid on the measured forward-only grids. It remains
+experimental and unpromoted because backward still delegates to hybrid and the
+default-promotion process is separate from the M8 perf recording gate.
 
 Hardware counters (§3.5) later confirmed and sharpened this model: the hybrid
 forward's DRAM reads total a measured 583 MB vs the Gluon kernel's 55 MB (the
@@ -598,11 +633,11 @@ each with entry/exit gates:
 |---|---|---|
 | M3 | Extract `_backend_hybrid.py`, no behavior change | **Done.** Hybrid op names and schemas preserved; public facade re-exports existing helpers. |
 | M4 | Router + `SPARTON_BACKEND` + `backend` kwarg | **Done.** Default proven hybrid; `naive` selectable; invalid/`optimized` selections raise with reason. |
-| M5 | `_backend_naive_triton.py` fused forward (`tl.dot`, no Gluon); backward is NOT reimplemented — the naive backend registers its own autograd that calls the current Triton backward (B1) | **Done.** Correctness/router/schema/memory tests pass; allocator check shows output-only peak on the measured shape; benchmark recorded vs hybrid. |
+| M5 | `_backend_naive_triton.py` fused forward (`tl.dot`, no Gluon); backward is NOT reimplemented — the naive backend registers its own autograd that calls the current Triton backward (B1) | **Done.** Correctness/router/schema/memory tests pass; allocator check shows output-only peak on the measured shape; current forward launch uses bounded Triton autotune with the original fixed tile retained as a candidate. |
 | M6 | `_gluon_runtime.py` shim + Gluon smoke test (probe/bench scripts already live in `benchmarks/`; extend as needed) | shim imports lazily; capability whitelist unit-tested; `mma_v2` smoke kernel passes on RTX 5090; smoke is skipped cleanly where Gluon/CUDA absent |
-| M7 | In-repo Gluon GEMM microbenchmark + policy generator + tuning sweep | correctness vs cuBLAS on dev shapes fp16 **and bf16**; **>= 85% of cuBLAS** on at least `M=4096, K=768, N=30522` and one stress shape; policy generator only emits configs satisfying §7.2 constraints |
-| M8 | Gluon fused forward O1 (non-persistent) | epilogue probe (§3.6 item 1) passed first; full correctness matrix vs reference incl. index policy; memory gate: peak extra < 2x outputs (vs hybrid's ~140 MiB); perf recorded, no gate |
-| M9 | O2/O3: persistent + warp-specialized + barrier-free pipeline | beats naive fused on all dev shapes; **>= hybrid forward on at least one realistic shape**; nsys shows single kernel launch; ncu shows DRAM reads within 1.3x the analytic A+B floor and no logits-sized write stream (§11) |
+| M7 | In-repo Gluon GEMM microbenchmark + policy generator + Triton/Gluon autotune gate | correctness vs cuBLAS on dev shapes fp16 **and bf16**; **>= 85% of cuBLAS** on at least `M=4096, K=768, N=30522` and one stress shape; policy generator only emits configs satisfying §7.2 constraints |
+| M8 | Gluon fused forward O1/policy-autotuned (non-persistent) | epilogue probe (§3.6 item 1) passed first; full correctness matrix vs reference incl. index policy; memory gate: peak extra < 2x outputs (vs hybrid's ~140 MiB); fixed production policy universe with runtime GPU-derived active candidates; policy-autotuned forward perf recorded, no default-promotion gate |
+| M9 | O2/O3: persistent + warp-specialized + barrier-free pipeline | beats autotuned naive fused on all dev shapes; **>= hybrid forward on at least one realistic shape**; nsys shows single kernel launch; ncu shows DRAM reads within 1.3x the analytic A+B floor and no logits-sized write stream (§11) |
 | M10 | Gluon backward B2 (direct atomic), then B3 (local `d_bias`/`d_embed` aggregation) | gradient matrix vs reference and vs current backward (bias and no-bias); no NaN under AMP smoke; B3 only after profiling realistic index distributions; perf >= current Triton backward before any default consideration |
 | M11 | Promotion decision | §12 gates, explicit changelog + README update |
 
@@ -898,14 +933,15 @@ ncu --nvtx --nvtx-include "hybrid_fwd/" \
 The probe and benchmark scripts were promoted into the repository at
 `benchmarks/` on 2026-06-11 (see `benchmarks/README.md`):
 `probe_mma_matrix.py` (MMA availability), `bench_gluon_gemm.py` (TMA+mma_v2
-GEMM, subprocess-per-config with timeouts), `bench_sparton_baseline.py`
+GEMM, policy-derived Triton/Gluon autotune gate), `bench_sparton_baseline.py`
 (merged hybrid/naive fixed-grid baselines),
 `bench_hybrid_baseline.py` and `bench_naive_baseline.py` (compatibility
 wrappers), `repro_inductor_env_defects.py` (environment-defect reproduction),
-`ncu_runner.py` and `ncu_targets.py` (fixed-config launchers and NVTX ranges
-for the §3.5 counter profiles). The load-bearing kernel, verbatim
-as validated (best config: `BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
-NUM_STAGES=3, warps 4x2`, launched with `num_warps=8`):
+`ncu_runner.py` and `ncu_targets.py` (autotuned launchers and NVTX ranges
+for the §3.5 counter profiles). The original fixed-policy bring-up kernel,
+kept here for provenance (initial validated config: `BLOCK_M=128,
+BLOCK_N=128, BLOCK_K=64, NUM_STAGES=3, warps 4x2`, launched with
+`num_warps=8`):
 
 ```python
 from triton.experimental import gluon
@@ -916,7 +952,8 @@ from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 @gluon.jit
 def gemm_abt_kernel(a_desc, b_desc, c_ptr, M, N, K,
                     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
-                    NUM_STAGES: gl.constexpr, WARPS_M: gl.constexpr, WARPS_N: gl.constexpr):
+                    NUM_STAGES: gl.constexpr, WARPS_M: gl.constexpr, WARPS_N: gl.constexpr,
+                    ELEMENT_TY: gl.constexpr):
     pid_m = gl.program_id(0)
     pid_n = gl.program_id(1)
     off_m = pid_m * BLOCK_M
@@ -927,8 +964,8 @@ def gemm_abt_kernel(a_desc, b_desc, c_ptr, M, N, K,
     dot_a: gl.constexpr = gl.DotOperandLayout(0, mma, 2)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, mma, 2)
 
-    a_smem = gl.allocate_shared_memory(gl.float16, [NUM_STAGES, BLOCK_M, BLOCK_K], a_desc.layout)
-    b_smem = gl.allocate_shared_memory(gl.float16, [NUM_STAGES, BLOCK_N, BLOCK_K], b_desc.layout)
+    a_smem = gl.allocate_shared_memory(ELEMENT_TY, [NUM_STAGES, BLOCK_M, BLOCK_K], a_desc.layout)
+    b_smem = gl.allocate_shared_memory(ELEMENT_TY, [NUM_STAGES, BLOCK_N, BLOCK_K], b_desc.layout)
     bars = gl.allocate_shared_memory(gl.int64, [NUM_STAGES, 1], mbarrier.MBarrierLayout())
     for i in gl.static_range(NUM_STAGES):
         mbarrier.init(bars.index(i), count=1)
@@ -965,7 +1002,7 @@ def gemm_abt_kernel(a_desc, b_desc, c_ptr, M, N, K,
     offs_cm = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, mma))
     offs_cn = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, mma))
     mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    gl.store(c_ptr + offs_cm[:, None].to(gl.int64) * N + offs_cn[None, :], acc.to(gl.float16), mask)
+    gl.store(c_ptr + offs_cm[:, None].to(gl.int64) * N + offs_cn[None, :], acc.to(ELEMENT_TY), mask)
 ```
 
 Host side: `TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K], layout)` and
@@ -993,7 +1030,10 @@ env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -c "import torch; im
 
 # Probes and benchmarks (see benchmarks/README.md):
 env $ENV /workspace/venvs/sparton/bin/python -u benchmarks/probe_mma_matrix.py
-env $ENV /workspace/venvs/sparton/bin/python -u benchmarks/bench_gluon_gemm.py
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u \
+  benchmarks/bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u \
+  benchmarks/bench_gluon_gemm.py --dtype bf16 --include-block-n-256 --require-ratio 85
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_hybrid_baseline.py
 

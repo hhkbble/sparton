@@ -32,12 +32,8 @@ _ENV_BACKEND = os.environ.get("SPARTON_BACKEND", "hybrid").strip().lower() or "h
 
 def resolve_backend(backend: Optional[str]) -> str:
     selected = _ENV_BACKEND if backend is None else backend.strip().lower()
-    if selected in {"hybrid", "naive"}:
+    if selected in {"hybrid", "naive", "optimized"}:
         return selected
-    if selected == "optimized":
-        raise RuntimeError(
-            "Sparton backend 'optimized' is not available yet; use 'hybrid' or 'naive'."
-        )
     raise ValueError(
         f"Unknown Sparton backend {selected!r}; expected 'hybrid', 'naive', or 'optimized'."
     )
@@ -48,7 +44,22 @@ def _forward_op_for_backend(backend: str):
         return fused_sparton_fwd_op
     if backend == "naive":
         return naive_forward
+    if backend == "optimized":
+        from ._backend_optimized_gluon import optimized_forward
+
+        return optimized_forward
     raise AssertionError(f"unhandled resolved Sparton backend {backend!r}")
+
+
+def __getattr__(name: str):
+    if name in {"optimized_forward", "optimized_fwd_op"}:
+        from ._backend_optimized_gluon import optimized_forward, optimized_fwd_op
+
+        return {
+            "optimized_forward": optimized_forward,
+            "optimized_fwd_op": optimized_fwd_op,
+        }[name]
+    raise AttributeError(name)
 
 
 class SpartonHead(nn.Module):
