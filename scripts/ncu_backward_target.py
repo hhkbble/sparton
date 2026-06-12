@@ -11,11 +11,11 @@ backward autotune cache, then wraps ``--launches`` direct
 thread** — autograd's backward worker thread does not inherit NVTX ranges
 (design v1 §2.5), so ``tensor.backward()`` must not be profiled here.
 
-Intended invocation (hardened env, serial; see benchmarks/README.md):
+Intended invocation (hardened env, serial; see scripts/README.md):
 
   ncu --nvtx --nvtx-include "bwd_direct/" --launch-skip 1 --launch-count 1 \
       --metrics <set recorded in the M11 memo> -o <report> \
-      python -u benchmarks/ncu_backward_target.py --dtype fp16 --bias on
+      python -u scripts/ncu_backward_target.py --dtype fp16 --bias on
 
 Prints one summary line; exits non-zero if the backward op fails.
 """

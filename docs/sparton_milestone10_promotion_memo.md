@@ -30,10 +30,10 @@ back. Rollback is one knob: `SPARTON_BACKEND=hybrid` or
    backend (hybrid had worked pre-M9 only because TorchInductor's compiled
    matmul is autocast-aware; the fused backends never supported AMP at all).
 2. **Adaptive default** in `sparton_kernel.resolve_backend` (above).
-3. **`opt f+b ms` column** in `benchmarks/bench_sparton_baseline.py` (gate 3
+3. **`opt f+b ms` column** in `scripts/bench_sparton_baseline.py` (gate 3
    needed measured optimized fwd+bwd, not inference from "same backward").
-4. **Gate tooling**: `benchmarks/soak_optimized_correctness.py` (gate 5) and
-   `benchmarks/probe_training_smoke.py` (gate 6 tier 1; its `run_mode` is
+4. **Gate tooling**: `scripts/soak_optimized_correctness.py` (gate 5) and
+   `scripts/probe_training_smoke.py` (gate 6 tier 1; its `run_mode` is
    reused by the slow `test_training_parity_smoke_autocast`).
 5. **Training example fixes** (tier 2): `LSRTrainer.save_model` now uses
    `torch.save` — `SpladeModel` ties the head weight to the backbone word
@@ -83,7 +83,7 @@ peak extra memory 1.00–1.06× outputs everywhere (hybrid: 6.2–23×).
 
 ### Gate 5 — shape soak
 
-`benchmarks/soak_optimized_correctness.py`, full sweep: S ∈ {1, 7, 64, 127,
+`scripts/soak_optimized_correctness.py`, full sweep: S ∈ {1, 7, 64, 127,
 128, 129, 255, 511} × B ∈ {1, 2, 5} × D ∈ {768, 1024} × V ∈ {30522, 151936}
 × bias ∈ {y, n} × dtype ∈ {fp16, bf16}; 75%-density random masks with batch
 row 0 fully zeroed (for B=1 the entire batch is masked):
@@ -97,7 +97,7 @@ satisfied the tie-aware index contract with zero gap.
 
 ### Gate 6 tier 1 — synthetic training smoke (mandatory)
 
-`benchmarks/probe_training_smoke.py`, 300 AdamW steps, head-only contrastive
+`scripts/probe_training_smoke.py`, 300 AdamW steps, head-only contrastive
 (cosine InfoNCE) + ramped FLOPS regularizer on a fixed synthetic set,
 identical fp32 master init, `B=16, S=128, D=768, V=30522`:
 
@@ -161,7 +161,7 @@ M10-complete status note pointing here.
 ## Validation ledger (hardened env, serial)
 
 ```text
-py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py -> passed
+py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py -> passed
 python -m pytest -q                  -> 114 passed (quick loop: 98 passed, 16 deselected)
 soak_optimized_correctness.py        -> 384/384 passed (full sweep)
 probe_training_smoke.py (300 steps)  -> passed (fp16 + bf16)

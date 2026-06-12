@@ -35,7 +35,7 @@ milestone.
 | F16 hardcoded `dtype_name="fp16"` | Intent comment plus a host-side `element_size() == 2` assert in `_launch_optimized_fwd` | `_backend_optimized_gluon.py` |
 | F20 backend-error provenance | `resolve_backend` errors name the `SPARTON_BACKEND` environment variable or the `backend` argument as the source; both paths tested | `sparton_kernel.py` |
 | Deferred: F9 (per-call descriptor-bank rebuild) | Scheduled as the M12 launcher-v2 work, per design | — |
-| Deferred: D2 (kernel-body duplication) | Cross-reference comments added above both decorator stacks (outside the JIT bodies); dedup deliberately rejected before the M12 rewrite | `_backend_optimized_gluon.py`, `benchmarks/bench_gluon_gemm.py` |
+| Deferred: D2 (kernel-body duplication) | Cross-reference comments added above both decorator stacks (outside the JIT bodies); dedup deliberately rejected before the M12 rewrite | `_backend_optimized_gluon.py`, `scripts/bench_gluon_gemm.py` |
 
 ## F1 red→green evidence
 
@@ -73,7 +73,7 @@ gradients.
    trailing `None` removed; only in-repo caller updated; symbol re-exported).
 5. Invalid inputs to the forward wrappers now raise contract-named
    `ValueError`/`TypeError` instead of reaching kernels/descriptors.
-6. `benchmarks/bench_sparton_baseline.py` hybrid columns measure
+6. `scripts/bench_sparton_baseline.py` hybrid columns measure
    `hybrid_forward` (the user path) rather than the raw op.
 
 ## Plan deviations (recorded)
@@ -107,7 +107,7 @@ naive run-to-run spread ~3% predates M9).
 ## Exit checklist transcript (2026-06-12, hardened env, serial)
 
 ```text
---- 1. py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py ---
+--- 1. py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py ---
 py_compile: passed
 --- 2. pytest full (incl. slow) ---
 105 passed, 15 warnings in 14.36s
@@ -138,7 +138,7 @@ warnings, all upstream torch deprecations.
 
 - Empty tensors (`B`, `S`, or `V` == 0) are documented as unspecified in
   `_validation.py`, not validated.
-- Raw-op callers (`benchmarks/ncu_targets.py`, anyone importing
+- Raw-op callers (`scripts/ncu_targets.py`, anyone importing
   `fused_sparton_fwd_op` directly) bypass validation by design; the ops
   assume canonical inputs (AGENTS invariant).
 - `training/` changes are `py_compile`-checked only: `transformers` is not

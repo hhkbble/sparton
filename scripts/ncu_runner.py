@@ -2,7 +2,7 @@
 
 Launches the policy selected by the GEMM autotune path six times back-to-back so
 a profiler can skip warm-up launches (e.g. `ncu --launch-skip 4 --launch-count 1`).
-Run from the benchmarks/ directory with the hardened env prefix; see
+Run from the scripts/ directory with the hardened env prefix; see
 docs/sparton_gluon_remaining_work_design.md §11 and Appendix B.
 """
 

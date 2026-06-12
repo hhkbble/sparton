@@ -13,6 +13,11 @@ Requirements:
 - `torch>=2.7.1`
 - `triton>=3.3.1`
 
+The development environment used for this repository is the NGC container
+image `nvcr.io/nvidia/pytorch:26.05-py3` (torch 2.12 nightly, Triton 3.6.0,
+CUDA 13.2 toolchain) — the validated configuration behind the documented
+benchmarks and tests.
+
 ```bash
 pip install "torch>=2.7.1" "triton>=3.3.1"
 

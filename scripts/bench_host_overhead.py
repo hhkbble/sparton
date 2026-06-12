@@ -27,7 +27,7 @@ canonicalization, and descriptor plumbing included. Record, don't threshold
 failures to *run* a requested backend still raise.
 
 Needs PYTHONPATH handling via its own bootstrap and the hardened env prefix;
-see benchmarks/README.md.
+see scripts/README.md.
 """
 
 from __future__ import annotations

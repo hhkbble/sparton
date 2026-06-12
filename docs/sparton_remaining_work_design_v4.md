@@ -287,7 +287,7 @@ dependencies. T3 is the only task that changes the kernel.
 The Performance-Optimization Loop steps 1–2 applied to the forward; v3's
 prose entry gate made executable. Half a day to a day.
 
-- New `benchmarks/ncu_forward_target.py` mirroring
+- New `scripts/ncu_forward_target.py` mirroring
   `ncu_backward_target.py` (parameterized main-thread direct calls to the
   optimized forward, NVTX range `fwd_direct/`, CLI shape/dtype/bias);
   `ncu_targets.py` stays the fixed-dev-shape hybrid-era launcher it is.
@@ -296,8 +296,9 @@ prose entry gate made executable. Half a day to a day.
   16×768, bf16). Record tensor-pipe %, SOL compute/memory, DRAM bytes,
   stall profile, occupancy, regs — same table discipline as M11 memo §2.
   Log selected policies with `TRITON_PRINT_AUTOTUNING=1`. nsys: kernel
-  inventory per forward call. Deposit transcripts (e.g.
-  `/root/profiles/m12/`).
+  inventory per forward call. Deposit transcripts (done at execution under
+  the session-local `/root/profiles/m12/`; today's convention is the
+  gitignored `tests/data/runs/<label>/`).
 - Re-measure the canonical grid and dev row **with the `gemm ms` column in
   the same run** (`bench_sparton_baseline.py --optimized-policy on`, run 2
   of 2) so per-row floor ratios and fwd/bwd shares carry one provenance —
@@ -337,7 +338,7 @@ keep the measured overhead visible.
 #### M12-T2 `gl.warp_specialize` subprocess probe (entry gate for the WS variant)
 
 Still unprobed on sm_120 (v1 §3.6 item 2). New
-`benchmarks/probe_warp_specialize.py`, subprocess-isolated in the
+`scripts/probe_warp_specialize.py`, subprocess-isolated in the
 `probe_mma_matrix.py` house shape: compile and run a minimal
 producer/consumer warp-specialized kernel; record register budgets and
 barrier interplay. Gate: the probe exits 0 having printed a verdict line
@@ -376,7 +377,7 @@ only — it does not close T3.
 
 #### M12-T4 Measurement-set additions (unconditional)
 
-- Add `--mask-density` to `benchmarks/bench_sparton_baseline.py` (default
+- Add `--mask-density` to `scripts/bench_sparton_baseline.py` (default
   1.0 — today's all-ones behavior unchanged) and record a forward sweep
   over densities {25, 75, 100}% on the dev shape plus one grid row —
   v1 §10.3's sweep, landed on the forward side (`bench_backward.py`
@@ -386,7 +387,7 @@ only — it does not close T3.
   backend — the standing documentation of the deferred F9 overhead (§6),
   and the baseline any future latency user would revive launcher v2
   against.
-- Gate: the recorded tables land in `benchmarks/README.md` (or a
+- Gate: the recorded tables land in `scripts/README.md` (or a
   benchmarks doc it links) with run-of-record provenance. Record, don't
   threshold — these are documentation of record, not pass/fail numbers.
 
@@ -524,23 +525,25 @@ Standing gates (every milestone exit, hardened env, serial):
 ```bash
 ENV='TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2/include TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor'
 PY=/workspace/venvs/sparton/bin/python
-env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py
+env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py
 env $ENV $PY -m pytest -q                          # full, incl. slow (132 at M11 exit)
 env $ENV $PY -m pytest -q -m "not slow"            # quick loop (109 at M11 exit)
-env $ENV PYTHONPATH=src $PY -u benchmarks/soak_optimized_correctness.py        # forward-surface changes
-env $ENV PYTHONPATH=src $PY -u benchmarks/probe_training_smoke.py              # autograd/AMP changes
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py --optimized-policy on   # grid of record
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py \
+env $ENV PYTHONPATH=src $PY -u scripts/soak_optimized_correctness.py        # forward-surface changes
+env $ENV PYTHONPATH=src $PY -u scripts/probe_training_smoke.py              # autograd/AMP changes
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py --optimized-policy on   # grid of record
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py \
     --batch-sizes 32 --seq-lens 128 --dim 768 --vocab 30522 --dtype fp16 --optimized-policy on  # dev row
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_backward.py --impls current,legacy \
-    --sources uniform,zipf,real --bundle /root/m11_bundles/swimir_de_steps0.pt \
-    --bundle /root/m11_bundles/swimir_de_steps150.pt --active-fraction 0.10     # backward changes
+env $ENV PYTHONPATH=src $PY -u scripts/bench_backward.py --impls current,legacy \
+    --sources uniform,zipf,real --bundle tests/data/bundles/swimir_de_steps0.pt \
+    --bundle tests/data/bundles/swimir_de_steps150.pt --active-fraction 0.10     # backward changes
 env $ENV PYTHONPATH=src $PY -c "import sparton"    # stdout-silent
 git diff --check
 ```
 
-(Regenerate the bundles via `capture_index_distributions.py` if
-`/root/m11_bundles/` is gone; bundles never live in the repo.)
+(Bundles live gitignored in `tests/data/bundles/`;
+`capture_index_distributions.py` regenerates them if absent and reuses
+them if present — regenerated bundles contain different records, so
+re-measure baselines rather than comparing across the swap.)
 
 M12 additions: production-forward counter tables vs the analytic model
 (T0); nsys launch-count and ncu DRAM-floor checks plus the v1 §9
@@ -571,11 +574,11 @@ any M13 candidate inherits it.
 | `gl.warp_specialize` immature/fatal on sm_120 | medium | M12-T2 subprocess probe before any T3 work; CTA-barrier persistent variant is the fallback |
 | Persistent rewrite churns the validated forward kernel for <5% | medium | T0 entry gate + model-derived exit numbers + v1 §9 rejection criteria + shape soak; closing-without-rewrite is a recorded outcome |
 | M13 gather ceiling sits close to current performance | medium | model-first: the ceiling is computed before any candidate is built; the closing memo records the price of the residual |
-| Captured bundles lost (host cleanup) or unrepresentative beyond swim-ir/XLM-R | low | regeneration recipe in `benchmarks/README.md`; tokenizer/corpus generality is a recorded limitation (M11 memo §9); harness accepts any capture-script bundle |
+| Captured bundles lost (host cleanup) or unrepresentative beyond swim-ir/XLM-R | low | regeneration recipe in `scripts/README.md`; tokenizer/corpus generality is a recorded limitation (M11 memo §9); harness accepts any capture-script bundle |
 | Sparse-regime capture needs training-recipe changes that don't converge cheaply | low | timeboxed probe; synthetic `f = 0.10` stays the regime of record; sentinel quick-exit already covers sparse cost |
 | Backward changes shift training numerics | low–medium | A/B vs segmented + AMP smoke + determinism protocol with the post-M11 baseline; tier-2 parity rerun lands at M13-T0 regardless |
 | Triton upgrade moves Gluon APIs mid-milestone | medium | shim + `VALIDATED_TRITON` warning in place; re-run the M7 ratio gate (`bench_gluon_gemm.py --require-ratio 85`), epilogue probe, and soak on any bump |
-| Two-process measurement interference / post-GPU-job pytest flakes | low | serial runs; classify-then-rerun rule (AGENTS.md); never edit `src/`/`benchmarks/` while a queued process will import them |
+| Two-process measurement interference / post-GPU-job pytest flakes | low | serial runs; classify-then-rerun rule (AGENTS.md); never edit `src/`/`scripts/` while a queued process will import them |
 
 ---
 
@@ -677,6 +680,11 @@ Still deferred, new home in this document:
 
 ## Appendix A. Numbers provenance
 
+Transcript paths under `/root/` are session-local artifacts of the runs
+that produced them (the repo's self-containment rule post-dates them);
+every row's regeneration recipe is the named script/command, and the
+bundles of record now live in `tests/data/bundles/`.
+
 | Number | Source (run of record) |
 |---|---|
 | Dev shape M10: fwd 0.900 / f+b 2.325 ms | M10 gate run 2, [M10 memo](sparton_milestone10_promotion_memo.md) |
@@ -695,7 +703,7 @@ Still deferred, new home in this document:
 | GEMM bring-up kernel 63.9% tensor pipe vs cuBLAS 86.6% (same occupancy/instruction family) | [v1](sparton_gluon_remaining_work_design.md) §3.5 — **GEMM benchmark kernel, not the production forward** |
 | Distribution stats: f = 1.0000, top1 collision 0.184–0.198, query collision factor ≈10417 | M11 memo §3/§4 (capture bundles) |
 | Suite 132 / quick 109; soak 384/384; smoke parity 0.21–0.24% (bf16) | M11 memo §6 gate ledger |
-| M13 gather model: seg L2-read/red residuals ≤ 1% on four shapes; seg floor 1.04/1.34 ms vs 3.31 measured (doc) | [M13 memo](sparton_milestone13_backward_memo.md) §4 (`/root/m13_runs/m13_traffic_model_out.txt`, `/root/profiles/m13/bwd_*.txt`) |
+| M13 gather model: seg L2-read/red residuals ≤ 1% on four shapes; seg floor 1.04/1.34 ms vs 3.31 measured (doc) | [M13 memo](sparton_milestone13_backward_memo.md) §4 (model promoted to `scripts/m13_traffic_model.py`, output of record `tests/data/m13_traffic_model_out.txt`; counter transcripts were session artifacts) |
 | M13 baselines: real-record bwd 3.29–4.32 ms (run 3 of record; run-2 contamination classified); A-vs-A ≤ 2.45% | M13 memo §3 (`bwd_baseline_run{1,2,3}.log`) |
 | M13 split backward: real cells 1.46–1.60× vs segmented; grid implied bwd 1.430–3.522 ms (dev 0.982); synthetic f=0.10 −6…−16% | M13 memo §5.5/§5.6 (`bench_decision_fixed_run2.log`, `gate_ab_run2.log`, `gate_grid_run2.log`, `gate_dev_run2.log`) |
 | Uniform-pass floor attainment: 1.37 ms vs 1.34 modeled (doc, ncu regime) | M13 memo §5.4 (`bwd_segv3_doc_r1.txt`) |
@@ -707,9 +715,9 @@ Still deferred, new home in this document:
 The standing-gate block in §4, plus:
 
 - Forward profiling (M12-T0): ncu/nsys command shapes from v1 §11 against
-  the new `benchmarks/ncu_forward_target.py` (NVTX `fwd_direct/`); backward
-  profiling via `benchmarks/ncu_backward_target.py` (invocation in
-  `benchmarks/README.md`); `TRITON_PRINT_AUTOTUNING=1` for selection
+  the new `scripts/ncu_forward_target.py` (NVTX `fwd_direct/`); backward
+  profiling via `scripts/ncu_backward_target.py` (invocation in
+  `scripts/README.md`); `TRITON_PRINT_AUTOTUNING=1` for selection
   logging.
 - Sanitizer (M13-T2, if ownership semantics change): the three
   `compute-sanitizer` invocations recorded in the M11 memo §5.4.
@@ -718,5 +726,6 @@ The standing-gate block in §4, plus:
   `8×128×768×1280` fp16.
 - M7 ratio gate on any Triton bump: `bench_gluon_gemm.py --dtype {fp16,bf16}
   --include-block-n-256 --require-ratio 85` plus `probe_gluon_epilogue.py`.
-- Bundle regeneration: `capture_index_distributions.py --train-steps {0,150}
-  --out /root/m11_bundles/swimir_de_steps{0,150}.pt`.
+- Bundle regeneration: `capture_index_distributions.py --train-steps {0,150}`
+  (defaults to `tests/data/bundles/swimir_de_steps{0,150}.pt`; reuses an
+  existing file, `--force` to regenerate).

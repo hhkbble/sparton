@@ -52,15 +52,22 @@ its specializations.
   sparsity regularization, and `Trainer`.
 - `tests/` contains the kernel/reference pytest suite (136 tests at the M13
   close; the quick loop `-m "not slow"` is 113). Pytest (>=9) is configured
-  in `pyproject.toml`.
-- `benchmarks/` contains validated probe/benchmark/gate scripts: MMA
+  in `pyproject.toml`. `tests/data/` is the repository-local home for
+  *generated* data and run artifacts (never Hugging Face downloads): small
+  fixtures committed, large artifacts gitignored and regenerable by a
+  `scripts/` script that reuses existing files — conventions and the
+  current contents of record in `tests/data/README.md`.
+- `scripts/` contains validated probe/benchmark/gate scripts: MMA
   availability, Gluon GEMM ratio gate, merged backend baselines (with
   `--mask-density`), shape soak, training smoke, host-overhead recorder,
-  the forward and backward direct-op profiling targets, and the backward
-  toolchain (index-distribution capture with regularizer pass-through,
-  distribution-aware backward harness with per-cell verification); usage in
-  `benchmarks/README.md`. Only validated, reusable tooling lives here —
-  disposable probes go outside the repo (Operating Loop).
+  the forward and backward direct-op profiling targets, the backward
+  toolchain (index-distribution capture with regularizer pass-through and
+  reuse-if-exists outputs, distribution-aware backward harness with
+  per-cell verification), the M13 analytic traffic model
+  (`m13_traffic_model.py`), and the backward IR/config dump tool
+  (`dump_backward_ir.py`); usage in `scripts/README.md`. Only validated,
+  reusable tooling lives here — disposable probes go to the gitignored
+  `tests/data/runs/<label>/` until they prove durable (Operating Loop).
 - Document map: the executed plan of record for M12/M13 lives in
   `docs/sparton_remaining_work_design_v4.md` (both kernel tracks closed;
   no milestone is planned after M13);
@@ -129,7 +136,7 @@ cutting evidence:
 
 - **Pipeline GPU time against authoring time.** GPU jobs run in the
   background (serially — see below) while docs, tests, and the memo are
-  written; the only forbidden overlap is editing `src/` or `benchmarks/`
+  written; the only forbidden overlap is editing `src/` or `scripts/`
   while a background or *queued* process will import them — a chained
   second run imports the edited tree and silently corrupts the A/B (M11).
   Docs and tests are always safe to edit. Sequence kernel-adjacent edits
@@ -147,11 +154,19 @@ cutting evidence:
   steady-state, which changed the campaign's shape. One probe beats a
   schedule built on an assumed cost.
 - **Deposit as you go.** Every decision-carrying run is teed to a
-  transcript at launch time, not reconstructed later; disposable probes and
-  analysis scripts live under a per-milestone directory outside the repo
-  (convention: `/root/m13_runs/probes/`, `/root/profiles/m13/`) and the
-  memo cites them by path. `benchmarks/` is only for validated, reusable
-  tooling.
+  transcript at launch time, not reconstructed later; disposable probes,
+  analysis scripts, profiles, and transcripts live under the gitignored
+  `tests/data/runs/<label>/` (convention in `tests/data/README.md`) and
+  the memo cites them by path. **Never deposit to `/tmp`**: background-task
+  stdout buffers land there transiently, the mount is `noexec` and gets
+  wiped — nothing in `/tmp` may be cited or relied on (the M13 review
+  agents' scratch went there and none of it survived as evidence; the
+  recorded findings did because they were in the memo). `scripts/` is only for validated, reusable
+  tooling — a probe that proves durable is promoted there with
+  repo-relative paths and run end-to-end at promotion (the M13 traffic
+  model and IR-dump tool are the precedents). Documents must never rely
+  on artifacts outside the repository: anything load-bearing either lives
+  in-repo or has an in-repo regeneration script.
 - Copy the repo's exemplar for the artifact you are creating (House Style)
   instead of designing from scratch; the shapes are proven.
 - Give long sweeps a `--quick` subset for development; run the full sweep
@@ -191,8 +206,9 @@ cutting evidence:
   (M13 memo §5.2: the do_bench-vs-GPU-sum gap is itself a quoted number),
   never assume it away.
 - **Deposit a transcript for every number that carries a decision** (tee
-  ncu/bench output to a file; bundles and profiles live outside the repo,
-  e.g. `/root/m11_bundles/`, `/root/profiles/`). The largest finding class
+  ncu/bench output to a file under `tests/data/runs/<label>/`; generated
+  bundles live in `tests/data/bundles/` — both gitignored, see
+  `tests/data/README.md`). The largest finding class
   in the M11 review was decision-carrying numbers with no preserved log;
   an unpreserved spot-run may not be quoted as a result — label it or
   re-run it (M11 memo §8 item 7).
@@ -224,8 +240,13 @@ cutting evidence:
   (cuBLAS unusually slow on a stress shape), say why or flag it as
   unexplained in the memo rather than letting the ratio stand alone.
 - A gate that can be expressed as a script should be one (see
-  `benchmarks/soak_optimized_correctness.py`): availability check, summary
-  line, non-zero exit listing every failure.
+  `scripts/soak_optimized_correctness.py`): availability check, summary
+  line, non-zero exit listing every failure. Scripts that write files
+  default their outputs under `tests/data/` (gitignored per
+  `tests/data/.gitignore`; CLI-overridable) — never `/tmp` and never
+  absolute paths outside the repo (`capture_index_distributions.py` →
+  `tests/data/bundles/`, `dump_backward_ir.py` → `tests/data/ir_dump/`
+  are the precedents).
 
 ## The Performance-Optimization Loop
 
@@ -258,9 +279,10 @@ repo-proven process around them.
    counters across four shapes). Compute distribution statistics (run
    counts, mixed fractions, active fractions) from the *actual inputs* —
    same seeds, same bundle records — never estimated. Deposit the script
-   with its output beside the transcripts (M13:
-   `/root/m13_runs/probes/m13_traffic_model.py`) so the model re-runs
-   against future counters. The model then prices each candidate's ceiling
+   with its output (the M13 model is promoted to
+   `scripts/m13_traffic_model.py`, output of record
+   `tests/data/m13_traffic_model_out.txt`) so the model re-runs against
+   future counters. The model then prices each candidate's ceiling
    before you invest in it, arbitrates surprises, and becomes the memo's
    expected-vs-measured spine. Pre-register the validation bar; a residual
    above it is recorded with a named mechanism (M13: the +30% query-shape
@@ -278,7 +300,7 @@ repo-proven process around them.
    `f ≪ 1` regime has no real capture; the λ-probe brackets a
    dense→collapsed transition with nothing usable inside — M13 §7).
 4. **Prototype behind a registry; production stays untouched.** Candidates
-   live in `benchmarks/` with the production op's exact signature — the
+   live in `scripts/` with the production op's exact signature — the
    *full* signature contract including output optionality (the M13
    prototypes' `bias_grad` placeholder-vs-None mismatch survived every
    quick gate, memo §8 item 2) — selected by `--impls`; the harness
@@ -316,8 +338,11 @@ repo-proven process around them.
 8. **Read the IR when the question is about lowering — and know the limits
    of static reading** (method ref §6.1–§6.2): `CompiledKernel.asm` /
    `nvdisasm` answer instruction-form questions (vector widths, scan
-   lowering, spills) at zero GPU cost; confirm the lowering before
-   benchmarking a config family. When the static census and runtime
+   lowering, spills) at zero GPU cost — `scripts/dump_backward_ir.py` is
+   the standing tool for the backward family (selection capture +
+   per-config TTGIR/PTX/SASS + load/atomic census into
+   `tests/data/ir_dump/`); confirm the lowering before benchmarking a
+   config family. When the static census and runtime
    counters disagree, stop reading listings and attribute empirically:
    compile the suspect region in isolation (differential compilation) and
    compute bytes-per-warp-instruction from sector counts ÷ executed-load
@@ -454,11 +479,11 @@ Copy the repo's best instance of a pattern instead of inventing a new shape:
 
 | Artifact | Exemplar |
 |---|---|
-| Gate/sweep script | `benchmarks/soak_optimized_correctness.py` (docstring contract, availability gate in `main`, `--quick`, summary line, non-zero exit with failure list) |
-| Training/integration probe | `benchmarks/probe_training_smoke.py` (reusable `run_mode`, per-mode gates) |
-| Perf decision harness | `benchmarks/bench_backward.py` (impl registry, per-cell verification before timing, determinism protocol, provenance header, documented synthetic-input contract and its `--quick` limits) |
-| Capture-to-disk distribution tooling | `benchmarks/capture_index_distributions.py` (stats recorded at capture; bundles outside the repo with rerun recipe; overrides recorded in bundle metadata) |
-| Runnable analytic model | the M13 traffic model (`/root/m13_runs/probes/m13_traffic_model.py` + its output beside the transcripts): exact stats from actual inputs, expected-vs-measured table per buffer per shape, time floors with named anchors |
+| Gate/sweep script | `scripts/soak_optimized_correctness.py` (docstring contract, availability gate in `main`, `--quick`, summary line, non-zero exit with failure list) |
+| Training/integration probe | `scripts/probe_training_smoke.py` (reusable `run_mode`, per-mode gates) |
+| Perf decision harness | `scripts/bench_backward.py` (impl registry, per-cell verification before timing, determinism protocol, provenance header, documented synthetic-input contract and its `--quick` limits) |
+| Capture-to-disk distribution tooling | `scripts/capture_index_distributions.py` (stats recorded at capture; bundles outside the repo with rerun recipe; overrides recorded in bundle metadata) |
+| Runnable analytic model | `scripts/m13_traffic_model.py` (+ its output of record `tests/data/m13_traffic_model_out.txt`): exact stats from actual inputs, expected-vs-measured table per buffer per shape, time floors with named anchors |
 | Contract checker + test tables | `tests/test_sparton_kernel.py` (`assert_index_contract`, case tables) |
 | Activation-pinning test | `tests/test_sparton_kernel.py::test_backward_uniform_chunk_path_matches_closed_form` (constructed activating input, the activation property asserted, closed-form outputs) |
 | Input validation + error template | `src/sparton/_validation.py` |
@@ -666,6 +691,11 @@ Authoring rules:
 
 ## Environment
 
+- The dev environment is the Docker image `nvcr.io/nvidia/pytorch:26.05-py3`
+  (NGC PyTorch container; ships the torch 2.12 nightly + Triton 3.6.0 +
+  CUDA 13.2 toolchain the venv layers over via `--system-site-packages`).
+  The workspace-defect notes below describe this container as mounted on
+  this host.
 - The package declares Python `>=3.10`.
 - Use the project venv unless there is a specific reason not to:
   `/workspace/venvs/sparton/bin/python`.
@@ -710,7 +740,7 @@ Authoring rules:
   the Performance-Optimization Loop for perf work.
 - For backward work specifically, the M13 memo carries the current
   mechanism evidence and the validated gather/traffic model (the M11 memo
-  carries the segmented design it split); `benchmarks/bench_backward.py`
+  carries the segmented design it split); `scripts/bench_backward.py`
   is the harness and `legacy_fused_sparton_bwd` (the M11 segmented design)
   the A/B reference. The Core Kernel Invariants section's three split
   invariants are the correctness surface of any edit there.
@@ -741,7 +771,7 @@ Authoring rules:
   `nthakur/swim-ir-cross-lingual` with languages `de,es,fr`.
 - Full training downloads large Hub assets and can be expensive. Do not run it
   casually as validation; prefer small synthetic or smoke probes
-  (`benchmarks/probe_training_smoke.py`) unless the user explicitly asks for
+  (`scripts/probe_training_smoke.py`) unless the user explicitly asks for
   a training run. The xlm-roberta-base weights and the swim-ir `de` split are
   cached locally since the M10 tier-2 runs; a steady-state 150-step tier-2
   run costs ~25 s on this host (M13 memo §6/§7) — the cold-start first run
@@ -766,7 +796,7 @@ Authoring rules:
 - For brand-new untracked docs, use `git diff --no-index`, for example:
   `git diff --no-index -- /dev/null CHANGELOG.md`
 - Syntax check for the current Python files:
-  `/workspace/venvs/sparton/bin/python -m py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py`
+  `/workspace/venvs/sparton/bin/python -m py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py`
 - Import check from source (must print the export list with no other stdout):
   `PYTHONPATH=src /workspace/venvs/sparton/bin/python -c "import sparton; print(sparton.__all__)"`
 - Pytest suite (full; append `-m "not slow"` for the quick loop):
@@ -779,16 +809,17 @@ Authoring rules:
   shapes, and at least one nontrivial tile boundary.
 - For changes that touch the optimized forward's correctness surface
   (kernel, policy generation, descriptors, validation), rerun the shape soak:
-  `benchmarks/soak_optimized_correctness.py` (use `--quick` while iterating,
+  `scripts/soak_optimized_correctness.py` (use `--quick` while iterating,
   the full sweep as the gate).
 - For changes that touch autograd, AMP, or the training path, rerun
-  `benchmarks/probe_training_smoke.py`.
-- For backward-kernel changes, rerun `benchmarks/bench_backward.py` with
+  `scripts/probe_training_smoke.py`.
+- For backward-kernel changes, rerun `scripts/bench_backward.py` with
   `--impls current,legacy` over {uniform, zipf} and the captured-real
-  bundles (regenerate via `benchmarks/capture_index_distributions.py` if
-  `/root/m11_bundles/` is gone — but regenerated bundles are *different
-  records*; cross-session comparisons to old transcripts break, so
-  re-measure baselines rather than comparing); uniform-only evidence is
+  bundles in `tests/data/bundles/` (regenerate via
+  `scripts/capture_index_distributions.py` if absent — it reuses existing
+  files; regenerated bundles are *different records*, so cross-session
+  comparisons to old transcripts break and baselines are re-measured
+  rather than compared); uniform-only evidence is
   never sufficient for a backward change (M11 rule of record).
 - For new or changed kernels whose ownership semantics differ from their
   predecessor (atomics→plain stores, `torch.empty` outputs, complementary

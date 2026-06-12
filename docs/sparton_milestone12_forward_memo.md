@@ -10,8 +10,10 @@ nightly, Triton 3.6.0, ncu 2026.1.1. Benchmark cells are
 `return_mode`; the M11 memo's header says "medians" for the same helper —
 a mislabel inherited from there, flagged in §7 item 5) judged on run 2 of
 two consecutive runs; ncu numbers are kernel-level (serialized,
-multi-pass) and are never compared against them. Transcripts for every decision-carrying
-number: `/root/profiles/m12/`.
+multi-pass) and are never compared against them. Transcripts for every
+decision-carrying number: `/root/profiles/m12/` — session-local artifacts
+(the repo's self-containment rule post-dates this milestone); rerun
+recipes are in this memo's commands and `scripts/README.md`.
 
 ## 1. Decision
 
@@ -46,7 +48,7 @@ of forward with no in-scope mechanism.
 
 ## 2. T0 entry evidence — first profile of the production forward kernel
 
-Profiled via the new `benchmarks/ncu_forward_target.py` (NVTX `fwd_direct/`,
+Profiled via the new `scripts/ncu_forward_target.py` (NVTX `fwd_direct/`,
 main-thread raw-op calls, autotune warmed outside the range;
 `--launch-skip 1 --launch-count 1`). The kernel had never been ncu-profiled
 before this session (only the GEMM bring-up kernel had counters, v1 §3.5).
@@ -193,7 +195,7 @@ as a gap).
 **Verdict: NO-GO.** Per the pre-registered rule: closing memo (this
 document), D2 discharged by re-affirmation (comment updates at
 `src/sparton/_backend_optimized_gluon.py` above the decorator stack and
-`benchmarks/bench_gluon_gemm.py`), M12 kernel work closed; T2
+`scripts/bench_gluon_gemm.py`), M12 kernel work closed; T2
 (`gl.warp_specialize` probe) is not run — it exists solely as the entry
 gate for T3's WS variant. Correction from the review pass: the comment
 edits exclude the comment *bytes* from the compiled-source hash, but

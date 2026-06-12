@@ -262,8 +262,8 @@ visible immediately as `tt.scan` + SHFL chains in TTGIR/SASS.
 
 Triton chooses tensor layouts from the *consuming* operations, and that
 choice propagates back into load vector widths. Lessons measured on the
-sparton backward (M13 memo §2/§5.4; IR dumps under
-`/root/profiles/m13/ir_dump/`):
+sparton backward (M13 memo §2/§5.4; regenerate the per-config IR/SASS
+dumps any time with `scripts/dump_backward_ir.py` → `tests/data/ir_dump/`):
 
 - **Reductions are layout-agnostic; scans are not.** A tile feeding only
   `tl.sum` vectorizes freely (`LDG.E.128` at ordinary register budgets); a

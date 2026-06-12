@@ -88,7 +88,7 @@ TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
 Baseline and tests:
 
 ```text
-py_compile package/training/tests/benchmarks: passed
+py_compile package/training/tests/scripts: passed
 pytest -q: 47 passed, 15 warnings in 8.71s
 probe_gluon_epilogue.py: fp16/bf16 bias/no-bias passed
 availability-gate smokes: bench_gluon_gemm.py fp16/bf16 autotune gates passed;
@@ -139,7 +139,7 @@ autotune, 2026-06-12. Command:
 
 ```bash
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u \
-  benchmarks/bench_sparton_baseline.py --optimized-policy on
+  scripts/bench_sparton_baseline.py --optimized-policy on
 ```
 
 Preset:

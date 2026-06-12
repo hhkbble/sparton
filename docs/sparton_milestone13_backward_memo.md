@@ -12,7 +12,12 @@ cells come from `triton.testing.do_bench` at the op level; ncu durations are
 serialized and appear only as structure/counter evidence; nsys is the
 single-regime source for sort/fill attribution. Transcripts:
 `/root/profiles/m13/` (ncu/nsys/IR), `/root/m13_runs/` (bench/training
-logs).
+logs) — session-local artifacts (the repo's self-containment rule
+post-dates this milestone): the runnable model and the IR-dump tool are
+promoted to `scripts/m13_traffic_model.py` (output of record
+`tests/data/m13_traffic_model_out.txt`) and `scripts/dump_backward_ir.py`;
+the bundles of record live in `tests/data/bundles/`; every other cited
+number's regeneration command is in this memo or `scripts/README.md`.
 
 ## 1. Decision
 
@@ -56,11 +61,11 @@ backward's floor-level term is now the embed kernel itself plus
 
 ## 2. T0 entry evidence — fresh counters on the promoted segmented backward
 
-Direct-op profile via `benchmarks/ncu_backward_target.py` (NVTX
+Direct-op profile via `scripts/ncu_backward_target.py` (NVTX
 `bwd_direct/`, main thread, `--launch-skip 4 --launch-count 4` over the
 four-kernel regex `bwd_prep_kernel|embed_grad_kernel|
 bwd_gather_payload_kernel|segmented_hidden_grad_kernel` — the
-`benchmarks/README.md` invocation's `regex:sparton_bwd` matches only the
+`scripts/README.md` invocation's `regex:sparton_bwd` matches only the
 retired legacy kernel name and profiles nothing on this family; corrected
 at close). Metric set = the M11 §2 union plus M13 additions
 (`lts__t_sectors_op_{read,write,atom}`,
@@ -449,7 +454,7 @@ promotion — the floor stands as the documented ceiling either way.
 
 ### 5.4 T1 execution: the variant walk
 
-All variants live in `benchmarks/bwd_prototypes.py` (production-op
+All variants live in `scripts/bwd_prototypes.py` (production-op
 signature, per-cell verified vs `current` before every timing row);
 quick-cell logs `/root/m13_runs/bench_segv{2,3}*_quick*.log`, kernel
 profiles `/root/profiles/m13/bwd_segv{2,2b,3,31}_doc_r1.txt`. Every accepted step has a
@@ -594,7 +599,7 @@ host stages factored into `_bwd_shared_stages`; the segmented kernel and
 `segmented_sparton_bwd` retained as the reference path behind
 `legacy_fused_sparton_bwd` (role comment names the removal condition);
 the M2-era kernel, its launcher, and its config helpers deleted with
-their facade re-exports; `benchmarks/bwd_prototypes.py` deleted
+their facade re-exports; `scripts/bwd_prototypes.py` deleted
 (winner-only wiring, M11 precedent).
 
 ```text

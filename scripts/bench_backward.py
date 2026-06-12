@@ -100,7 +100,7 @@ def build_impls(names: list[str]) -> dict[str, callable]:
                 from bwd_prototypes import PROTOTYPES
             except ImportError as exc:
                 raise RuntimeError(
-                    f"impl {name!r} requires benchmarks/bwd_prototypes.py "
+                    f"impl {name!r} requires scripts/bwd_prototypes.py "
                     f"(M11 T3 decision-probe tree): {exc}"
                 ) from exc
             if name not in PROTOTYPES:

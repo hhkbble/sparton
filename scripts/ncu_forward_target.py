@@ -18,11 +18,11 @@ backward target's 0.75) so profiles correspond to the all-ones canonical
 grid rows they gate; the kernel's work is mask-value-invariant (the mask is
 an epilogue multiply, not control flow).
 
-Intended invocation (hardened env, serial; see benchmarks/README.md):
+Intended invocation (hardened env, serial; see scripts/README.md):
 
   ncu --nvtx --nvtx-include "fwd_direct/" --launch-skip 1 --launch-count 1 \
       --section ... --metrics <set recorded in the M12 memo> -o <report> \
-      python -u benchmarks/ncu_forward_target.py --dtype fp16 --bias on
+      python -u scripts/ncu_forward_target.py --dtype fp16 --bias on
 
 Prints one summary line; exits non-zero if the forward op fails.
 """

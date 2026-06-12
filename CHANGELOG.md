@@ -5,6 +5,47 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-13
 
+### Repository self-containment: `benchmarks/` → `scripts/`, `tests/data/` conventions, promoted tools
+
+- **`benchmarks/` renamed to `scripts/`** (`git mv`; history preserved).
+  Every reference updated repo-wide: the test suite's namespace imports
+  (`tests/conftest.py`, `from scripts.<module> import ...`), intra-script
+  docstrings, the `src/sparton/_backend_optimized_gluon.py` cross-reference
+  comment, AGENTS.md, `scripts/README.md`, all design docs and milestone
+  memos, and historical CHANGELOG entries (references are live pointers —
+  pre-rename entries now name the current path).
+- **`tests/data/` is the repository-local home for generated data and run
+  artifacts** (never Hugging Face downloads): small fixtures committed;
+  large artifacts gitignored and produced by `scripts/` tools that
+  **reuse an existing file instead of regenerating** (the M11 capture
+  bundles of record were relocated to `tests/data/bundles/` — regenerated
+  bundles contain different records, so the originals were moved, not
+  remade). `capture_index_distributions.py` now defaults its output there,
+  reuses existing bundles (exits without touching the GPU), and takes
+  `--force` to regenerate deliberately. Conventions in
+  `tests/data/README.md`.
+- **Two session probes promoted to validated tools** (executed end-to-end
+  at promotion): `scripts/m13_traffic_model.py` (the M13 analytic
+  gather-traffic model of record; reproduces the memo §4 residual table
+  from the relocated bundles — output of record committed at
+  `tests/data/m13_traffic_model_out.txt`) and `scripts/dump_backward_ir.py`
+  (autotune-selection capture + per-config TTGIR/PTX/SASS dump with a
+  load/atomic census for the split backward; 13 compiled forms, 0
+  failures on its verification run). Probes that imported the deleted
+  `bwd_prototypes.py` were not promoted (they can no longer run); the M13
+  memo's §5.4 descriptions remain their record.
+- **Self-containment rule adopted** (AGENTS.md): documents must not rely
+  on scripts or data outside the repository — anything load-bearing lives
+  in-repo or has an in-repo regeneration script. Forward-looking
+  conventions (AGENTS.md, validation commands, `scripts/README.md`,
+  design-doc rerun appendixes) now use repo paths
+  (`tests/data/bundles/`, `tests/data/runs/<label>/`); historical
+  transcript citations in milestone memos are labeled as session-local
+  artifacts with their in-repo regeneration recipes named.
+- Documented the dev environment in AGENTS.md and README.md: the NGC
+  container image `nvcr.io/nvidia/pytorch:26.05-py3` (torch 2.12 nightly,
+  Triton 3.6.0, CUDA 13.2 toolchain).
+
 ### M13 — backward residual track: split backward promoted (milestone complete)
 
 #### Decision
@@ -73,7 +114,7 @@ the date they land in the repository unless a formal release tag exists.
 
 #### Added / closed debts (T0)
 
-- `benchmarks/capture_index_distributions.py` gains
+- `scripts/capture_index_distributions.py` gains
   `--lambda-l1/--lambda-flops/--reg-warmup-steps` pass-through (sparse
   -regime probe; values recorded in bundle metadata; default recipe
   byte-identical). The probe itself bracketed the λ transition (dense at
@@ -88,7 +129,7 @@ the date they land in the repository unless a formal release tag exists.
 - Autotune-key audit: the embed kernel's missing `seq_len` key
   (query-tuned configs serving doc records) priced at **0.69%** —
   inside the noise band, classified immaterial, no fix.
-- `benchmarks/README.md`: the backward ncu invocation now names the
+- `scripts/README.md`: the backward ncu invocation now names the
   five-kernel family (`regex:sparton_bwd` matched only the deleted M2
   kernel); capture-script row documents the new flags.
 
@@ -112,7 +153,7 @@ the date they land in the repository unless a formal release tag exists.
   (kernel-body duplication with `bench_gluon_gemm.py`) is discharged by
   re-affirmation (cross-reference comments updated in
   `src/sparton/_backend_optimized_gluon.py` and
-  `benchmarks/bench_gluon_gemm.py`); the launcher-v2 fold-in trigger never
+  `scripts/bench_gluon_gemm.py`); the launcher-v2 fold-in trigger never
   fired, so the M12-T1 deferral stands. Evidence, validated traffic model
   (requested-L2 formulas match counters to ≤0.6% on all three shapes),
   decision walk, and gate ledger:
@@ -130,11 +171,11 @@ the date they land in the repository unless a formal release tag exists.
 
 #### Added (M12-T0/T4 tooling and measurement sets)
 
-- `benchmarks/ncu_forward_target.py`: parameterized direct-op forward
+- `scripts/ncu_forward_target.py`: parameterized direct-op forward
   profiling target (NVTX `fwd_direct/`, main-thread `optimized_fwd_op`
   calls, autotune warmed outside the range) — the forward analogue of
   `ncu_backward_target.py` and the M12-T0 counter source.
-- `benchmarks/bench_sparton_baseline.py --mask-density` (default 1.0):
+- `scripts/bench_sparton_baseline.py --mask-density` (default 1.0):
   seeded Bernoulli masks as the last generator consumer — density 1.0 is
   byte-identical to the historical all-ones default and other densities
   leave hidden/embed/bias draws untouched (pinned by
@@ -143,7 +184,7 @@ the date they land in the repository unless a formal release tag exists.
   {0.25, 0.75, 1.0} — peak-to-peak 0.23% on the dev row, 0.09% at 8×512 —
   the mask is an epilogue multiply, and density is correctly absent from
   the autotune key.
-- `benchmarks/bench_host_overhead.py`: wall-minus-GPU host-share recorder
+- `scripts/bench_host_overhead.py`: wall-minus-GPU host-share recorder
   for the forward wrappers (the deferred-F9 visibility vehicle;
   record-don't-threshold). Run of record reproduces the v2 figure:
   optimized host share **0.121 ms/call** at `8×128×768×1280` fp16
@@ -241,7 +282,7 @@ the date they land in the repository unless a formal release tag exists.
   refers to) and the post-M10 snapshot and floor-ratio derivations.
   Updated the active-design-doc references in `AGENTS.md` (project map,
   orientation, exemplar table, documentation-system table, task routing)
-  and `benchmarks/README.md`.
+  and `scripts/README.md`.
 
 ### AGENTS.md refactor: the M8→M11 operating guide
 
@@ -351,7 +392,7 @@ the date they land in the repository unless a formal release tag exists.
   behind the new `legacy_fused_sparton_bwd` wrapper (A/B reference of
   record, test-pinned, reachable only explicitly); the exported
   `fused_sparton_bwd_with_bias` helper keeps its signature and launches the
-  legacy kernel. `benchmarks/bwd_prototypes.py` (T3 decision probe) was
+  legacy kernel. `scripts/bwd_prototypes.py` (T3 decision probe) was
   deleted after the decision; `bench_backward.py` resolves
   `current`/`legacy`.
 - Measured (run 2 of two consecutive runs, op-level `do_bench`): backward
@@ -396,11 +437,11 @@ the date they land in the repository unless a formal release tag exists.
 
 #### Added
 
-- `benchmarks/ncu_backward_target.py`: parameterized direct-op backward
+- `scripts/ncu_backward_target.py`: parameterized direct-op backward
   profiling target (NVTX `bwd_direct/` on the main thread, shapes/dtype/bias
   via CLI, optional capture-bundle input) generalizing the `ncu_targets.py`
   `hybrid_bwd_direct` pattern for the M11 before/after counter collection.
-- `benchmarks/capture_index_distributions.py`: captures real Sparton index
+- `scripts/capture_index_distributions.py`: captures real Sparton index
   distributions (per-batch `hidden_shape`, `max_scores` fp16, `max_idx`
   int16, `mask` uint8, plus active-fraction/density/index-collision stats)
   from the cached tier-2 stack (xlm-roberta-base, swim-ir `de`), with an
@@ -409,7 +450,7 @@ the date they land in the repository unless a formal release tag exists.
   (not committed; rerun the script to regenerate). Measured stats, both
   bundles: mean active fraction 1.0000, mean mask density 0.6675, mean
   index top1-collision share 0.198 (untrained) / 0.184 (150 steps).
-- `benchmarks/bench_backward.py`: distribution-aware backward harness —
+- `scripts/bench_backward.py`: distribution-aware backward harness —
   op-level `do_bench` timing over {uniform, zipf, captured-real} sources,
   synthetic mask densities {25, 75, 100}%, fp16/bf16, bias/no-bias, with
   per-cell verification against the production op and the recorded 5-repeat
@@ -461,7 +502,7 @@ the date they land in the repository unless a formal release tag exists.
   pointers to v3 so the future work has exactly one specification. Updated
   the active-design-doc references in `AGENTS.md` (project map, orientation,
   documentation-system table, task routing, exemplar table) and
-  `benchmarks/README.md`.
+  `scripts/README.md`.
 
 ### AGENTS.md method refactor
 
@@ -518,25 +559,25 @@ the date they land in the repository unless a formal release tag exists.
   validation had made AMP training a hard `TypeError` on all backends
   (hybrid had only ever worked pre-M9 via TorchInductor's autocast-aware
   matmul; the fused backends never supported AMP).
-- `benchmarks/bench_sparton_baseline.py` gained an `opt f+b ms` column
+- `scripts/bench_sparton_baseline.py` gained an `opt f+b ms` column
   (optimized forward+backward timing) alongside the existing optimized
   columns.
 - `training/train.py`: `LSRTrainer.save_model` now serializes the model with
   `torch.save` — `SpladeModel` ties the head weight to the backbone word
   embeddings, and transformers 5 removed `TrainingArguments.save_safetensors`,
   so the stock `Trainer._save` can never write this model via safetensors.
-- README Backend Selection, AGENTS.md invariants, and the benchmarks README
+- README Backend Selection, AGENTS.md invariants, and the scripts README
   were updated for the new default, the adaptive-fallback exception, the AMP
   behavior, and the new gate scripts.
 
 #### Added
 
-- Added `benchmarks/soak_optimized_correctness.py` (M10 gate 5): a 384-case
+- Added `scripts/soak_optimized_correctness.py` (M10 gate 5): a 384-case
   S/B/D/V/bias/dtype sweep with random masks including fully zeroed rows,
   checking optimized scores against a vectorized reference plus the
   tie-aware index contract. Full-sweep result: `384/384 passed, max score
   err 0.001953, max index gap 0.000000`.
-- Added `benchmarks/probe_training_smoke.py` (M10 gate 6 tier 1): 300-step
+- Added `scripts/probe_training_smoke.py` (M10 gate 6 tier 1): 300-step
   head-only contrastive+FLOPS training from identical fp32 master weights
   under fp16 AMP (GradScaler) and bf16 autocast; hybrid-vs-optimized loss
   parity 0.03–0.24%, far inside the 5% gate.
@@ -623,7 +664,7 @@ the date they land in the repository unless a formal release tag exists.
   `(hidden_grad, embed_grad, bias_grad)` instead of a 4-tuple with a vestigial
   trailing `None` (the symbol is re-exported; its only in-repo caller was
   `fused_sparton_bwd_op`).
-- `benchmarks/bench_sparton_baseline.py` hybrid columns now measure
+- `scripts/bench_sparton_baseline.py` hybrid columns now measure
   `hybrid_forward` (the user-visible path) instead of the raw op; A/B runs
   showed no measurable difference on the dev shape.
 - `_gluon_runtime` now uses the public `gl.NVMMASharedLayout` instead of the
@@ -631,7 +672,7 @@ the date they land in the repository unless a formal release tag exists.
   `is_gluon_backend_available`.
 - Updated `AGENTS.md` (project map with all backend modules, the
   wrapper/op layering invariant, index-contract rule, refreshed sharp edges,
-  glob `py_compile` command) and `benchmarks/README.md`/`README.md` pointers
+  glob `py_compile` command) and `scripts/README.md`/`README.md` pointers
   and index-semantics documentation for the post-M8 state.
 
 #### Removed
@@ -687,7 +728,7 @@ the date they land in the repository unless a formal release tag exists.
   Gluon GEMM benchmark, M7 tuning gate, and runtime GPU-derived optimized
   forward autotune pruning, including the public optimized-forward fallback
   policy helper used by tests.
-- Added `benchmarks/probe_gluon_epilogue.py` for optimized-forward epilogue
+- Added `scripts/probe_gluon_epilogue.py` for optimized-forward epilogue
   correctness across fp16/bf16 and bias/no-bias cases.
 - Added optimized-backend routing, correctness, backward-smoke, schema,
   environment-default, S-tail, and allocator tests.
@@ -712,15 +753,15 @@ the date they land in the repository unless a formal release tag exists.
   `16x32x32/4w/3s` launch to bounded Triton autotune over ten forward tile
   configs keyed by `(S, D, V)`, while keeping the original config as a
   candidate.
-- Changed `benchmarks/ncu_runner.py` to profile the autotuned Gluon GEMM path
+- Changed `scripts/ncu_runner.py` to profile the autotuned Gluon GEMM path
   using the shared policy/descriptor helpers instead of a removed fixed-kernel
   launcher.
-- Extended `benchmarks/bench_gluon_gemm.py` to use generated policy objects,
+- Extended `scripts/bench_gluon_gemm.py` to use generated policy objects,
   support fp16 and bf16, include BK=32/64-byte-swizzle candidates, enforce
   ratio gates, and use Triton/Gluon autotune as the M7 gate by converting the
   `_runtime_policy.py` GEMM policy universe to `triton.Config` objects with
   shared host-side policy/config/descriptor helpers.
-- Extended `benchmarks/bench_sparton_baseline.py` with optional optimized
+- Extended `scripts/bench_sparton_baseline.py` with optional optimized
   forward timing and memory columns.
 - Updated
   [docs/sparton_gluon_remaining_work_design.md](docs/sparton_gluon_remaining_work_design.md)
@@ -741,11 +782,11 @@ the date they land in the repository unless a formal release tag exists.
   the `64x64x64/3/2x2` policy.
 - Verified M7 stress GEMM gate on `M=4096, K=1024, N=50257`, fp16: best ratio
   `173.585%` of cuBLAS in the L2-flushed benchmark regime.
-- Verified `benchmarks/probe_gluon_epilogue.py`: fp16/bf16 bias/no-bias passed.
+- Verified `scripts/probe_gluon_epilogue.py`: fp16/bf16 bias/no-bias passed.
 - Verified availability-gated benchmark/profiler smokes:
   `bench_gluon_gemm.py`, `ncu_runner.py`, and a
   tiny `bench_sparton_baseline.py --optimized-policy on` run all passed.
-- Verified `benchmarks/bench_naive_baseline.py` after naive autotune:
+- Verified `scripts/bench_naive_baseline.py` after naive autotune:
   `B=4, S=64, D=64, V=4096`, fp16, hybrid+b `0.018 ms`, naive+b
   `0.006 ms`, naive no-bias `0.006 ms`, and naive peak extra `0.16 MiB`.
 - Verified optimized dev-shape memory gate
@@ -773,9 +814,9 @@ the date they land in the repository unless a formal release tag exists.
 - Added backend routing tests, naive correctness/backward tests, tail/mask/tie
   coverage, and an allocator check proving the naive forward only allocates
   outputs on the measured shape.
-- Added `benchmarks/bench_naive_baseline.py` to compare M5 naive forward
+- Added `scripts/bench_naive_baseline.py` to compare M5 naive forward
   latency and peak memory against the hybrid path.
-- Added `benchmarks/bench_sparton_baseline.py`, a merged hybrid/naive
+- Added `scripts/bench_sparton_baseline.py`, a merged hybrid/naive
   benchmark with realistic `naver/splade-code-06B` dimensions, bf16 defaults,
   a fixed `B=4,8,16` by `S=256,512,768` grid, and all-ones masks.
 - Added a pytest 9 test harness configured in `pyproject.toml`, including CUDA
@@ -800,11 +841,11 @@ the date they land in the repository unless a formal release tag exists.
   tensor-pipe utilization), the hybrid forward leaves the bias add unfused and
   reads tile logits twice (583 MB vs 55 MB measured DRAM reads), and the
   backward kernel is latency/atomic-bound at ~6% utilization.
-- Added `benchmarks/` with the validated probe and benchmark scripts behind
+- Added `scripts/` with the validated probe and benchmark scripts behind
   the design document's evidence (MMA availability matrix, TMA+`mma_v2` GEMM
   microbenchmark, hybrid baselines, ncu launchers, environment-defect
   reproducer), promoted from session scratch so they survive `/tmp` cleanup;
-  see `benchmarks/README.md`.
+  see `scripts/README.md`.
 - Documented the root cause of the previously "transient" TorchInductor/Triton
   compile failure: the NVIDIA Triton wheel ships no bundled CUDA headers
   (cold `cuda_utils` builds fail without `CPATH`) and `/tmp` is mounted
@@ -850,7 +891,7 @@ the date they land in the repository unless a formal release tag exists.
   bf16, batch sizes `4,8,16`, sequence lengths `256,512,768`, and
   `naive-policy=on`; it emitted the 9-row Markdown table recorded in the M5
   memo.
-- Verified `benchmarks/bench_naive_baseline.py` on the default
+- Verified `scripts/bench_naive_baseline.py` on the default
   `B=4, S=64, D=64, V=4096` fp16 shape: hybrid forward was 0.019 ms with bias
   and 0.014 ms without bias; naive forward was 0.008 ms for both; hybrid peak
   extra memory was 2.31 MiB, while naive peak extra memory was 0.16 MiB

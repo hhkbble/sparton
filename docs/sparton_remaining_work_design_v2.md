@@ -123,7 +123,7 @@ Two consequences that reshape the plan:
 ### 1.3 Validation ledger (this review, 2026-06-12)
 
 ```text
-py_compile over src/sparton, training, tests, benchmarks  -> passed
+py_compile over src/sparton, training, tests, scripts  -> passed
 hardened-env python -m pytest -q                          -> 47 passed, 15 warnings in 11.5 s
                                                              (warnings are upstream torch deprecations)
 non-tiny optimized correctness probe (7 shapes, fp16+bf16,
@@ -265,7 +265,7 @@ fix in M9, low risk; **[note]** recorded, scheduled later or accepted.
   placeholder "Your Name <you@example.com>".
 - **F13 [should] Test-infra fragility**:
   `test_bench_gluon_gemm_autotune_configs_follow_policy_generator` does `from
-  benchmarks.bench_gluon_gemm import ...`, which resolves only because
+  scripts.bench_gluon_gemm import ...`, which resolves only because
   `python -m pytest` puts the CWD on `sys.path` (namespace package). Running
   the `pytest` console script from anywhere else breaks collection.
 - **F14 [note] Shim niceties**: `_gluon_runtime._load_gluon` imports
@@ -289,7 +289,7 @@ fix in M9, low risk; **[note]** recorded, scheduled later or accepted.
   by the launcher-v2 design in M12 (one descriptor pair per call after
   selection), not by patching the bank.
 - **D2 [accepted] Kernel-body duplication** between
-  `_backend_optimized_gluon.py` and `benchmarks/bench_gluon_gemm.py` (mainloop
+  `_backend_optimized_gluon.py` and `scripts/bench_gluon_gemm.py` (mainloop
   + the 11/12-way descriptor if-chain). Deliberately **not** deduplicated in
   M9: the two kernels already differ in epilogue and barrier-reset structure,
   M12 will rewrite the production mainloop (persistent/WS) and they diverge
@@ -517,7 +517,7 @@ T4–T6 are parallel after T1).
   roles; Core Kernel Invariants describes the three-backend layering (§4.1)
   and replaces the stale "optimized should fail clearly" line with "optimized
   is an experimental opt-in; hybrid remains the default until the M10 gates
-  pass"; benchmarks map row points at this document; sharp-edges list drops
+  pass"; scripts README row points at this document; sharp-edges list drops
   the import-print/`"no bias"` entries (fixed in T4) and the license-mismatch
   entry (fixed below).
 - `pyproject.toml`: `license = {text = "Apache-2.0"}` to match `LICENSE` and
@@ -538,7 +538,7 @@ T4–T6 are parallel after T1).
 #### M9-T6 Test-infra hardening
 
 - `tests/conftest.py`: insert the repo root at the front of `sys.path`
-  (computed from `__file__`) so `import benchmarks.bench_gluon_gemm` works
+  (computed from `__file__`) so `import scripts.bench_gluon_gemm` works
   under any pytest invocation (F13); keep `pythonpath = ["src"]` in
   `pyproject` as-is.
 - Verify `pytest -q` (console script) and `python -m pytest -q` both collect
@@ -549,10 +549,10 @@ T4–T6 are parallel after T1).
 
 ```bash
 ENV='TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2/include TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor'
-env $ENV PYTHONPATH=src python -m py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py
+env $ENV PYTHONPATH=src python -m py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py
 env $ENV python -m pytest -q                      # full, incl. slow
 env $ENV python -m pytest -q -m "not slow"        # the documented quick loop
-env $ENV PYTHONPATH=src python -u benchmarks/bench_sparton_baseline.py \
+env $ENV PYTHONPATH=src python -u scripts/bench_sparton_baseline.py \
     --batch-sizes 32 --seq-lens 128 --dim 768 --vocab 30522 --dtype fp16 --optimized-policy on
 #   -> hybrid/optimized columns within ±5% of §1.2
 env $ENV PYTHONPATH=src python -c "import sparton"   # no stdout output
@@ -731,19 +731,19 @@ ENV='TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2
 PY=/workspace/venvs/sparton/bin/python
 
 # Baseline validation (M9 exit checklist is the superset):
-env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/model.py training/train.py tests/*.py benchmarks/*.py
+env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/model.py training/train.py tests/*.py scripts/*.py
 env $ENV $PY -m pytest -q
 env $ENV PYTHONPATH=src $PY -c "import torch, sparton.sparton_kernel as sk; print(torch.ops.sparton.optimized_fwd.default._schema)"
 
 # Canonical benchmarks:
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py --optimized-policy on
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py \
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py --optimized-policy on
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py \
     --batch-sizes 32 --seq-lens 128 --dim 768 --vocab 30522 --dtype fp16 --optimized-policy on
 
 # M7 ratio gates (re-run on any Triton bump):
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_gluon_gemm.py --dtype bf16 --include-block-n-256 --require-ratio 85
-env $ENV PYTHONPATH=src $PY -u benchmarks/probe_gluon_epilogue.py
+env $ENV PYTHONPATH=src $PY -u scripts/bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85
+env $ENV PYTHONPATH=src $PY -u scripts/bench_gluon_gemm.py --dtype bf16 --include-block-n-256 --require-ratio 85
+env $ENV PYTHONPATH=src $PY -u scripts/probe_gluon_epilogue.py
 
 # Profiling: unchanged from v1 §11 / Appendix B.
 ```

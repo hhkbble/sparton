@@ -43,8 +43,8 @@ is cited to the document that measured it (Appendix A).
 - AMP works on every backend (`autocast_canonicalize`, M10); the index
   contract, input validation, and wrapper symmetry are in place (M9).
 - Suite: 114 tests (quick loop 98); standing gate scripts:
-  `benchmarks/soak_optimized_correctness.py` (384-case shape soak) and
-  `benchmarks/probe_training_smoke.py` (AMP training parity).
+  `scripts/soak_optimized_correctness.py` (384-case shape soak) and
+  `scripts/probe_training_smoke.py` (AMP training parity).
 - Tier-2 training infrastructure exists and is locally cached:
   transformers 5.11.0 + accelerate 1.14.0 in the venv, xlm-roberta-base
   weights and the swim-ir `de` split downloaded, `training/train.py`
@@ -166,7 +166,7 @@ Uniform-random indices understate atomic conflicts on hot tokens; **no
 backward change is accepted on uniform evidence alone** (v1 §8 rule,
 restated). Build the harness before any kernel work:
 
-- New `benchmarks/capture_index_distributions.py`: loads the cached
+- New `scripts/capture_index_distributions.py`: loads the cached
   xlm-roberta-base via `training/model.py` (`head="sparton"`), optionally
   fine-tunes for a configurable number of steps (default 150, the validated
   tier-2 recipe), then runs forward passes over real tokenized swim-ir `de`
@@ -176,7 +176,7 @@ restated). Build the harness before any kernel work:
   non-zero exit). Rationale for capture-to-disk: backward benchmarking must
   not pay a backbone forward per measurement, and the bundle makes runs
   reproducible across sessions.
-- New `benchmarks/bench_backward.py` (or an extension of
+- New `scripts/bench_backward.py` (or an extension of
   `bench_sparton_baseline.py` if it stays small): times the backward op
   directly (build grad buffers, call `fused_sparton_bwd_op`-equivalent per
   backend-under-test) over three distribution sources × mask densities
@@ -317,13 +317,13 @@ Standing gates (every milestone exit, hardened env, serial):
 ```bash
 ENV='TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2/include TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor'
 PY=/workspace/venvs/sparton/bin/python
-env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/*.py tests/*.py benchmarks/*.py
+env $ENV PYTHONPATH=src $PY -m py_compile src/sparton/*.py training/*.py tests/*.py scripts/*.py
 env $ENV $PY -m pytest -q                          # full, incl. slow (114 at M10 exit)
 env $ENV $PY -m pytest -q -m "not slow"
-env $ENV PYTHONPATH=src $PY -u benchmarks/soak_optimized_correctness.py        # forward-surface changes
-env $ENV PYTHONPATH=src $PY -u benchmarks/probe_training_smoke.py              # autograd/AMP changes
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py --optimized-policy on   # grid of record
-env $ENV PYTHONPATH=src $PY -u benchmarks/bench_sparton_baseline.py \
+env $ENV PYTHONPATH=src $PY -u scripts/soak_optimized_correctness.py        # forward-surface changes
+env $ENV PYTHONPATH=src $PY -u scripts/probe_training_smoke.py              # autograd/AMP changes
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py --optimized-policy on   # grid of record
+env $ENV PYTHONPATH=src $PY -u scripts/bench_sparton_baseline.py \
     --batch-sizes 32 --seq-lens 128 --dim 768 --vocab 30522 --dtype fp16 --optimized-policy on  # dev row
 env $ENV PYTHONPATH=src $PY -c "import sparton"    # stdout-silent
 git diff --check
@@ -395,7 +395,7 @@ not touch it but the soak re-run proves that).
 ## Appendix B. Rerun commands
 
 The standing-gate block in §4 plus, for the new M11/M12 tooling once it
-lands, the invocations documented in `benchmarks/README.md` (capture script,
+lands, the invocations documented in `scripts/README.md` (capture script,
 backward harness, warp-specialize probe). Profiling command shapes are
 unchanged from v1 §11 (ncu/nsys, hardened env, serial; backward profiled via
 direct op calls on the main thread).

@@ -1,0 +1,15 @@
+# Large generated artifacts: produced by scripts/ (which reuse existing
+# files here instead of regenerating). Small committed fixtures are
+# whitelisted by not matching these patterns.
+*.pt
+*.nsys-rep
+*.sqlite
+*.cubin
+*.sass
+*.ptx
+*.ttgir
+*.llir
+*.log
+runs/
+work/
+ir_dump/

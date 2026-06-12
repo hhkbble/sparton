@@ -83,7 +83,7 @@ Full pytest suite:
 25 passed, 1 warning in 7.26s
 ```
 
-`benchmarks/bench_sparton_baseline.py` default realistic preset:
+`scripts/bench_sparton_baseline.py` default realistic preset:
 
 ```text
 D=1024
@@ -120,7 +120,7 @@ tok/s                     # tokens per second for hybrid+b
 Full default benchmark command:
 
 ```bash
-env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u scripts/bench_sparton_baseline.py
 ```
 
 Historical fixed-tile M5 results:
@@ -139,7 +139,7 @@ Historical fixed-tile M5 results:
 
 The previous SentenceTransformers-style benchmark result is obsolete. The
 current benchmark result of record should come from
-`benchmarks/bench_sparton_baseline.py`; the compatibility wrappers still exist.
+`scripts/bench_sparton_baseline.py`; the compatibility wrappers still exist.
 
 ## Remaining Risks
 

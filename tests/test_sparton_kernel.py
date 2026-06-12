@@ -349,7 +349,7 @@ def test_gluon_policy_generator_prunes_resource_constraints() -> None:
 def test_bench_gluon_gemm_autotune_configs_follow_policy_generator() -> None:
     from types import SimpleNamespace
 
-    from benchmarks.bench_gluon_gemm import (
+    from scripts.bench_gluon_gemm import (
         MAX_GEMM_AUTOTUNE_POLICIES,
         gemm_autotune_configs_for_policies,
         gemm_autotune_policy_universe,
@@ -1227,11 +1227,11 @@ def test_training_parity_smoke_autocast(
 ) -> None:
     """Short head-only training run: hybrid and optimized stay in lockstep.
 
-    A trimmed version of benchmarks/probe_training_smoke.py (the M10 tier-1
+    A trimmed version of scripts/probe_training_smoke.py (the M10 tier-1
     gate); reuses its run_mode so the gate logic stays single-sourced.
     """
 
-    from benchmarks.probe_training_smoke import run_mode
+    from scripts.probe_training_smoke import run_mode
 
     failures = run_mode(
         mode="bf16",
@@ -1263,7 +1263,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
     cuda_device: torch.device,
     source: str,
 ) -> None:
-    """Pin the synthetic input contract of benchmarks/bench_backward.py.
+    """Pin the synthetic input contract of scripts/bench_backward.py.
 
     The M11 backward harness documents its synthetic regime in its docstring;
     this test single-sources the generator (no duplicated logic) and asserts
@@ -1273,7 +1273,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
     mirroring the forward's zero-baseline semantics.
     """
 
-    from benchmarks.bench_backward import make_synthetic_case
+    from scripts.bench_backward import make_synthetic_case
 
     active_fraction = 0.10
     case = make_synthetic_case(
@@ -1312,7 +1312,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
 @requires_cuda
 @pytest.mark.cuda
 def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None:
-    """Pin the --mask-density seam of benchmarks/bench_sparton_baseline.py.
+    """Pin the --mask-density seam of scripts/bench_sparton_baseline.py.
 
     The M12-T4 flag must not perturb the canonical rows: at density 1.0 the
     mask is exactly the historical all-ones mask, and because the mask is the
@@ -1320,7 +1320,7 @@ def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None
     density for the same seed.
     """
 
-    from benchmarks.bench_sparton_baseline import ShapeSpec, make_inputs
+    from scripts.bench_sparton_baseline import ShapeSpec, make_inputs
 
     spec = ShapeSpec(batch_size=2, seq_len=64)
     common = dict(dim=32, vocab=128, dtype=torch.float16, seed=7)
@@ -1338,11 +1338,11 @@ def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None
 
 
 def test_bench_host_overhead_shape_parser() -> None:
-    """Pin the BxSxDxV CLI contract of benchmarks/bench_host_overhead.py."""
+    """Pin the BxSxDxV CLI contract of scripts/bench_host_overhead.py."""
 
     import argparse
 
-    from benchmarks.bench_host_overhead import parse_shape_list
+    from scripts.bench_host_overhead import parse_shape_list
 
     assert parse_shape_list("8x128x768x1280,32x128x768x30522") == (
         (8, 128, 768, 1280),

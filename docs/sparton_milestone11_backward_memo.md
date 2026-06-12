@@ -36,9 +36,12 @@ query record (408.03 M → 1.55 M, deposited transcripts
 
 ## 2. T1 — entry evidence (re-profile of the unchanged kernel)
 
-Direct-op profile via `benchmarks/ncu_backward_target.py` (NVTX
+Direct-op profile via `scripts/ncu_backward_target.py` (NVTX
 `bwd_direct/`, main thread, `--launch-skip 1 --launch-count 1`); raw
-transcripts under `/root/profiles/m11/`.
+transcripts under `/root/profiles/m11/` (session-local artifacts — the
+repo's self-containment rule post-dates this milestone; rerun recipes are
+in this memo and `scripts/README.md`, and the capture bundles of record
+now live in `tests/data/bundles/`).
 
 | metric | dev shape (32×128×768×30522, fp16, bias) | corner (16×512×1024×151936, bf16, bias) |
 |---|---|---|
@@ -107,7 +110,7 @@ is `V_active/S`: ≈10417 for query records (S=24), ≈976–1302 for documents.
 
 ## 4. T2 — distributions and harness baseline
 
-`benchmarks/capture_index_distributions.py` captured 32 records per bundle
+`scripts/capture_index_distributions.py` captured 32 records per bundle
 from the cached tier-2 stack (xlm-roberta-base through
 `training/model.py` `head="sparton"`, swim-ir `de`, optimized backend,
 bf16 autocast), untrained and after the validated 150-step recipe:
@@ -133,7 +136,7 @@ Two findings that reshaped the plan's assumptions:
   including the early-exit path), while the real records carry the dense,
   collision-heavy regime. Both regimes gate.
 
-`benchmarks/bench_backward.py` baseline of record (run 2, `current` only,
+`scripts/bench_backward.py` baseline of record (run 2, `current` only,
 88 cells, 0 failures): synthetic (uniform/zipf × densities 25/75/100% ×
 fp16/bf16 × bias on/off, B=32 S=128 D=768 V=30522, active 0.10)
 0.356–0.391 ms; real records (V=250002) 5.88–7.89 ms — query records
@@ -152,7 +155,7 @@ accumulation order alone.
 
 ### 5.1 B2a, and why it cannot reach the gate
 
-`benchmarks/bwd_prototypes.py` `aggregated_bwd` (B2a): grid
+`scripts/bwd_prototypes.py` `aggregated_bwd` (B2a): grid
 `(cdiv(D,BLOCK_D), cdiv(V,BLOCK_V))`, batch loop in-CTA, plain-store
 `embed_grad`/`bias_grad`, `reset_to_zero` shrunk to `hidden_grad`, embed
 tile loaded once per CTA. Full matrix (run 1, `bench_b2a_run1.log`; the
@@ -327,7 +330,7 @@ untouched):
   `fused_sparton_bwd_with_bias` helper keeps its signature and now
   explicitly launches the legacy kernel. Winner-only wiring: no runtime
   adaptivity, no env-var kill switch (a second fallback seam is forbidden).
-- `benchmarks/bwd_prototypes.py` deleted; `bench_backward.py` resolves
+- `scripts/bwd_prototypes.py` deleted; `bench_backward.py` resolves
   `current` and `legacy`.
 
 Tests (suite 114 → **132** across the milestone; the T2 contract test

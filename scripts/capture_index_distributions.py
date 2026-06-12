@@ -19,8 +19,13 @@ recorded shapes. Capture-to-disk exists so backward benchmarking never pays
 a backbone forward per measurement and runs reproduce across sessions
 (design v3 M11-T2).
 
-Bundles are written outside the repository (convention: /root/m11_bundles/)
-and are never committed; rerun this script to regenerate them.
+Bundles default to ``tests/data/bundles/swimir_de_steps{N}.pt`` (gitignored
+— large generated data per ``tests/data/README.md``). If the output file
+already exists the script **reuses it**: it prints the stored summary and
+exits 0 without touching the GPU, because regenerated bundles contain
+*different records* (training nondeterminism) and silently replacing the
+file would break comparability with every transcript measured against it.
+Pass ``--force`` to regenerate deliberately.
 
 ``--lambda-l1`` / ``--lambda-flops`` / ``--reg-warmup-steps`` (M13-T0) pass
 through to ``LSRTrainingArguments`` so a shortened-warmup fine-tune can probe
@@ -166,7 +171,12 @@ def maybe_finetune(model, tokenizer, dataset, args) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=str, required=True, help="bundle output path")
+    parser.add_argument("--out", type=str, default=None,
+                        help="bundle output path (default: "
+                             "tests/data/bundles/swimir_de_steps{train-steps}.pt)")
+    parser.add_argument("--force", action="store_true",
+                        help="regenerate even if the output bundle exists "
+                             "(regenerated bundles contain different records)")
     parser.add_argument("--model", type=str, default="FacebookAI/xlm-roberta-base")
     parser.add_argument("--dataset", type=str, default="nthakur/swim-ir-cross-lingual")
     parser.add_argument("--languages", type=str, default="de")
@@ -183,13 +193,33 @@ def main() -> int:
                         help="override LSRTrainingArguments.lambda_flops (default: trainer default)")
     parser.add_argument("--reg-warmup-steps", type=int, default=None,
                         help="override LSRTrainingArguments.reg_warmup_steps (default: trainer default)")
-    parser.add_argument("--work-dir", type=str, default="/root/m11_bundles/work")
+    parser.add_argument("--work-dir", type=str,
+                        default=str(REPO_ROOT / "tests" / "data" / "bundles" / "work"))
     parser.add_argument("--quick", action="store_true",
                         help="2 batches, no fine-tune")
     args = parser.parse_args()
     if args.quick:
         args.num_batches = 2
         args.train_steps = 0
+    if args.out is None:
+        args.out = str(REPO_ROOT / "tests" / "data" / "bundles"
+                       / f"swimir_de_steps{args.train_steps}.pt")
+
+    out_path = Path(args.out)
+    if out_path.exists() and not args.force:
+        bundle = torch.load(out_path, weights_only=False)
+        records = bundle.get("records", [])
+        mean_active = (sum(r["stats"]["active_fraction"] for r in records)
+                       / len(records)) if records else float("nan")
+        print(
+            f"capture summary: reused existing bundle ({len(records)} records, "
+            f"train_steps={bundle.get('train_steps')}, "
+            f"backend={bundle.get('backend')}) -> {out_path} | "
+            f"mean active {mean_active:.4f} | pass --force to regenerate "
+            f"(regenerated bundles contain different records)",
+            flush=True,
+        )
+        return 0
 
     if not torch.cuda.is_available():
         raise RuntimeError("capture_index_distributions.py requires CUDA")

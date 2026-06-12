@@ -75,8 +75,8 @@ PYTHONPATH=src /workspace/venvs/sparton/bin/python -m py_compile \
   src/sparton/__init__.py src/sparton/sparton_kernel.py \
   src/sparton/_backend_hybrid.py src/sparton/_backend_naive_triton.py \
   training/model.py training/train.py tests/conftest.py tests/test_sparton_kernel.py \
-  benchmarks/bench_sparton_baseline.py \
-  benchmarks/bench_hybrid_baseline.py benchmarks/bench_naive_baseline.py
+  scripts/bench_sparton_baseline.py \
+  scripts/bench_hybrid_baseline.py scripts/bench_naive_baseline.py
 # -> passed after M5
 
 TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas /workspace/venvs/sparton/bin/python -m pytest -q
@@ -88,13 +88,13 @@ TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas /workspace/venvs/sparton/bin/py
 # run 3 (hardened env, see §2.4):   11 passed, 1 warning in 20.47s (cold Inductor cache)
 # M5 hardened env run:              25 passed, 1 warning in 7.26s
 
-PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_naive_baseline.py
+PYTHONPATH=src /workspace/venvs/sparton/bin/python -u scripts/bench_naive_baseline.py
 # M5 compatibility wrapper shape B=4 S=64 D=64 V=4096:
 #   hybrid fwd bias/no-bias: 0.019 / 0.014 ms
 #   naive  fwd bias/no-bias: 0.008 / 0.008 ms
 #   peak extra memory: hybrid 2.31 MiB, naive 0.16 MiB, full logits 2.00 MiB
 
-PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
+PYTHONPATH=src /workspace/venvs/sparton/bin/python -u scripts/bench_sparton_baseline.py
 # Canonical merged benchmark after M5: defaults model naver/splade-code-06B
 # (D=1024, V=151936, bf16), uses all-ones masks, and reports exactly one row
 # for each fixed B/S pair in B={4,8,16}, S={256,512,768}.
@@ -541,7 +541,7 @@ src/sparton/
   _backend_optimized_gluon.py  # Gluon fused forward/backward (M8+)
   _gluon_runtime.py            # compatibility shim: ALL gluon imports + capability whitelist (M6)
   _runtime_policy.py           # device/problem profiles, policy generation (M7+)
-benchmarks/                    # validated probe/bench scripts (promoted 2026-06-11; extended at M6/M7)
+scripts/                    # validated probe/bench scripts (promoted 2026-06-11; extended at M6/M7)
 ```
 
 `tests/test_sparton_kernel.py` keeps the reference; backend-parity tests are
@@ -634,7 +634,7 @@ each with entry/exit gates:
 | M3 | Extract `_backend_hybrid.py`, no behavior change | **Done.** Hybrid op names and schemas preserved; public facade re-exports existing helpers. |
 | M4 | Router + `SPARTON_BACKEND` + `backend` kwarg | **Done.** Default proven hybrid; `naive` selectable; invalid/`optimized` selections raise with reason. |
 | M5 | `_backend_naive_triton.py` fused forward (`tl.dot`, no Gluon); backward is NOT reimplemented — the naive backend registers its own autograd that calls the current Triton backward (B1) | **Done.** Correctness/router/schema/memory tests pass; allocator check shows output-only peak on the measured shape; current forward launch uses bounded Triton autotune with the original fixed tile retained as a candidate. |
-| M6 | `_gluon_runtime.py` shim + Gluon smoke test (probe/bench scripts already live in `benchmarks/`; extend as needed) | shim imports lazily; capability whitelist unit-tested; `mma_v2` smoke kernel passes on RTX 5090; smoke is skipped cleanly where Gluon/CUDA absent |
+| M6 | `_gluon_runtime.py` shim + Gluon smoke test (probe/bench scripts already live in `scripts/`; extend as needed) | shim imports lazily; capability whitelist unit-tested; `mma_v2` smoke kernel passes on RTX 5090; smoke is skipped cleanly where Gluon/CUDA absent |
 | M7 | In-repo Gluon GEMM microbenchmark + policy generator + Triton/Gluon autotune gate | correctness vs cuBLAS on dev shapes fp16 **and bf16**; **>= 85% of cuBLAS** on at least `M=4096, K=768, N=30522` and one stress shape; policy generator only emits configs satisfying §7.2 constraints |
 | M8 | Gluon fused forward O1/policy-autotuned (non-persistent) | epilogue probe (§3.6 item 1) passed first; full correctness matrix vs reference incl. index policy; memory gate: peak extra < 2x outputs (vs hybrid's ~140 MiB); fixed production policy universe with runtime GPU-derived active candidates; policy-autotuned forward perf recorded, no default-promotion gate |
 | M9 | O2/O3: persistent + warp-specialized + barrier-free pipeline | beats autotuned naive fused on all dev shapes; **>= hybrid forward on at least one realistic shape**; nsys shows single kernel launch; ncu shows DRAM reads within 1.3x the analytic A+B floor and no logits-sized write stream (§11) |
@@ -854,7 +854,7 @@ A/B timing measurement (don't keep unmeasurable "optimizations").
 ## 11. Profiling plan
 
 - Latency of record: `triton.testing.do_bench` (L2-flushed) + CUDA-event
-  timing in `benchmarks/`. ncu durations are serialized/cache-flushed and are
+  timing in `scripts/`. ncu durations are serialized/cache-flushed and are
   not comparable to `do_bench` (§2.5).
 - `nsys profile --stats=true ...` for kernel inventory, launch counts, stream
   overlap, and the no-extra-kernel/no-memcpy structure checks.
@@ -931,7 +931,7 @@ ncu --nvtx --nvtx-include "hybrid_fwd/" \
 ## Appendix A. Probe provenance
 
 The probe and benchmark scripts were promoted into the repository at
-`benchmarks/` on 2026-06-11 (see `benchmarks/README.md`):
+`scripts/` on 2026-06-11 (see `scripts/README.md`):
 `probe_mma_matrix.py` (MMA availability), `bench_gluon_gemm.py` (TMA+mma_v2
 GEMM, policy-derived Triton/Gluon autotune gate), `bench_sparton_baseline.py`
 (merged hybrid/naive fixed-grid baselines),
@@ -1028,27 +1028,27 @@ env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -m py_compile \
 env $ENV /workspace/venvs/sparton/bin/python -m pytest -q
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -c "import torch; import sparton.sparton_kernel; print(torch.ops.sparton.fused_sparton_fwd.default._schema); print(torch.ops.sparton.fused_sparton_bwd.default._schema)"
 
-# Probes and benchmarks (see benchmarks/README.md):
-env $ENV /workspace/venvs/sparton/bin/python -u benchmarks/probe_mma_matrix.py
+# Probes and benchmarks (see scripts/README.md):
+env $ENV /workspace/venvs/sparton/bin/python -u scripts/probe_mma_matrix.py
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u \
-  benchmarks/bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85
+  scripts/bench_gluon_gemm.py --dtype fp16 --include-block-n-256 --require-ratio 85
 env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u \
-  benchmarks/bench_gluon_gemm.py --dtype bf16 --include-block-n-256 --require-ratio 85
-env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_sparton_baseline.py
-env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u benchmarks/bench_hybrid_baseline.py
+  scripts/bench_gluon_gemm.py --dtype bf16 --include-block-n-256 --require-ratio 85
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u scripts/bench_sparton_baseline.py
+env $ENV PYTHONPATH=src /workspace/venvs/sparton/bin/python -u scripts/bench_hybrid_baseline.py
 
 # nsys timeline + per-kernel summary:
 env $ENV /usr/local/bin/nsys profile --stats=true -o /tmp/trace \
   /workspace/venvs/sparton/bin/python -u <bench>.py
 
 # ncu counter profiles (see §11 for section/metric guidance).
-# ncu_runner.py imports bench_gluon_gemm, hence PYTHONPATH=benchmarks:
-env $ENV PYTHONPATH=benchmarks /usr/local/bin/ncu --launch-skip 4 --launch-count 1 \
+# ncu_runner.py imports bench_gluon_gemm, hence PYTHONPATH=scripts:
+env $ENV PYTHONPATH=scripts /usr/local/bin/ncu --launch-skip 4 --launch-count 1 \
   -k "regex:gemm_abt" \
   --section SpeedOfLight --section ComputeWorkloadAnalysis --section Occupancy \
   --metrics dram__bytes_op_read.sum,dram__bytes_op_write.sum \
-  /workspace/venvs/sparton/bin/python -u benchmarks/ncu_runner.py
+  /workspace/venvs/sparton/bin/python -u scripts/ncu_runner.py
 env $ENV PYTHONPATH=src /usr/local/bin/ncu --nvtx --nvtx-include "hybrid_fwd/" \
   --metrics dram__bytes_op_read.sum,dram__bytes_op_write.sum,gpu__time_duration.sum \
-  /workspace/venvs/sparton/bin/python -u benchmarks/ncu_targets.py
+  /workspace/venvs/sparton/bin/python -u scripts/ncu_targets.py
 ```
