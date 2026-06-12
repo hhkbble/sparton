@@ -74,9 +74,11 @@ def _argmax_strict_combine(value_a, index_a, value_b, index_b):
 # The TMA + mma_v2 mainloop below intentionally mirrors the GEMM benchmark
 # kernel in benchmarks/bench_gluon_gemm.py; the kernels stay separate because
 # this one runs the Sparton max/argmax epilogue while the benchmark
-# materializes C, and the planned persistent rewrite will diverge them
-# further. See docs/sparton_remaining_work_design_v2.md (D2) before
-# deduplicating.
+# materializes C. The persistent rewrite once planned for this mainloop was
+# declined at the M12 entry gate (tensor pipe already 92-94% utilized, no
+# scheduling bubbles to recover — D2 discharged by re-affirmation; see
+# docs/sparton_milestone12_forward_memo.md and design v2 (D2)). Revisit only
+# if a future milestone reopens the kernel body.
 @autotune(
     configs=get_optimized_forward_configs(),
     key=["B", "S", "D", "V"],

@@ -5,10 +5,12 @@ Defaults model the projection-head dimensions of naver/splade-code-06B:
   - vocab size 151936
   - bf16 tensors
 
-The benchmark runs one row per (B, S) pair with all-ones attention masks. The
-naive backend uses production Triton autotune; pass ``--optimized-policy on``
-to include the experimental Gluon forward with runtime GPU-derived active
-autotune candidates.
+The benchmark runs one row per (B, S) pair with all-ones attention masks by
+default; ``--mask-density p`` switches to seeded Bernoulli(p) masks (M12-T4
+sweep dimension — density 1.0 is byte-identical to the all-ones default and
+leaves every other input draw untouched). The naive backend uses production
+Triton autotune; pass ``--optimized-policy on`` to include the experimental
+Gluon forward with runtime GPU-derived active autotune candidates.
 Needs PYTHONPATH=src and the hardened env prefix from
 docs/sparton_gluon_remaining_work_design.md section 2.4.
 """
@@ -41,6 +43,16 @@ def parse_int_list(value: str) -> tuple[int, ...]:
     if any(item <= 0 for item in items):
         raise argparse.ArgumentTypeError("all list values must be positive")
     return items
+
+
+def parse_density(value: str) -> float:
+    try:
+        density = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("mask density must be a float") from exc
+    if not 0.0 < density <= 1.0:
+        raise argparse.ArgumentTypeError("mask density must be in (0.0, 1.0]")
+    return density
 
 
 def parse_dtype(value: str) -> torch.dtype:
@@ -79,6 +91,7 @@ def make_inputs(
     vocab: int,
     dtype: torch.dtype,
     seed: int,
+    mask_density: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = torch.randn(
@@ -91,7 +104,13 @@ def make_inputs(
     ) * 0.05
     embed = torch.randn(vocab, dim, device="cuda", dtype=dtype, generator=generator) * 0.05
     bias = torch.randn(vocab, device="cuda", dtype=dtype, generator=generator) * 0.05
-    mask = torch.ones(spec.batch_size, spec.seq_len, device="cuda", dtype=torch.int32)
+    # The mask is the last generator consumer, so hidden/embed/bias draws are
+    # identical at every density; rand in [0, 1) < 1.0 is all-True, making the
+    # default byte-identical to the historical torch.ones mask.
+    mask = (
+        torch.rand(spec.batch_size, spec.seq_len, device="cuda", generator=generator)
+        < mask_density
+    ).to(torch.int32)
     return hidden, embed, bias, mask
 
 
@@ -119,6 +138,7 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         vocab=args.vocab,
         dtype=dtype,
         seed=args.seed + spec.batch_size * 65537 + spec.seq_len,
+        mask_density=args.mask_density,
     )
 
     def hybrid_bias():
@@ -290,6 +310,7 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--dim", type=int, default=DEFAULT_DIM)
     parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
     parser.add_argument("--dtype", choices=("bf16", "bfloat16", "fp16", "float16"), default="bf16")
+    parser.add_argument("--mask-density", type=parse_density, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--rep", type=int, default=16)
@@ -334,7 +355,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"warmup/rep={args.warmup}/{args.rep} naive={args.naive_policy} "
         f"optimized={args.optimized_policy}"
     )
-    print("Times are milliseconds per fixed (B, S) row; masks are all ones.")
+    mask_note = (
+        "masks are all ones."
+        if args.mask_density == 1.0
+        else f"masks are Bernoulli(p={args.mask_density:g})."
+    )
+    print(f"Times are milliseconds per fixed (B, S) row; {mask_note}")
 
     rows = []
     for spec in shapes:

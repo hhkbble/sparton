@@ -166,7 +166,9 @@ def build_autotuned_kernel(args):
     # The TMA + mma_v2 mainloop below intentionally mirrors the optimized
     # forward kernel in src/sparton/_backend_optimized_gluon.py; the kernels
     # stay separate because this one materializes C while the production
-    # kernel runs the Sparton max/argmax epilogue. See
+    # kernel runs the Sparton max/argmax epilogue. D2 was discharged by
+    # re-affirmation at the M12 close (no persistent rewrite; see
+    # docs/sparton_milestone12_forward_memo.md); see also
     # docs/sparton_remaining_work_design_v2.md (D2) before deduplicating.
     @autotune(
         configs=configs,

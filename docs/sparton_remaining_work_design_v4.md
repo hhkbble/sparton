@@ -9,7 +9,8 @@ MMA matrix, Gluon API survey, environment defects, profiler notes, the GEMM
 bring-up counters and break-even model); [v2](sparton_remaining_work_design_v2.md)
 for the post-M8 review findings (F1–F20), the design-evolution ledger, the
 architecture rules of record (§4, including the policy-bank mechanics that
-M12-T1 replaces), and the executed M9/M10 specifications;
+the deferred launcher v2 would replace — §6), and the executed M9/M10
+specifications;
 [v3](sparton_remaining_work_design_v3.md) for the executed **M11 plan of
 record** and the post-M10 state snapshot and floor-ratio derivations (its
 §1) — the specification whose deviation ledger lives in the
@@ -76,7 +77,7 @@ cuBLAS GEMM in the same table (v2 §1.2). Neither the M10 nor the M11 gate
 run re-quoted a floor; their forwards (0.900 / 0.880 ms) are consistent
 with the review run within the same-config band. The dev forward is
 essentially done; M12-T0 re-measures forward and floor in one preserved
-run before any ratio gates a decision.
+run before any ratio gates a decision *(done — dev 1.029×, M12 memo §3)*.
 
 Canonical `splade-code-06B` grid (bf16, `D=1024, V=151936`, all-ones
 masks): forward (kernel unchanged since M8) runs at **≈1.05–1.12× the
@@ -84,7 +85,9 @@ per-row GEMM floor**. Provenance requires care: the preserved same-run
 evidence is the M8 memo grid (`opt+b` vs `gemm ms` columns → 1.094–1.123×
 across the nine rows); v3 §1.2 recorded 1.054–1.113× (best 8×512, worst
 16×768) from the M10 gate run, whose per-row gemm column was **not
-preserved** — per the evidence rules it orients but may not gate. The M11
+preserved** — per the evidence rules it orients but may not gate
+*(resolved at M12: re-measured in one preserved run, 1.099–1.117× — memo
+§3)*. The M11
 implied backward is 1.546–3.720 ms per row, −32…−41% vs M10. Derived
 shares: the backward is now **~17–52% of optimized fwd+bwd across the
 grid** (M11 implied-bwd ÷ (M10 forward + M11 implied-bwd), mixed-run) and
@@ -103,7 +106,8 @@ Two residual costs, both with named mechanisms:
    86.6% at identical occupancy/instruction family ⇒ the gap is intra-CTA
    pipelining quality). **The production fused kernel has never been
    ncu-profiled** — closing that is the first step of any forward work
-   (M12-T0).
+   (M12-T0). *[Superseded at M12: the profile exists (memo §2) and
+   overturned this picture — tensor pipe 92–94%, no scheduling slack.]*
 2. **Backward residual (M11 memo §6):** the segmented hidden-grad kernel is
    bound by embed-gather latency (no unit above ~35% on the deposited real
    doc record);
@@ -117,8 +121,11 @@ Two residual costs, both with named mechanisms:
 Host-side launch overhead of the optimized forward: ~0.119 ms/call
 wall-minus-GPU at `8×128×768×1280`, ~0.051 ms of it rebuilding the
 22-descriptor bank every call (v2 §1.3). Unchanged since — no launcher work
-has happened. Irrelevant at ≥1 ms GPU times; dominant for small/latency
-workloads; pure waste in all cases.
+has happened. Irrelevant at ≥1 ms GPU times — which is every documented
+workload; it would bind only for a small-shape latency-critical caller of
+the head itself, which nothing in the repo exercises. The scheduled fix
+(launcher v2) is **deferred** by maintainer decision; rationale and
+revival triggers in §6, overhead kept visible by M12-T4.
 
 ### 1.3 What M11 changed in this plan's assumptions
 
@@ -140,7 +147,10 @@ workloads; pure waste in all cases.
    — exactly the binder class where lowering-level tools (persistent
    scheduling, warp specialization) pay off. M12's kernel work remains
    plausible *because* its binder class differs from the one that
-   bounded B2a/B2b.
+   bounded B2a/B2b. *[Superseded at M12: the production kernel's own
+   profile put its binder in the operation-count class after all (pipe
+   saturated at 92–94%; the v1 inference was drawn from the GEMM bring-up
+   kernel at 63.9% and did not transfer) — memo §5.]*
 3. **Numeric exit gates are set from a validated analytic model, not
    before one exists.** M11's 1.5× clause was written before the traffic
    model and the doc-record cells near-missed it at 1.35–1.43× for a
@@ -152,8 +162,9 @@ workloads; pure waste in all cases.
    processes on borderline cells, M11 memo §5.2/§5.3). This invalidates
    v3's M12-T1 gate "identical policy selection to today's autotuner"
    as stated — near-tie selections legitimately flip between runs. The
-   parity gate is restated in M12-T1 as candidate-set/ranking parity
-   (deterministic) plus winner-time parity within a measured A-vs-A band.
+   parity gate for any revived launcher v2 is restated accordingly in its
+   deferred entry (§6): candidate-set/ranking parity (deterministic) plus
+   winner-time parity within a measured A-vs-A band.
 5. **Real-distribution evidence is standing infrastructure, and the data
    already falsified one assumption** (tier-2 representations are dense,
    `f = 1.0`; what real batches add is index collisions, not sparsity).
@@ -182,14 +193,18 @@ lockstep). Load-bearing for the milestones below:
   per cell before any timing). Production is wired winner-only at
   promotion.
 - **Policy-bank mechanics** (v2 §4.2) remain the document of record for
-  how the optimized forward selects configurations today; M12-T1 replaces
-  that mechanism and must update v2 §4.2's status note when it does.
+  how the optimized forward selects configurations today — and stay in
+  force while launcher v2 is deferred (§6). Whatever eventually replaces
+  the mechanism (a revived launcher v2, or a T3 rewrite that folds in the
+  single-pair launch) must update v2 §4.2's status note when it does.
 - **D2 (kernel-body duplication** between the optimized forward and
   `bench_gluon_gemm.py`) stays deliberately unresolved until the M12-T3
   decision point: dedupe into a shared `@gluon.jit` helper only if the
   rewritten production mainloop and the benchmark still share structure;
   if M12 closes without a rewrite, discharge D2 by re-affirming the
-  cross-reference comments instead.
+  cross-reference comments instead. **Discharged 2026-06-13** (M12 closed
+  without a rewrite; comments re-affirmed — M12 memo §5); re-open only if
+  a future milestone reopens the kernel body.
 - **`legacy_fused_sparton_bwd` removal condition** (role comment at the
   kernel): it stays until a later milestone supersedes the M11 comparison
   evidence. If M13 promotes a new backward, the baton passes explicitly:
@@ -203,14 +218,13 @@ lockstep). Load-bearing for the milestones below:
 
 Numbering continues from v3. Execution order inside and across milestones:
 
-1. **Unconditional tasks:** M12-T0 (forward entry evidence), M12-T1
-   (launcher v2), M12-T4 (measurement additions, after T1), and M13-T0
-   (backward entry evidence + training-scale debt). T0 and T1 are
-   independent of each other; land T1 first when convenient (it removes
-   per-call host noise from small-shape rows and deletes complexity
-   regardless of any kernel decision). M13-T0 reuses M12-T0's re-measured
-   grid table when it exists (one provenance for the shared baselines)
-   and re-measures otherwise — a convenience, not a dependency.
+1. **Unconditional tasks:** M12-T0 (forward entry evidence), M12-T4
+   (measurement additions), and M13-T0 (backward entry evidence +
+   training-scale debt). Launcher v2 (M12-T1) is **deferred** by
+   maintainer decision — rationale, revival triggers, and the retained
+   gate design in §6. M13-T0 reuses M12-T0's re-measured grid table when
+   it exists (one provenance for the shared baselines) and re-measures
+   otherwise — a convenience, not a dependency.
 2. **Kernel-rewrite work (M12-T2/T3, M13-T1/T2) is conditional**, each
    behind its own track's entry rule with its own denominator (M12-T0:
    ≥10% of forward time; M13-T0: ≥10% of backward time — stated in the
@@ -225,17 +239,36 @@ Numbering continues from v3. Execution order inside and across milestones:
    ordering is moot; if neither, the performance work ends with two
    closing memos (see Beyond M13).
 
-### M12 — Forward track: launcher v2 and entry-gated scheduling rewrite
+### M12 — Forward track: entry-gated scheduling rewrite
 
-Goal: remove the measured host-launch waste unconditionally; rewrite the
-mainloop only if fresh counter evidence says the remaining forward gap is
-real, SM-side, and worth ≥10% of forward on a shape that matters.
+Update, 2026-06-13: **M12 is complete — closed without kernel work.**
+T0's re-measured evidence fails the pre-registered rule's second clause:
+the production forward kernel is tensor-pipe-bound at **92.3–94.4%**
+utilization with the L2 fabric simultaneously at 89–91% and DRAM at the
+compulsory byte floor — there are no scheduling bubbles for a
+persistent/warp-specialized rewrite to fill (rule (i) passed on five grid
+rows at 10.16–10.51%, margins inside the run-to-run noise band; rule (ii)
+failed by ~18 points). T2/T3 were not entered; T4 landed
+(`--mask-density`, `bench_host_overhead.py`, plus the T0 tooling
+`ncu_forward_target.py`); D2 was discharged by re-affirmation; the
+launcher fold-in trigger (§6, trigger b) never fired. The one-provenance
+state table, validated traffic model, decision walk, and the forward
+track's terminal residual-bottleneck note (per-cycle pipe efficiency +
+L2 pressure at the autotuned 64×64×32 tile shape — a tile-shape question,
+not a scheduling one) live in the
+[M12 memo](sparton_milestone12_forward_memo.md).
+
+Goal: rewrite the mainloop only if fresh counter evidence says the
+remaining forward gap is real, SM-side, and worth ≥10% of forward on a
+shape that matters. (Launcher v2, formerly this milestone's unconditional
+task, is deferred — §6.)
 
 Will NOT touch: backward kernels or the backward op; `_validation.py`;
-op schemas (`sparton::optimized_fwd` keeps its schema throughout — T1
-changes descriptor plumbing and the kernel's slot signature/`POLICY_ID`
-if-chain but not the mainloop or epilogue; T3 is the only task that
-rewrites the mainloop); training code; dependencies.
+op schemas (`sparton::optimized_fwd` keeps its schema throughout); the
+selection/launch mechanism — decorator autotune and the descriptor bank
+stay as-is while launcher v2 is deferred, except that a T3 rewrite may
+fold in the single-pair launch per its §6 revival trigger; training code;
+dependencies. T3 is the only task that changes the kernel.
 
 #### M12-T0 Entry evidence: first production-forward profile + analytic model + decision
 
@@ -280,44 +313,14 @@ prose entry gate made executable. Half a day to a day.
 - Gate: counter tables + model-vs-measured residuals recorded in the M12
   memo with deposited transcripts; an explicit go/no-go entry in the memo.
 
-#### M12-T1 Launcher v2 (unconditional; fixes F9; deletes the descriptor bank)
+#### M12-T1 Launcher v2 — deferred (maintainer decision, 2026-06-12)
 
-Replace the decorator-autotune + 22-descriptor-bank mechanism
-(`_backend_optimized_gluon.py`, `_gluon_policy_runtime.py`) with an owned
-two-phase selector:
-
-- Selection: `derive_optimized_forward_policies` already prunes and ranks
-  candidates from the device/problem profiles; benchmark the survivors
-  once per `(B, S, D, V, dtype)` key with the existing `do_bench`
-  infrastructure, memoize in-process (optional on-disk cache mirroring
-  `cache_results=True` semantics).
-- Launch: build **one** descriptor pair per call for the selected policy
-  and invoke a single-pair kernel; delete the 22-arg bank, the `POLICY_ID`
-  if-chain, and `make_descriptor_bank`'s padding logic once parity is
-  proven. Keep the multi-slot kernel until then.
-- Tests: candidate-set/ranking parity is deterministic — assert the v2
-  selector's candidate list equals the autotune `early_config_prune`
-  path's output on canonical keys (tiny-problem fallback collapse
-  included); launch correctness rides the existing non-tiny forward tests
-  plus the shape soak.
-- Gates:
-  1. **Candidate parity (deterministic):** identical candidate sets and
-     ranking on the canonical grid + dev keys.
-  2. **Winner parity within noise (replaces v3's exact-selection gate,
-     per §1.3 item 4):** for each canonical key, the v2-selected policy's
-     `do_bench` time is within the same-impl A-vs-A band of the
-     autotuner-selected policy's (establish the band by repeating one
-     configuration; expect exact agreement on clear winners, legitimate
-     flips at near-ties).
-  3. Host overhead ≤ **0.02 ms/call** by the v2 Appendix A probe method
-     (300-call wall minus `do_bench` GPU time at `8×128×768×1280` fp16).
-  4. Full suite + shape soak green; canonical grid + dev rows within ±5%
-     of a baseline run taken in the same session immediately before the
-     change (use T0's table when T0 has already landed).
-- Documentation: update v2 §4.2's status note (the policy-bank mechanics
-  it documents are replaced); AGENTS.md Project Map line for
-  `_gluon_policy_runtime.py` if helpers are deleted; `benchmarks/README.md`
-  autotune description; CHANGELOG.
+The task number is retained so existing references resolve; the work is
+not scheduled. Deferred until a latency user exists or until the T3
+rewrite forces the kernel signature open anyway — full rationale, revival
+triggers, and the gate design of record for any revival are in §6
+("Launcher v2"). F9 remains a recorded finding; M12-T4's latency rows
+keep the measured overhead visible.
 
 #### M12-T2 `gl.warp_specialize` subprocess probe (entry gate for the WS variant)
 
@@ -339,11 +342,16 @@ only — it does not close T3.
   per-s-tile pipeline drain and embed-tile re-read disappear naturally in
   the persistent formulation — measure the actual gain against the T0
   model, don't assume it.
-- This rewrite is the **D2 decision point** (§2).
+- This rewrite is the **D2 decision point** (§2). It is also the recorded
+  revival trigger for the deferred launcher v2 (§6): the rewrite opens
+  the kernel signature anyway, so decide here — and record the decision —
+  whether the new kernel takes a single descriptor pair (folding in the
+  launcher simplification and deleting the 22-slot bank) or keeps the
+  bank mechanism.
 - Per-iteration discipline (loop steps 8–10): confirm lowering by reading
   TTGIR/SASS before benchmarking a config family (method ref §6.1, zero
   GPU cost); accept tuning changes only with a profiler-confirmed
-  mechanism; audit the autotune/selection key if T1's selector gains new
+  mechanism; audit the decorator-autotune key if the rewrite adds
   performance-relevant arguments.
 - Gates: full suite, shape soak, training smoke, benchmark grid; exit
   number fixed at T0 from the model (target family: ≤ **1.05× the
@@ -354,7 +362,7 @@ only — it does not close T3.
   recorded against the 86.6% cuBLAS reference. Exit names the residual
   bottleneck (loop step 10).
 
-#### M12-T4 Measurement-set additions (unconditional, after T1)
+#### M12-T4 Measurement-set additions (unconditional)
 
 - Add `--mask-density` to `benchmarks/bench_sparton_baseline.py` (default
   1.0 — today's all-ones behavior unchanged) and record a forward sweep
@@ -362,8 +370,10 @@ only — it does not close T3.
   v1 §10.3's sweep, landed on the forward side (`bench_backward.py`
   already carries it for the backward).
 - Record small-shape/latency rows (the v2 Appendix A item 5 shape family,
-  e.g. `8×128×768×1280`) with and without launcher v2 — T1's user-visible
-  effect.
+  e.g. `8×128×768×1280`) including the wall-minus-GPU host share per
+  backend — the standing documentation of the deferred F9 overhead (§6),
+  and the baseline any future latency user would revive launcher v2
+  against.
 - Gate: the recorded tables land in `benchmarks/README.md` (or a
   benchmarks doc it links) with run-of-record provenance. Record, don't
   threshold — these are documentation of record, not pass/fail numbers.
@@ -494,11 +504,11 @@ git diff --check
 (Regenerate the bundles via `capture_index_distributions.py` if
 `/root/m11_bundles/` is gone; bundles never live in the repo.)
 
-M12 additions: candidate-set/ranking parity assertion and the
-winner-within-noise check (T1); host-overhead probe ≤ 0.02 ms/call (T1);
-production-forward counter tables vs the analytic model (T0); nsys
-launch-count and ncu DRAM-floor checks plus the v1 §9 rejection criteria
-(T3); mask-density sweep and latency rows (T4).
+M12 additions: production-forward counter tables vs the analytic model
+(T0); nsys launch-count and ncu DRAM-floor checks plus the v1 §9
+rejection criteria (T3); mask-density sweep and latency rows including
+the host-overhead share (T4). The launcher-v2 parity and host-overhead
+gates live with its deferred entry (§6) and apply only on revival.
 
 M13 additions: model-vs-counter validation on real records (T0);
 per-cell-verified decision matrix over all sources, run 2 of record (T1);
@@ -518,7 +528,7 @@ any M13 candidate inherits it.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Launcher v2 selection diverges from the autotuner at near-ties | expected, low | two-part parity gate (deterministic candidate/ranking parity; winner time within the measured A-vs-A band) — exact-match gating was invalidated by measured ±5% selection jitter |
+| F9 host overhead (~0.119 ms/call) stays in place for any future latency user | low — no such user identified | deferred with recorded revival triggers and gate design (§6); M12-T4 keeps the overhead share measured and visible |
 | Production-forward profile contradicts the GEMM-kernel priors (binder not SM-side) | medium | that is what T0 exists to find; the decision rule then closes T3 without kernel work, with the memo recording the real binder |
 | `gl.warp_specialize` immature/fatal on sm_120 | medium | M12-T2 subprocess probe before any T3 work; CTA-barrier persistent variant is the fallback |
 | Persistent rewrite churns the validated forward kernel for <5% | medium | T0 entry gate + model-derived exit numbers + v1 §9 rejection criteria + shape soak; closing-without-rewrite is a recorded outcome |
@@ -532,6 +542,51 @@ any M13 candidate inherits it.
 ---
 
 ## 6. Rejected / deferred
+
+Deferred by maintainer decision, 2026-06-12 (supersedes v3's "launcher v2
+proceeds independently"):
+
+- **Launcher v2 (M12-T1: owned two-phase selector; delete the 22-slot
+  descriptor bank and `POLICY_ID` if-chain; fixes F9)** — **deferred
+  until a latency user exists or until the T3 rewrite forces the kernel
+  signature open anyway.** Three-part rationale:
+  1. **No identified latency scenario at this seam.** In every documented
+     workload (Trainer-based training, batched encoding) the head runs
+     behind a backbone forward at shapes where its GPU time is ≥1 ms and
+     host launch work overlaps it. The 0.119 ms/call binds only for a
+     small-shape, latency-critical caller of the head itself — nothing in
+     the repo exercises or documents such a caller, and in an online-
+     serving scenario the backbone forward would dominate the budget
+     anyway.
+  2. **The replacement is unproven against the incumbent.** An owned
+     selector still pays the shared wrapper/op/autograd machinery
+     (~0.013 ms/call wall-minus-GPU on the naive path — derived from v2
+     Appendix A item 5: 0.035 wall vs 0.022 GPU) plus per-call
+     winner-descriptor construction (~0.005 ms, scaling the measured
+     0.051 ms / 22-descriptor rebuild to one pair) and a cache lookup.
+     The paper estimate lands at ~0.018 ms against the ≤0.02 ms/call
+     target — under it with no margin, and no prototype was ever built.
+     The assumed ~6× host-overhead win could plausibly be ~2–3×, or miss
+     the gate.
+  3. With (1) and (2) unresolved, churning the validated production
+     selection path is speculative-benefit churn — it fails the
+     risk/benefit bar that every other task in this plan is held to.
+  F9 stays a recorded finding; M12-T4 records the wall-minus-GPU host
+  share per shape so the cost stays visible. **Revival triggers:** (a) a
+  real latency/small-shape user appears; (b) the M12-T3 rewrite proceeds
+  — fold the single-pair launch into the new kernel there rather than
+  reviving this as a standalone task; (c) a Triton autotune-API change
+  forces the mechanism open. **Gate design of record on revival:**
+  prototype first and measure the actual host floor before committing to
+  the ≤0.02 ms/call target (re-scope if the prototype misses it);
+  deterministic candidate-set/ranking parity vs the autotune
+  `early_config_prune` path on canonical keys (tiny-problem fallback
+  collapse included); winner-time parity within a measured A-vs-A band —
+  not exact selection match, which the ±5% jitter makes unachievable
+  (§1.3 item 4); full suite + shape soak; grid/dev rows within ±5% of a
+  same-session pre-change baseline; keep the multi-slot kernel until
+  parity is proven; update v2 §4.2's status note at the switch. v3 §3
+  M12-T1 carries the original mechanism spec.
 
 Decided during M11 — do not re-litigate (evidence in the M11 memo):
 
@@ -556,9 +611,12 @@ Carried forward from v3 §6 (rationale unchanged):
 
 - **Hybrid-side performance fixes** (v1 §9 items 7–9) — deferred
   indefinitely; hybrid is the compatibility path post-promotion.
-- **Descriptor-bank caching** — superseded by M12-T1 (removes the bank).
-- **Kernel-body dedup (D2)** — deferred to the M12-T3 decision point (§2),
-  discharged by re-affirmation if M12 closes without a rewrite.
+- **Descriptor-bank caching** — still rejected, including now that
+  launcher v2 is deferred: if the overhead ever matters, the right fix is
+  the bank *removal* above, not caching the bank.
+- **Kernel-body dedup (D2)** — **discharged by re-affirmation at the M12
+  close, 2026-06-13** (no rewrite; cross-reference comments updated — M12
+  memo §5). Re-open only if a future milestone reopens the kernel body.
 - **Restricting hybrid to fp16/bf16** — rejected; fp32 hybrid is permitted
   legacy (`test_validation_allows_fp32_hybrid`).
 - **CI setup** — out of scope (no CUDA runner); §4 is the gate mechanism.
@@ -586,10 +644,10 @@ Still deferred, new home in this document:
 | Dev shape M10: fwd 0.900 / f+b 2.325 ms | M10 gate run 2, [M10 memo](sparton_milestone10_promotion_memo.md) |
 | Dev floor 0.880 ms with same-run forward 0.898 ms (1.02×) | post-M8 review run, [v2](sparton_remaining_work_design_v2.md) §1.2 (re-quoted by the M9 memo; the M10/M11 gate runs quote no floor) |
 | Dev shape M11: fwd 0.880 / f+b 1.949 / implied bwd 1.069 ms (and hybrid 1.152 / 2.262) | M11 gate run 2, [M11 memo](sparton_milestone11_backward_memo.md) §6 |
-| Grid floor ratios: 1.094–1.123× (same-run); 1.054–1.113× (v3) | preserved same-run: M8 memo grid `opt+b`/`gemm ms` columns; v3 §1.2's range came from the M10 grid run whose per-row gemm column was **not preserved** — orients, may not gate |
+| Grid floor ratios: 1.099–1.117× (M12 run of record); 1.094–1.123× (M8 same-run); 1.054–1.113× (v3) | **current ratios of record: M12 memo §3** (`grid_bf16_run2.txt`); M8 memo grid `opt+b`/`gemm ms` columns (preserved same-run); v3 §1.2's range came from the M10 grid run whose per-row gemm column was **not preserved** — orients, may not gate |
 | Grid implied backward 1.546–3.720 ms, −32…−41% vs M10 | M11 memo §6 table |
-| Backward share ~17–52% grid / ~55% dev | **derived** — grid: M11 implied-bwd ÷ (M10 forward + M11 implied-bwd), mixed-run, re-derived in one run at M12-T0; dev: 1.069 / 1.949, same M11 run |
-| Forward absolute gap ~0.3–0.5 ms (8×512) / ~1.6–1.8 ms (16×768) | **derived** from the two ratio anchors above; re-derived at M12-T0 |
+| Backward share ~17–52% grid / ~55% dev | **re-derived on one provenance at M12** (memo §3: 18.5–52.3% grid / 54.9% dev); originally derived mixed-run (M11 implied-bwd ÷ (M10 forward + M11 implied-bwd)) |
+| Forward absolute gap per grid row | **M12 run of record** (memo §3): 0.126–1.628 ms/call (gap 8.97–10.51% of forward); supersedes the v4-draft anchors derived from the contested ratio range |
 | Real-record backward 3.3–4.4 ms (legacy 5.90–7.93); speedups: queries 2.15–2.39×, steps150 docs 1.35–1.43×, synthetic 1.09–1.29× | M11 memo §5.3 / §6 gate ledger |
 | L2 red sectors 96.57M→3.49M (dev), 330.63M→6.40M (corner), 408.03M→1.55M (real query) | M11 memo §6; transcripts `/root/profiles/m11/` |
 | Residual: segmented kernel no unit >35% (real doc); embed kernel LTS 82.6% (dev) | M11 memo §6 (`bwd_real_r1doc_segmented.txt`, `bwd_after_dev_fp16.txt`) |
@@ -611,8 +669,9 @@ The standing-gate block in §4, plus:
   logging.
 - Sanitizer (M13-T2, if ownership semantics change): the three
   `compute-sanitizer` invocations recorded in the M11 memo §5.4.
-- Host-overhead probe (M12-T1): the 300-call wall-vs-`do_bench` method of
-  v2 Appendix A item 5 at `8×128×768×1280` fp16.
+- Host-overhead probe (M12-T4's host-share rows; revived launcher v2):
+  the 300-call wall-vs-`do_bench` method of v2 Appendix A item 5 at
+  `8×128×768×1280` fp16.
 - M7 ratio gate on any Triton bump: `bench_gluon_gemm.py --dtype {fp16,bf16}
   --include-block-n-256 --require-ratio 85` plus `probe_gluon_epilogue.py`.
 - Bundle regeneration: `capture_index_distributions.py --train-steps {0,150}

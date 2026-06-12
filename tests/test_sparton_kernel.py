@@ -1223,6 +1223,50 @@ def test_bench_backward_synthetic_inputs_honor_contract(
 
 @requires_cuda
 @pytest.mark.cuda
+def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None:
+    """Pin the --mask-density seam of benchmarks/bench_sparton_baseline.py.
+
+    The M12-T4 flag must not perturb the canonical rows: at density 1.0 the
+    mask is exactly the historical all-ones mask, and because the mask is the
+    last generator consumer, hidden/embed/bias stay bit-identical at every
+    density for the same seed.
+    """
+
+    from benchmarks.bench_sparton_baseline import ShapeSpec, make_inputs
+
+    spec = ShapeSpec(batch_size=2, seq_len=64)
+    common = dict(dim=32, vocab=128, dtype=torch.float16, seed=7)
+
+    hidden_1, embed_1, bias_1, mask_1 = make_inputs(spec, **common, mask_density=1.0)
+    assert torch.equal(
+        mask_1, torch.ones(spec.batch_size, spec.seq_len, device="cuda", dtype=torch.int32)
+    ), "density 1.0 must reproduce the all-ones mask exactly"
+
+    hidden_h, embed_h, bias_h, mask_h = make_inputs(spec, **common, mask_density=0.5)
+    assert torch.equal(hidden_1, hidden_h), "hidden draw must be density-independent"
+    assert torch.equal(embed_1, embed_h), "embed draw must be density-independent"
+    assert torch.equal(bias_1, bias_h), "bias draw must be density-independent"
+    assert not torch.equal(mask_1, mask_h), "density 0.5 must actually mask positions"
+
+
+def test_bench_host_overhead_shape_parser() -> None:
+    """Pin the BxSxDxV CLI contract of benchmarks/bench_host_overhead.py."""
+
+    import argparse
+
+    from benchmarks.bench_host_overhead import parse_shape_list
+
+    assert parse_shape_list("8x128x768x1280,32x128x768x30522") == (
+        (8, 128, 768, 1280),
+        (32, 128, 768, 30522),
+    )
+    for bad in ("8x128x768", "8x128x768xfoo", "8x128x0x1280", ""):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_shape_list(bad)
+
+
+@requires_cuda
+@pytest.mark.cuda
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 @pytest.mark.parametrize("autocast_dtype", AUTOCAST_DTYPES)
 def test_forward_backward_under_autocast(

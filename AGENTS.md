@@ -331,7 +331,12 @@ Rules:
   cross-references) — never mechanics, never change-narration.
   Cross-reference comments about kernel twins go above the decorator stack,
   never inside `@triton.jit`/`@gluon.jit` bodies (kernel-body bytes affect
-  compiled-source hashes).
+  compiled-source hashes). Above-decorator placement is NOT cache-safe
+  either: Triton's JIT cache key includes the function's starting line
+  number (verified on 3.6 at the M12 close — a +2-line comment edit
+  re-keyed the kernel's compile and autotune caches), so never edit such
+  comments while a measurement campaign is in flight; land them before the
+  runs or after the last run of record.
 - Retired implementations are either deleted or promoted to an explicit,
   test-pinned reference with a role comment naming its removal condition
   (`legacy_fused_sparton_bwd`, M11) — never left as silent dead code.
@@ -516,14 +521,18 @@ Authoring rules:
 - For training behavior, start from `training/model.py` and `training/train.py`;
   avoid importing training modules unless the optional Hugging Face
   dependencies are needed for the task.
-- For the next planned milestones (M12 forward track, M13 backward
-  residual track), read design v4 §3. The unconditional tasks are
-  launcher v2 (M12-T1), the two entry-evidence tasks (M12-T0, M13-T0),
-  and the measurement additions (M12-T4); all kernel-rewrite work is
-  entry-gated on fresh profiles plus model-derived recoverable-time bars,
-  with the cross-track ordering decided by the comparative table the two
-  entry tasks fill (forward column at M12-T0, backward column at M13-T0),
-  not by document order.
+- **M12 (forward track) is closed without kernel work** (2026-06-13): the
+  production forward kernel is tensor-pipe-bound at 92–94% with the L2
+  fabric at ~90% and DRAM at the compulsory floor — no scheduling bubbles
+  for a persistent/warp-specialized rewrite; evidence, the one-provenance
+  state table, and the terminal residual-bottleneck note (per-cycle pipe
+  efficiency + L2 pressure at the autotuned 64×64×32 tile shape) live in
+  `docs/sparton_milestone12_forward_memo.md`. Launcher v2 (M12-T1) stays
+  deferred (v4 §6; the T3 revival trigger never fired). The next planned
+  milestone is **M13 (backward residual track)**, design v4 §3: its
+  unconditional T0 (analytic gather ceiling + training-scale debt) is the
+  next task; kernel work stays entry-gated, with the M12 memo §3 table as
+  the forward column of the cross-track comparison.
 
 ## Training and Hugging Face References
 

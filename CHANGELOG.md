@@ -3,7 +3,113 @@
 All notable repository changes should be recorded here. Entries are grouped by
 the date they land in the repository unless a formal release tag exists.
 
+## 2026-06-13
+
+### M12 — forward track closed without kernel work (milestone complete)
+
+#### Decision
+
+- **M12's entry gate said no-go**: the first-ever ncu profile of the
+  production `sparton_optimized_forward_kernel` (dev fp16 plus the
+  rule-passing grid rows 4×768 and 16×512 bf16) measures the tensor pipe
+  at **92.3–94.4% utilization** with the L2 fabric simultaneously at
+  89–91%, DRAM reads at the compulsory byte floor (100–102%), L2 hit ≈99%,
+  zero spills, and the dominant warp stall *waiting for the execution
+  pipe*. The persistent/warp-specialized mainloop rewrite (M12-T2/T3)
+  targets scheduling bubbles that demonstrably do not exist (SM
+  active/elapsed = 99.6% at 16×512), so per the pre-registered v4 M12-T0
+  rule the kernel work is closed: the remaining 9.0–10.5% gap to the
+  same-run full-V cuBLAS GEMM is per-cycle tensor-pipe efficiency and L2
+  pressure at the autotuned 64×64×32 tile shape — a tile-shape question,
+  recorded as the forward track's terminal residual bottleneck. D2
+  (kernel-body duplication with `bench_gluon_gemm.py`) is discharged by
+  re-affirmation (cross-reference comments updated in
+  `src/sparton/_backend_optimized_gluon.py` and
+  `benchmarks/bench_gluon_gemm.py`); the launcher-v2 fold-in trigger never
+  fired, so the M12-T1 deferral stands. Evidence, validated traffic model
+  (requested-L2 formulas match counters to ≤0.6% on all three shapes),
+  decision walk, and gate ledger:
+  [docs/sparton_milestone12_forward_memo.md](docs/sparton_milestone12_forward_memo.md);
+  transcripts under `/root/profiles/m12/`.
+- The re-measured grid/dev state now has **one provenance** (run 2 of two
+  consecutive runs, gemm column in the same run): forward at
+  1.099–1.117× the per-row GEMM floor (gap 8.97–10.51% of forward; five
+  rows ≥10%, margins inside the 0.04–2.1-point run-to-run band), dev at
+  1.029×; implied backward 1.543–3.822 ms grid / 1.061 ms dev (backward
+  share 18.5–52.3% / 54.9%) — replacing design v4 §1.2's mixed-run
+  derivation. Design v4 carries the dated M12 status note and updated
+  Appendix A provenance rows; AGENTS.md task routing now points at M13-T0
+  as the next task.
+
+#### Added (M12-T0/T4 tooling and measurement sets)
+
+- `benchmarks/ncu_forward_target.py`: parameterized direct-op forward
+  profiling target (NVTX `fwd_direct/`, main-thread `optimized_fwd_op`
+  calls, autotune warmed outside the range) — the forward analogue of
+  `ncu_backward_target.py` and the M12-T0 counter source.
+- `benchmarks/bench_sparton_baseline.py --mask-density` (default 1.0):
+  seeded Bernoulli masks as the last generator consumer — density 1.0 is
+  byte-identical to the historical all-ones default and other densities
+  leave hidden/embed/bias draws untouched (pinned by
+  `test_bench_baseline_mask_density_contract`). Recorded sweep (v1 §10.3
+  landed on the forward side): forward time flat across densities
+  {0.25, 0.75, 1.0} — peak-to-peak 0.23% on the dev row, 0.09% at 8×512 —
+  the mask is an epilogue multiply, and density is correctly absent from
+  the autotune key.
+- `benchmarks/bench_host_overhead.py`: wall-minus-GPU host-share recorder
+  for the forward wrappers (the deferred-F9 visibility vehicle;
+  record-don't-threshold). Run of record reproduces the v2 figure:
+  optimized host share **0.121 ms/call** at `8×128×768×1280` fp16
+  (v2 record: 0.119) and 0.002–0.032 ms (overlapped, noise-dominated) at
+  the dev shape. CLI contract pinned by
+  `test_bench_host_overhead_shape_parser`. Suite: 132 → 134.
+
+#### M12 review pass
+
+- An inline adversarial review (two independent reviewers: every memo
+  number recomputed against the deposited transcripts; doctrine/
+  consistency over both milestone commits) confirmed the no-go decision
+  chain exactly — all §2/§3/§4/§6 figures reproduce to the printed
+  decimal — and produced corrections, all applied: the unreproducible
+  "15–50×" byte-floor multiplier replaced by the derived 7–81× range; the
+  4×768 DRAM-write excess reconciled instead of omitted; exact density and
+  host-share figures; `do_bench` cells relabeled means (not medians);
+  autotune selections captured for all nine grid keys + dev
+  (`fwd_selected_configs_grid.txt`), making the unprofiled-row
+  policy-family claim measured fact; v4 §1's pre-M12 claims marked
+  superseded. One durable method lesson landed in `AGENTS.md`: comments
+  above a kernel's decorator stack are NOT cache-safe to edit — Triton's
+  JIT cache key includes the def's starting line number (verified: the
+  close commit's +2-line comment edit re-keyed the forward kernel's
+  compile/autotune caches, after all runs of record) — never edit such
+  comments mid-campaign.
+
 ## 2026-06-12
+
+### Design v4: launcher v2 (M12-T1) deferred
+
+- Launcher v2 — the owned two-phase selector that would replace the
+  optimized forward's decorator-autotune + 22-descriptor-bank launch
+  mechanism (design v4 M12-T1, fixing review finding F9) — is **deferred
+  by maintainer decision**: until a latency user exists, or until the
+  M12-T3 mainloop rewrite forces the kernel signature open anyway (in
+  which case the single-pair launch folds into the rewrite rather than
+  reviving as a standalone task). Recorded rationale (v4 §6): no
+  documented workload is latency-bound at this seam — the head runs
+  behind a backbone forward at ≥1 ms GPU shapes where host launch work
+  overlaps, and nothing in the repo exercises a small-shape
+  latency-critical caller of the head itself; and the replacement's
+  ≤0.02 ms/call host target was an assumption, never a prototyped
+  measurement — the shared wrapper/op machinery alone costs
+  ~0.013 ms/call (naive path, v2 Appendix A item 5) and a winner-pair
+  descriptor build adds ~0.005 ms, leaving no margin. Churning the
+  validated selection path without either point resolved fails the plan's
+  risk/benefit bar. F9 stays a recorded finding; M12-T4 now records the
+  wall-minus-GPU host share per shape so the cost stays visible; the
+  jitter-aware parity/overhead gate design is retained in the deferred
+  entry for any revival (prototype-first). v4 §1–§5, `AGENTS.md` task
+  routing, and the v2 §4.2 policy-bank pointer were updated accordingly;
+  this supersedes v3's "launcher v2 proceeds independently" decision.
 
 ### Remaining-work design v4
 
