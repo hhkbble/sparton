@@ -193,6 +193,6 @@ Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). Design an
   title={Sparton: Fast and Memory-Efficient Triton Kernel for Learned Sparse Retrieval},
   author={Thong Nguyen, Cosimo Rulli, Franco Maria Nardini, Rossano Venturini, Andrew Yates},
   year={2026},
-  url={https://github.com/thongnt99/lsr-kernel}
+  url={https://arxiv.org/pdf/2603.25011}
 }
 ```
