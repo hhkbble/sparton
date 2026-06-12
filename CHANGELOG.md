@@ -5,6 +5,18 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-12
 
+### Kernel-optimization method reference
+
+- Added
+  [docs/triton_gluon_kernel_optimization.md](docs/triton_gluon_kernel_optimization.md)
+  (user-provided): methodologies, techniques, and tooling for kernel
+  optimization on Triton and Gluon — bottleneck-classification-first
+  profiling, autotune hygiene, occupancy/register-pressure tuning loops,
+  Gluon layout/async/TMA/warp-specialization techniques, a tooling checklist
+  (Compute Sanitizer, Proton, interpreter mode), and common failure modes.
+  Adopted as the method reference for the M11 backward track alongside
+  `AGENTS.md`.
+
 ### Remaining-work design v3
 
 - Added
