@@ -6,9 +6,16 @@ messages below use the wrapper argument names.
 
 Contract notes:
 
-- ``mask`` may be bool, integer, or floating point. Non-binary mask values
-  produce weighted logits (``logits * mask``), which is defined behavior but
-  not the Hugging Face attention-mask contract.
+- ``mask`` is contractually a binary {0, 1} tensor (the standard tokenizer
+  ``attention_mask``), in bool, integer, or floating point. The forward
+  multiplies logits by the mask, so non-binary values produce weighted
+  logits — an implementation property outside the original Sparton
+  contract: the shared backward does not differentiate the mask factor, so
+  gradients are exact for binary masks only. Weighted-mask support would be
+  an extension (backward change tested against the autograd head). Values
+  are not validated because these checks are metadata-only by design (see
+  below); rejecting non-binary values would need a data scan and a device
+  sync.
 - Empty tensors (``B``, ``S``, or ``V`` equal to 0) are not validated here and
   backend behavior for them is unspecified.
 - The custom ops themselves assume validated, contiguous ("canonical")

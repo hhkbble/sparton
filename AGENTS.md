@@ -3,10 +3,11 @@
 This file applies to the entire `/workspace/sparton` repository. Treat it as
 the source-grounded operating guide for future agents and contributors. It
 encodes both the repository facts and the working method that produced the
-M8→M10 arc; the method sections (Operating Loop, Evidence and Measurement,
-Testing Doctrine, House Style, Documentation System) apply to every task,
-not only kernel work. Rules cite the memo or design section that taught them
-so you can audit the evidence rather than trust the rule.
+M8→M11 arc; the method sections (Operating Loop, Evidence and Measurement,
+Performance-Optimization Loop, Testing Doctrine, Milestone Review, House
+Style, Documentation System) apply to every task, not only kernel work.
+Rules cite the memo or design section that taught them so you can audit the
+evidence rather than trust the rule.
 
 ## Project Map
 
@@ -17,7 +18,11 @@ so you can audit the evidence rather than trust the rule.
   (`resolve_backend`, `SpartonHead`, re-exports, lazy `optimized` symbols).
   Backend implementations live beside it:
   - `_backend_hybrid.py` — compatibility backend (compiled tiled matmul +
-    Triton reduction + the single Triton backward used by all backends);
+    Triton reduction) plus the shared backward used by all backends: the
+    M11 segmented backward (prep + exclusive-owner embed/bias-grad kernel +
+    sorted segmented-scan hidden-grad kernel inside
+    `sparton::fused_sparton_bwd`) and the retained pre-M11 kernel behind
+    `legacy_fused_sparton_bwd` (A/B reference of record, test-pinned);
   - `_backend_naive_triton.py` — `tl.dot` fused-forward debug baseline with
     bounded autotune;
   - `_backend_optimized_gluon.py` — Gluon TMA + `mma_v2` fused forward with
@@ -34,16 +39,23 @@ so you can audit the evidence rather than trust the rule.
   package. `training/model.py` wraps Hugging Face MLM backbones, and
   `training/train.py` wires dataset loading, tokenization, contrastive loss,
   sparsity regularization, and `Trainer`.
-- `tests/` contains the pytest 9 kernel/reference test suite. Pytest is
-  configured in `pyproject.toml`.
+- `tests/` contains the kernel/reference pytest suite (132 tests at M11
+  exit; the quick loop is `-m "not slow"`). Pytest (>=9) is configured in
+  `pyproject.toml`.
 - `benchmarks/` contains validated probe/benchmark/gate scripts (MMA
   availability, Gluon GEMM ratio gate, merged backend baselines, shape soak,
-  training smoke, profiler launchers); usage in `benchmarks/README.md`. The
-  forward plan lives in `docs/sparton_remaining_work_design_v3.md`;
-  `docs/sparton_remaining_work_design_v2.md` remains authoritative for the
-  post-M8 review findings and M9/M10 provenance, and
-  `docs/sparton_gluon_remaining_work_design.md` for platform facts and
-  measured evidence.
+  training smoke, profiler launchers, and the M11 backward toolchain:
+  index-distribution capture, distribution-aware backward harness, backward
+  profiling target); usage in `benchmarks/README.md`.
+- Document map: the forward plan lives in
+  `docs/sparton_remaining_work_design_v4.md`;
+  `docs/sparton_remaining_work_design_v3.md` remains authoritative for the
+  executed M11 plan of record and the post-M10 snapshot/ratio derivations;
+  `docs/sparton_remaining_work_design_v2.md` for the post-M8 review
+  findings and M9/M10 provenance;
+  `docs/sparton_gluon_remaining_work_design.md` for platform facts and the
+  original measured evidence; `docs/sparton_milestone11_backward_memo.md`
+  for the backward's mechanism evidence and analytic traffic model.
 - There is currently no lint config, typecheck config, CI config, or lockfile.
   The documented command set in Validation is the gate mechanism.
 
@@ -53,7 +65,7 @@ so you can audit the evidence rather than trust the rule.
   project status.
 - Read `CHANGELOG.md` for recent repository changes before planning or editing.
 - For milestone work, read the active design doc's milestone section
-  (`docs/sparton_remaining_work_design_v3.md`) before planning: it contains
+  (`docs/sparton_remaining_work_design_v4.md`) before planning: it contains
   file-level task specs, gates, and recorded decisions. Do not re-derive what
   it already settles; do not silently contradict it — evolve it and record
   the evolution (see Documentation System).
@@ -63,7 +75,7 @@ so you can audit the evidence rather than trust the rule.
 
 ## The Operating Loop
 
-The cycle that produced M9 and M10; follow it for any non-trivial task.
+The cycle that produced M9–M11; follow it for any non-trivial task.
 
 1. **Orient** (above), then **probe before designing**: when the task starts
    from a suspicion or a review finding, write a small disposable probe that
@@ -97,7 +109,13 @@ Efficiency rules learned the long way:
 - Give long sweeps a `--quick` subset for development; run the full sweep
   only as the gate.
 - Long GPU jobs can run in the background while you edit docs/tests, but
-  never run two Triton/Inductor-compiling processes concurrently.
+  never run two Triton/Inductor-compiling processes concurrently — and
+  never edit `src/` or `benchmarks/` while a background or *queued* process
+  will import them: a chained second run imports the edited tree and
+  silently corrupts the A/B (M11). Docs and tests are always safe to edit.
+- A pytest run launched immediately after a heavy background GPU job can
+  fail transiently (subprocess-based tests); rerun and classify before
+  debugging (M11 memo §8).
 - Autotune and Inductor caches are persistent (`cache_results=True`,
   `TORCHINDUCTOR_CACHE_DIR`): first runs pay compile/tune cost, reruns are
   cheap. Judge timings accordingly (below) and don't fear re-running gates.
@@ -110,29 +128,105 @@ Efficiency rules learned the long way:
   command; run benchmarks serially.
 - **Judge benchmarks on the second consecutive run** (warm caches). Recorded
   baselines of record: dev shape `B=32,S=128,D=768,V=30522` fp16 — see the
-  M10 memo table; rerun the row yourself before using it as a gate.
+  M10/M11 memo tables; rerun the row yourself before using it as a gate.
 - **Measure A-vs-A before judging A-vs-B**: repeat the same configuration and
-  use that spread as the noise band. The atomic-add backward makes even
-  same-seed training runs differ (~20% loss spread in chaotic regimes — M10
-  memo, tier 2); a cross-backend difference inside the same-backend band is
-  noise, not signal.
+  use that spread as the noise band. Autotune config-selection jitter between
+  processes is part of the band (±5% on borderline cells — M11 memo §5.2);
+  a cross-impl difference inside the same-impl band is noise, not signal.
 - **Keep measurement regimes separate**: `triton.testing.do_bench`
   (L2-flushed) is the latency of record; `ncu` serializes and flushes, so its
   durations are inflated — use it for structure, counters, and ratios; `nsys`
-  for kernel inventory. Never compare numbers across regimes (v1 §2.5 records
-  a published mistake from mixing them).
-- **Classify a failure before fixing it.** Three verdicts are possible: a
-  real defect (non-contiguous `embed_grad`, M9 F1), expected behavior that
+  for kernel inventory; sanitizer-run timings are meaningless. Never compare
+  numbers across regimes (v1 §2.5 records a published mistake from mixing
+  them).
+- **Deposit a transcript for every number that carries a decision** (tee
+  ncu/bench output to a file; bundles and profiles live outside the repo,
+  e.g. `/root/m11_bundles/`, `/root/profiles/`). The largest finding class
+  in the M11 review was decision-carrying numbers with no preserved log;
+  an unpreserved spot-run may not be quoted as a result — label it or
+  re-run it (M11 memo §8 item 7).
+- **Classify a failure before fixing it.** Four verdicts are possible: a
+  real defect (non-contiguous `embed_grad`, M9 F1); expected behavior that
   the gate mis-asserts (GradScaler-skipped early fp16 steps are normal AMP
-  scale calibration — the M10 smoke's gate was rewritten, not the code), or
-  an out-of-contract input (near-tie index mismatches are allowed by the
-  index contract). Fixing before classifying produces wrong fixes.
+  scale calibration — the M10 smoke's gate was rewritten, not the code); an
+  out-of-contract input (near-tie index mismatches are allowed by the index
+  contract); or behavior that is in-contract but the contract itself needs a
+  maintainer ruling — escalate, then record the ruling in code comments and
+  docs (the M11 mask-factor finding became a contract note, not a code fix;
+  memo §9). Fixing before classifying produces wrong fixes.
 - Perf claims need a mechanism, not just a delta: when a result surprises
   (cuBLAS unusually slow on a stress shape), say why or flag it as
   unexplained in the memo rather than letting the ratio stand alone.
 - A gate that can be expressed as a script should be one (see
   `benchmarks/soak_optimized_correctness.py`): availability check, summary
   line, non-zero exit listing every failure.
+
+## The Performance-Optimization Loop
+
+The M11 extension of the Operating Loop for performance work. Kernel-level
+techniques live in `docs/triton_gluon_kernel_optimization.md`; this section
+is the repo-proven process around them. Every rule cites the M11 memo
+(`sparton_milestone11_backward_memo.md`).
+
+1. **Name the binding resource before designing** (method ref §3.3): profile
+   the current implementation (ncu, direct op calls on the main thread) and
+   identify the unit that binds — M11: L2 sector pipe at 56–58% while SM sat
+   below 7% (§5.1). Then ask the altitude question: is the binder an
+   algorithm-level *operation count* or a lowering-level inefficiency?
+   Counts that scale with the problem (sectors, atomics, bytes) are
+   invariant under grid restructuring, TMA, or a Gluon port — only changing
+   *which operations exist* helps. Lowering-level tools (Gluon, IR reading,
+   occupancy/register tuning) pay off only when the binder is SM-side.
+2. **Write the analytic traffic model first**: per-buffer formulas in the
+   problem dims and block params, validated against counters before any
+   candidate is built (M11 §3 matched measured sectors to four significant
+   figures on two shapes). The model then predicts each candidate's ceiling
+   before you invest in it, arbitrates surprises, and becomes the memo's
+   expected-vs-measured spine.
+3. **Benchmark on realistic data distributions.** Synthetic-uniform inputs
+   missed both decisive properties of real batches (dense scores; 20–46% of
+   vocab entries sharing one argmax position — §4). Capture real
+   distributions once (`capture_index_distributions.py` bundles, with
+   distribution stats recorded at capture time), replay them in the harness
+   (`bench_backward.py`), and keep synthetic sources for regimes real data
+   does not cover. The data may also overturn design assumptions — measure
+   the distribution before trusting the plan's picture of it.
+4. **Prototype behind a registry; production stays untouched.** Candidates
+   live in `benchmarks/` with the production op's exact signature, selected
+   by `--impls`; the harness numerically verifies every cell against
+   production *before* timing it, so a broken prototype cannot produce a
+   timing row (§5). Wire the winner into the op only at promotion; retain
+   the loser of record as an explicit, test-pinned legacy reference.
+5. **Pre-register numeric decision rules** for timeboxed alternatives (the
+   B2b early-stop rule, §5.1) so skipping work is defensible, and record
+   the decision-criteria walk in the memo.
+6. **Time at the op level for the verdict; profile at the kernel level for
+   structure.** The op-level closure allocates exactly what production
+   allocates — buffer fills and host passes count. The host side is
+   in-bounds for "kernel" optimization: M11's unlock included `torch.sort`
+   plus a fused prep kernel, and fusing seven elementwise launches into one
+   was worth more than any kernel tweak at small shapes (§5.2).
+7. **Audit the autotune key.** A performance-relevant argument missing from
+   the key silently reuses a wrong config (`seq_len`, §5.2: query-tuned
+   configs served documents at ~7% cost). Log selections with
+   `TRITON_PRINT_AUTOTUNING=1`; note that Triton ≥3.6 keys include argument
+   dtypes automatically.
+8. **Read the IR when the question is about lowering** (method ref §6.1):
+   `CompiledKernel.asm` / `nvdisasm` answer instruction-form questions
+   (vector widths, scan lowering, spills) at zero GPU cost. Confirm the
+   lowering before benchmarking a config family; settle counter surprises
+   by reading the form, not inferring it from counter arithmetic.
+9. **Sanitize kernels whose ownership semantics changed** (atomics→stores,
+   `torch.empty` outputs): `compute-sanitizer` racecheck/memcheck/initcheck
+   on a small shape — initcheck mechanically validates empty-allocation
+   claims, and one harness run sweeps every autotune config under the
+   sanitizer (§5.4).
+10. **Per-iteration discipline**: accept a tuning change only with a
+    profiler-confirmed mechanism (method ref §4.3), re-verify correctness
+    after every kernel edit (the harness does this per cell), and stop
+    optimizing when the remaining gap has a named, recorded bottleneck —
+    the memo's residual-bottleneck note is the entry evidence for the next
+    milestone (§6).
 
 ## Testing Doctrine
 
@@ -143,6 +237,13 @@ Efficiency rules learned the long way:
   pruning, dtype), assert the activation itself in the test —
   `test_optimized_forward_nontiny_shapes` asserts the derived candidate set
   is larger than the fallback before checking outputs.
+- **Conditional expectations must pin what they condition on.** A
+  closed-form expectation computed from the kernel's own saved outputs is
+  the right shape for backward tests at random non-tiny shapes (autograd
+  through the reference re-litigates contract-legal near-tie choices), but
+  it masks forward bugs unless the same test pins those saved outputs —
+  reference scores within tolerance plus the index contract
+  (`test_fused_backward_nontiny_shapes`; M11 memo §8 item 6).
 - **Match assertion strength to input class**: deterministic constructed
   cases (intentional ties, masked winners, dyadic-rational patterns) assert
   exact equality — they pin tie policy. Random-input cases assert the
@@ -155,8 +256,11 @@ Efficiency rules learned the long way:
   API — tests depend on them; change them deliberately.
 - Single-source gate logic: when a gate script and a test overlap, the test
   imports the script's function (`test_training_parity_smoke_autocast` reuses
-  `probe_training_smoke.run_mode`) instead of duplicating it.
-- Mark expensive coverage `@pytest.mark.slow`; the default `pytest -q` runs
+  `probe_training_smoke.run_mode`; the backward harness's synthetic-input
+  contract is pinned by importing `make_synthetic_case`) instead of
+  duplicating it.
+- Mark expensive coverage `@pytest.mark.slow` — including tests that
+  autotune kernel families at non-tiny shapes; the default `pytest -q` runs
   everything, `-m "not slow"` is the documented quick loop. Don't let the
   quick loop lose meaning by marking cheap tests slow.
 - Subprocess tests use absolute paths (`_REPO_ROOT`, `_SRC_PATH` in
@@ -165,11 +269,31 @@ Efficiency rules learned the long way:
   `pytest /workspace/sparton/tests` from a foreign working directory — run
   all three after touching test infrastructure.
 - Parametrized cases live in named tables with explicit ids
-  (`FORWARD_CASES`, `VALIDATION_ERROR_CASES`, `NONTINY_FORWARD_CASES`);
-  `strict_parametrization_ids` is enabled.
+  (`FORWARD_CASES`, `BACKWARD_CASES`, `VALIDATION_ERROR_CASES`,
+  `NONTINY_FORWARD_CASES`); `strict_parametrization_ids` is enabled.
 - Gate availability with fixtures/helpers (`_forward_for_backend`,
   `_optimized_gluon_availability`), not device-name checks — capability, not
   hardware identity.
+- Tensors built for gradient tests must be autograd leaves: an arithmetic
+  result like `-torch.ones(..., requires_grad=True)` is a non-leaf whose
+  `.grad` stays `None`; use `torch.full`/`torch.ones` directly (M11 memo §6
+  red→green note).
+
+## Milestone Review
+
+Before a milestone closes, run an adversarial review of the diff **and the
+evidence chain**, then fix or record every finding the review cannot refute
+— silence is not a verdict. The M11 shape: independent reviewers per
+dimension (kernel/op correctness; every quoted number checked against its
+preserved log; doctrine compliance), each finding judged by two independent
+verifiers prompted to refute it. That pass caught a contract-level gap the
+gates could not see, an unpreserved figure that flattered the result, and a
+test-gate hole — after all functional gates were green (M11 memo §8).
+Findings about the contract itself go to the maintainer for a ruling
+(Evidence section, fourth verdict) rather than being "fixed". Corrections
+to the milestone's own documents are themselves recorded in the memo's
+deviations section — the review is part of the evidence, not a cleanup to
+hide.
 
 ## House Style
 
@@ -179,10 +303,12 @@ Copy the repo's best instance of a pattern instead of inventing a new shape:
 |---|---|
 | Gate/sweep script | `benchmarks/soak_optimized_correctness.py` (docstring contract, availability gate in `main`, `--quick`, summary line, non-zero exit with failure list) |
 | Training/integration probe | `benchmarks/probe_training_smoke.py` (reusable `run_mode`, per-mode gates) |
+| Perf decision harness | `benchmarks/bench_backward.py` (impl registry, per-cell verification before timing, determinism protocol, provenance header, documented synthetic-input contract) |
+| Capture-to-disk distribution tooling | `benchmarks/capture_index_distributions.py` (stats recorded at capture; bundles outside the repo with rerun recipe) |
 | Contract checker + test tables | `tests/test_sparton_kernel.py` (`assert_index_contract`, case tables) |
 | Input validation + error template | `src/sparton/_validation.py` |
-| Forward design doc | `docs/sparton_remaining_work_design_v3.md` (active plan); `docs/sparton_remaining_work_design_v2.md` for the review-born shape (findings + evolution ledger) |
-| Milestone memo | `docs/sparton_milestone9_production_readiness_memo.md` (finding→fix table, red→green evidence), `docs/sparton_milestone10_promotion_memo.md` (gate-by-gate decision record) |
+| Forward design doc | `docs/sparton_remaining_work_design_v4.md` (active plan); `docs/sparton_remaining_work_design_v2.md` for the review-born shape (findings + evolution ledger) |
+| Milestone memo | `docs/sparton_milestone11_backward_memo.md` (analytic-model spine, expected-vs-measured, decision record, deviations incl. self-corrections); `docs/sparton_milestone9_production_readiness_memo.md` (finding→fix table, red→green evidence); `docs/sparton_milestone10_promotion_memo.md` (gate-by-gate decision record) |
 
 Rules:
 
@@ -195,14 +321,20 @@ Rules:
   wrapper), never N divergent copies.
 - **No silent fallbacks.** The single sanctioned exception is default-backend
   resolution (one-time `RuntimeWarning`, M10). Explicit selections raise with
-  the reason. Do not add a second exception.
+  the reason. Do not add a second exception — data-dependent algorithm
+  dispatch inside an op would also need a host sync, which is why M11
+  shipped one kernel family, not an adaptive switch.
 - Diagnostics go through `logging.getLogger("sparton")` at DEBUG. Never
   `print` from library code; a regression test enforces silent import.
 - Comments state constraints the code cannot show (TMA alignment origin, the
-  16-bit `dtype_name` assumption, D2 cross-references) — never mechanics,
-  never change-narration. Cross-reference comments about kernel twins go
-  above the decorator stack, never inside `@triton.jit`/`@gluon.jit` bodies
-  (kernel-body bytes affect compiled-source hashes).
+  16-bit `dtype_name` assumption, run-boundary composition invariants, D2
+  cross-references) — never mechanics, never change-narration.
+  Cross-reference comments about kernel twins go above the decorator stack,
+  never inside `@triton.jit`/`@gluon.jit` bodies (kernel-body bytes affect
+  compiled-source hashes).
+- Retired implementations are either deleted or promoted to an explicit,
+  test-pinned reference with a role comment naming its removal condition
+  (`legacy_fused_sparton_bwd`, M11) — never left as silent dead code.
 - Capability dispatch for fatal-failure APIs (Gluon MMA families abort the
   process at LLVM selection) uses static whitelists probed in subprocesses
   (`probe_mma_matrix.py`), never try/except fallback.
@@ -225,7 +357,9 @@ Rules:
   forwards delegate backward to `fused_sparton_bwd_op`.
 - Autograd registration saves max scores, max indices, hidden states, decoder
   weights, bias, and mask. Backward uses `fused_sparton_bwd_op` and accumulates
-  `hidden_grad`, `embed_grad`, and `bias_grad` in `float32`.
+  `hidden_grad`, `embed_grad`, and `bias_grad` in `float32`. A backward swap
+  that keeps the saved-tensor set is schema-safe inside the op (M11); a
+  changed saved-tensor set requires a new op name.
 - Preserve CUDA-only behavior unless explicitly implementing a CPU fallback.
   `__init__.py` intentionally exposes no `SpartonHead` when CUDA is unavailable.
 - Preserve tensor contracts unless the task explicitly changes them:
@@ -233,11 +367,25 @@ Rules:
   `[V]`, attention mask is `[B, S]`, and output sparse reps are `[B, V]`.
 - The mask semantics in both PyTorch and Triton paths are part of correctness:
   logits are masked over sequence positions before ReLU, `log1p`, and max over
-  the sequence dimension. Non-binary masks weight logits — defined behavior,
-  not the HF attention-mask contract (documented in `_validation.py`).
+  the sequence dimension. The mask contract is binary {0, 1} (the standard
+  tokenizer `attention_mask`); under it the shared backward is exact — a
+  masked winner forces score 0 and the `scores > 0` guard zeroes its
+  gradient, so no `mask[b, idx]` factor is needed (maintainer ruling,
+  M11 review; memo §9). Non-binary values weight logits in the forward as
+  an implementation property, but they are outside the contract: the
+  backward does not differentiate the mask factor. Supporting weighted
+  masks would be an extension — backward change plus tests against the
+  `head="torch"` autograd path. Values are deliberately not validated
+  (`_validation.py` checks are metadata-only; a value scan needs a device
+  sync).
 - Numerics contract: forward output follows hidden/logit dtype; `naive`/
   `optimized` accumulate logits in fp32 (more precise than hybrid's
   input-dtype logits — intended); backward gradient buffers are `float32`.
+  `hidden_grad` is zero-filled (atomic accumulation; untouched rows stay 0);
+  `embed_grad`/`bias_grad` are `torch.empty` — safe only because the embed
+  kernel's unconditional exclusive-owner stores cover every element
+  (initcheck-validated, M11 memo §5.4); keep allocation and coverage in
+  lockstep if either changes.
 - Do not casually change autotune config lists, tile-size heuristics,
   `torch.library.custom_op` signatures, fake registrations, or autograd setup.
   These affect compilation, graph capture, memory behavior, and gradients.
@@ -267,7 +415,7 @@ task's definition of done.
 |---|---|---|
 | `README.md` | User-facing setup, examples, behavior, high-level status | User-visible behavior changes |
 | `AGENTS.md` (this file) | Durable repository facts, invariants, and method | A rule changes or a new durable lesson is learned; never task history |
-| Active design doc (`docs/sparton_remaining_work_design_v3.md`) | The forward plan: milestones, gates, architecture rules, recorded decisions | Milestone completion gets a dated status note pointing at the memo; superseding it means a new doc plus a supersession note in the old one |
+| Active design doc (`docs/sparton_remaining_work_design_v4.md`) | The forward plan: milestones, gates, architecture rules, recorded decisions | Milestone completion gets a dated status note pointing at the memo; superseding it means a new doc plus a supersession note in the old one |
 | Milestone memos (`docs/sparton_milestone*_memo.md`) | Evidence of record: finding→fix mappings, gate transcripts, red→green captures, deviations, the not-validated list | One per milestone or substantial debugging session |
 | `CHANGELOG.md` | Dated user-visible changes: behavior, API/schema, packaging, validation infrastructure, fixes, milestones | Every task that changes any of those |
 
@@ -280,11 +428,15 @@ Authoring rules:
   in a command someone can rerun (appendix of rerun commands).
 - **Memos record what actually happened**, including deviations from the plan
   and what was deliberately not validated. An honest "known gaps" section is
-  mandatory.
+  mandatory. For performance memos, the spine is the analytic model and an
+  expected-vs-measured table per change (M11 memo) — a reader must be able
+  to see *why* each change worked, not only that it did.
 - **Every number in a committed document was produced by a command run in
-  that session.** If prose was drafted before the measurement, correct the
-  draft to the measured value before committing. Quote both numbers when two
-  regimes disagree, with the regime named.
+  that session, and quotes its run of record.** If prose was drafted before
+  the measurement, correct the draft to the measured value before
+  committing. Quote both numbers when two regimes disagree, with the regime
+  named. An isolated unpreserved measurement may not stand as a result —
+  label it as unpreserved or re-run it (M11 memo §8 item 7).
 - Documents form a supersession chain, never silent replacement: the old doc
   gets a status line naming its successor and what it remains authoritative
   for.
@@ -293,6 +445,13 @@ Authoring rules:
 
 ## Reference Material
 
+- `docs/triton_gluon_kernel_optimization.md` is the kernel-optimization
+  method reference (user-provided, adopted at M11 alongside this file):
+  bottleneck-classification-first profiling, autotune hygiene,
+  occupancy/register tuning loops, Gluon techniques, tooling checklist
+  (incl. the §6.1 IR-stage visibility recipe), failure modes. Read it
+  before any Triton/Gluon performance work; update trigger mirrors this
+  file's (a durable method lesson, never task history).
 - Upstream project metadata in this repo points at
   `https://github.com/thongnt99/sparton`; the local remote is different.
 - The README citation references:
@@ -331,6 +490,11 @@ Authoring rules:
   `docs/sparton_gluon_remaining_work_design.md`.
 - Useful shell prefix for local probes:
   `TRITON_PTXAS_PATH=/usr/local/cuda-13.2/bin/ptxas CPATH=/usr/local/cuda-13.2/include TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor PYTHONPATH=src /workspace/venvs/sparton/bin/python`.
+- Profilers: `ncu` and `nsys` are on PATH;
+  `/usr/local/cuda-13.2/bin/compute-sanitizer` works on this host since the
+  post-M11 restart (under stock WSL2/WDDM it fails with "Device not
+  supported" — that error means the host needs its debugger interface
+  enabled, not that the code is wrong).
 - Avoid running multiple Triton/Inductor-compiling processes concurrently when
   validating or benchmarking; serialize runs for attributable results.
 
@@ -341,13 +505,25 @@ Authoring rules:
 - For kernel correctness/performance work, start from
   `src/sparton/sparton_kernel.py` and the relevant `_backend_*.py`; build a
   small PyTorch reference before changing Triton/Gluon kernels or
-  custom-op/autograd wiring; probe risky APIs in subprocesses first.
+  custom-op/autograd wiring; probe risky APIs in subprocesses first; follow
+  the Performance-Optimization Loop for perf work.
+- For backward work specifically, the M11 memo carries the mechanism
+  evidence and the analytic model; `benchmarks/bench_backward.py` is the
+  harness and `legacy_fused_sparton_bwd` the A/B reference. The residual
+  bottleneck of record is embed-gather latency in the segmented kernel (no
+  unit above ~35% on real doc records — memo §6); design v4 §3 M13 is the
+  entry-gated plan for chasing it.
 - For training behavior, start from `training/model.py` and `training/train.py`;
   avoid importing training modules unless the optional Hugging Face
   dependencies are needed for the task.
-- For the next planned milestones (M11 backward track, M12 forward
-  scheduling/launcher), read the corresponding design v3 §3 sections; v3
-  §1.2 and the M10 memo's residual-risks section carry their entry evidence.
+- For the next planned milestones (M12 forward track, M13 backward
+  residual track), read design v4 §3. The unconditional tasks are
+  launcher v2 (M12-T1), the two entry-evidence tasks (M12-T0, M13-T0),
+  and the measurement additions (M12-T4); all kernel-rewrite work is
+  entry-gated on fresh profiles plus model-derived recoverable-time bars,
+  with the cross-track ordering decided by the comparative table the two
+  entry tasks fill (forward column at M12-T0, backward column at M13-T0),
+  not by document order.
 
 ## Training and Hugging Face References
 
@@ -398,6 +574,15 @@ Authoring rules:
   the full sweep as the gate).
 - For changes that touch autograd, AMP, or the training path, rerun
   `benchmarks/probe_training_smoke.py`.
+- For backward-kernel changes, rerun `benchmarks/bench_backward.py` with
+  `--impls current,legacy` over {uniform, zipf} and the captured-real
+  bundles (regenerate via `benchmarks/capture_index_distributions.py` if
+  `/root/m11_bundles/` is gone); uniform-only evidence is never sufficient
+  for a backward change (M11 rule of record).
+- For new or changed kernels whose ownership semantics differ from their
+  predecessor (atomics→plain stores, `torch.empty` outputs), run
+  `compute-sanitizer` racecheck/memcheck/initcheck on a small shape through
+  the harness (commands in the M11 memo §5.4).
 - For training changes, use a tiny local or sliced dataset smoke test before
   any full Hub-backed training run.
 
@@ -412,11 +597,16 @@ Authoring rules:
 - Importing `sparton` is silent on stdout; diagnostics go through the
   `"sparton"` `logging` logger at DEBUG level. A regression test enforces the
   silent import.
-- The backward kernel accumulates with atomic adds: training is
-  non-deterministic run-to-run even with fixed seeds (same-config 150-step
-  runs differed ~20% in final loss in the chaotic early regime — M10 memo).
-  Establish same-config noise bands before reading meaning into cross-config
-  training differences; do not promise bitwise-reproducible training.
+- The backward is not bitwise-deterministic run-to-run. Since M11,
+  `embed_grad`/`bias_grad` are exactly deterministic (exclusive-owner plain
+  stores) and `hidden_grad` atomics are reduced to ~two partial sums per
+  destination run, but their accumulation order still varies (measured
+  per-call relative spread: gradient-norm ≤ 1.2e-7, element-sensitive
+  loss-proxy ≤ 4.2e-6 — M11 memo §7; the M10 "~20% loss spread in the
+  chaotic early regime" predates M11 and overstates the current band,
+  which has not been re-measured at training scale). Establish same-config
+  noise bands before reading meaning into cross-config training
+  differences; do not promise bitwise-reproducible training.
 - Under fp16 AMP, the GradScaler's default 2^16 initial scale legitimately
   overflows fp16 score-gradients in early steps; skipped steps during scale
   calibration are expected, not a bug (gate pattern in

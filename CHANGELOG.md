@@ -5,6 +5,232 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-12
 
+### Remaining-work design v4
+
+- Added
+  [docs/sparton_remaining_work_design_v4.md](docs/sparton_remaining_work_design_v4.md),
+  the post-M11 forward plan, re-grounding the remaining work in the
+  measured post-M11 state (backward share down from 24–64% to ~17–52% of
+  optimized fwd+bwd across the grid and ~55% on the dev shape; both
+  residual costs now have named mechanisms) and restructuring it around
+  the Performance-Optimization Loop. M12 (forward track) gains an
+  unconditional entry-evidence task — the first-ever ncu profile of the
+  *production* fused forward (only the GEMM bring-up kernel has counters,
+  v1 §3.5) plus a counter-validated analytic floor model and a
+  pre-registered go/no-go for the persistent/warp-specialized rewrite —
+  and launcher v2's selection-parity gate is restated as deterministic
+  candidate-set/ranking parity plus winner-time parity within a measured
+  noise band (v3's exact-selection gate is unachievable under the ±5%
+  autotune-selection jitter M11 measured). New M13 (backward residual
+  track), entry-gated on an analytic ceiling for the segmented backward's
+  named residual (embed-gather latency; g/idx stream re-reads), riding the
+  M11 harness/registry machinery, with an explicit A/B-reference baton
+  rule; its unconditional T0 absorbs the recorded M11/M10 evidence debt
+  (tier-2 150-step parity rerun, training-scale determinism re-measure,
+  optional sparse-regime capture probe). Cross-track ordering is decided
+  by M12-T0's comparative recoverable-time table, and exit numbers are
+  fixed from validated models at entry time — the M11 1.5×-clause lesson.
+  All v3 rejections carry forward, joined by the M11-decided ones (B2b
+  structural rejection, tensor-core one-hot accumulation, adaptive
+  in-op dispatch, weighted-mask gradients) so they are not re-litigated.
+  An adversarial review of the draft against the cited runs of record
+  also corrected two provenance defects v4 would otherwise have inherited
+  from v3: the dev-shape GEMM floor (0.880 ms) traces to the post-M8
+  review run in v2 §1.2 (same-run forward 0.898 ms, 1.02×), not the M10
+  memo, and the grid floor ratios are re-anchored to the preserved
+  same-run M8 grid gemm column (1.094–1.123×) with v3's 1.054–1.113×
+  flagged as derived from an unpreserved M10 gemm column (orients, may
+  not gate; M12-T0 re-measures in one preserved run).
+- Marked
+  [docs/sparton_remaining_work_design_v3.md](docs/sparton_remaining_work_design_v3.md)
+  superseded as the forward plan; it remains authoritative for the
+  executed M11 plan of record (the spec the M11 memo's deviation ledger
+  refers to) and the post-M10 snapshot and floor-ratio derivations.
+  Updated the active-design-doc references in `AGENTS.md` (project map,
+  orientation, exemplar table, documentation-system table, task routing)
+  and `benchmarks/README.md`.
+
+### AGENTS.md refactor: the M8→M11 operating guide
+
+- Refactored `AGENTS.md` (maintainer-requested) to distill the M11 arc's
+  engineering experience into durable method, so a cold agent can reproduce
+  the milestone's level of work. New sections: **The
+  Performance-Optimization Loop** (binding-resource-first altitude test;
+  analytic traffic model validated against counters before any candidate is
+  built; realistic-distribution capture/replay; prototype-behind-a-registry
+  with per-cell verification before timing; pre-registered numeric
+  early-stop rules; op-level vs kernel-level timing; autotune-key audit;
+  IR-stage reading; sanitizer for ownership-semantics changes;
+  named-residual-bottleneck exit) and **Milestone Review** (adversarial
+  review of the diff *and* the evidence chain before a milestone closes,
+  with the maintainer-ruling path for contract findings). Extended rules:
+  a fourth failure-classification verdict (contract rulings), deposited
+  transcripts for decision-carrying numbers, autotune-selection jitter in
+  the noise band, conditional test expectations must pin their conditions,
+  autograd-leaf construction, the no-editing-files-a-queued-process-imports
+  hazard, and the retired-implementation rule (delete or promote to a
+  test-pinned reference). Repo facts updated: suite size, M11 backward
+  toolchain in the project map, House Style exemplars (`bench_backward.py`,
+  capture tooling, M11 memo), task routing (M11 complete → M12 entry gate),
+  `compute-sanitizer` availability, and the `torch.empty` gradient-buffer
+  invariant.
+
+### Method reference: IR-stage visibility recipe
+
+- Added §6.1 to
+  [docs/triton_gluon_kernel_optimization.md](docs/triton_gluon_kernel_optimization.md):
+  the working recipe for reading Triton/Gluon intermediate stages on this
+  stack (`CompiledKernel.asm` via `jit_fn.device_caches`, `nvdisasm` for
+  SASS, `TRITON_KERNEL_DUMP`/`MLIR_ENABLE_DUMP`), what each stage answers,
+  and where it slots into the loop (zero-GPU-cost lowering confirmation
+  before benchmarking; settling ncu surprises by instruction form).
+  Probed on the M11 backward kernels: the hidden-grad atomics are
+  `REDG.E.ADD.F32x4` (proving the 4-wide vectorization T1 had inferred
+  from counter arithmetic), the uniform-chunk guard lowers to single
+  warp-level `REDUX` ops, and the `tl.cumsum` scan is visible as
+  `tt.scan` + SHFL chains; dumps under `/root/profiles/m11/ir_dump/`.
+
+### M11 sanitizer gate discharged
+
+- After a host restart enabled `compute-sanitizer` (blocked on WSL2 during
+  the milestone session — M11 memo §5.4), the deferred sanitizer gate ran
+  clean on the promoted tree: **racecheck 0 hazards, memcheck 0 errors,
+  initcheck 0 errors** (small shape, fp16, bias on/off,
+  `current` + `legacy` impls; the autotuner sweeps every config under the
+  sanitizer). initcheck additionally validates the `torch.empty`
+  `embed_grad`/`bias_grad` allocation: no uninitialized read exists, so
+  the exclusive-owner stores provably cover both buffers. Transcripts under
+  `/root/profiles/m11/sanitizer_*.txt`; memo §5.4/§8/§9 updated.
+
+### M11 adversarial review pass
+
+- A 47-agent adversarial review of the M11 diff (three dimensions:
+  kernel/op correctness, evidence consistency, doctrine compliance; every
+  finding independently verified twice) confirmed one pre-existing kernel
+  gap and a set of documentation/test corrections, all applied:
+  - The review flagged that the shared backward omits the `mask[b, idx]`
+    factor from all gradients. **Maintainer resolution: expected behavior
+    under the original contract** — the Sparton mask is binary {0, 1} (the
+    standard tokenizer `attention_mask`), under which the omission is
+    exact (masked winners are eliminated by the forward/max/ReLU guard).
+    `_validation.py`'s old "non-binary masks are defined behavior" note
+    overstated the contract and is corrected (with AGENTS.md, README, and
+    the memo §9): non-binary values weight logits in the forward as an
+    implementation property outside the contract and are not
+    differentiated. Weighted-mask support, if wanted, is an extension
+    (backward change + autograd-head tests). A non-binary-rejection
+    validation was considered and rejected: the validation layer is
+    metadata-only by design (torch.compile-safe, no device sync).
+  - `test_fused_backward_nontiny_shapes` now pins the forward outputs its
+    closed-form expectation conditions on (reference scores + index
+    contract); `test_backward_matches_legacy_kernel` is slow-marked and
+    its docstring cites the actually-measured legacy self-spread.
+  - Host-side `B*V < 2^31` / `S*D < 2^31` guards in
+    `segmented_sparton_bwd` (fail loudly instead of wrapping int32-derived
+    arithmetic; thresholds unreachable on this hardware).
+  - Memo/doc numeric corrections to match the preserved runs of record
+    (the `steps150`-doc deviation range is 1.35–1.43×, not 1.37–1.47×;
+    per-column B2a ranges; bias-matched implied-backward grid derivation;
+    real-record ncu transcripts re-deposited — the production segmented
+    config measures 1.55 M red sectors vs legacy's 408.03 M on the real
+    query record, 264×). The method reference
+    `docs/triton_gluon_kernel_optimization.md` is now registered in
+    `AGENTS.md` Reference Material.
+
+### M11 T3–T4 — segmented backward promoted (milestone complete)
+
+#### Changed
+
+- The shared backward inside `sparton::fused_sparton_bwd` (all three
+  backends) is now the M11 segmented design in
+  `src/sparton/_backend_hybrid.py`: a fused payload-prep kernel (fp32
+  `g = grad_out·exp(-scores)` where `scores > 0`, int32 idx, destination
+  sort keys), `torch.sort` by destination row plus a payload-gather kernel,
+  an exclusive-owner embed/bias-gradient kernel (plain stores, zero
+  atomics, `torch.empty` outputs — the V×D fp32 zero-fill disappears from
+  every call), and a persistent-stride segmented-scan hidden-grad kernel
+  (chunk-local cumsum, at most ~two partial-sum atomics per destination
+  run, sentinel quick-exit for sparse inputs, `seq_len` in the autotune
+  key). Op schema, fake registration, autograd wiring, and saved tensors
+  are unchanged. Mechanism and decision record:
+  [docs/sparton_milestone11_backward_memo.md](docs/sparton_milestone11_backward_memo.md).
+- The pre-M11 kernel is retained as `legacy_fused_sparton_bwd_kernel_with_bias`
+  behind the new `legacy_fused_sparton_bwd` wrapper (A/B reference of
+  record, test-pinned, reachable only explicitly); the exported
+  `fused_sparton_bwd_with_bias` helper keeps its signature and launches the
+  legacy kernel. `benchmarks/bwd_prototypes.py` (T3 decision probe) was
+  deleted after the decision; `bench_backward.py` resolves
+  `current`/`legacy`.
+- Measured (run 2 of two consecutive runs, op-level `do_bench`): backward
+  1.35–2.40× faster than legacy on captured-real cells (queries ≥2.15×;
+  the 16 `steps150`-document cells at 1.35–1.43× sit below the design's
+  1.5× exit clause — recorded deviation, memo §8), 1.09–1.29× faster on
+  every synthetic cell (no regression anywhere). Dev-shape `opt f+b`
+  2.325 → 1.949 ms; implied optimized backward −25% (dev) and −31…−41%
+  (canonical grid). L2 reduction sectors: 96.6 M → 3.49 M (dev),
+  330.6 M → 6.40 M (corner), 408 M → 6.4 M (real query record).
+  `embed_grad`/`bias_grad` are now structurally deterministic; the
+  `hidden_grad` proxy spread tightens ~5×.
+
+#### Added
+
+- Backward test coverage (suite 116 → 132 on top of T2's 114 → 116): bf16
+  backward cases for all three backends (`BACKWARD_CASES`,
+  `_grad_tolerances`), non-tiny backward shapes with a closed-form
+  expectation from the kernel's saved `(scores, idx)` plus in-test pinning
+  of those saved outputs against the reference scores and the index
+  contract, exact-equality constructed cases for the zero-score and
+  masked-row invariants, and the `test_backward_matches_legacy_kernel` A/B
+  of record (slow-marked, like its non-tiny siblings).
+- `AGENTS.md`: backward validation rule (rerun `bench_backward.py` vs
+  `legacy` on captured bundles; uniform-only evidence never sufficient) and
+  the updated determinism sharp edge; `README.md` backward paragraph;
+  design v3 M11 status note.
+
+#### Validation
+
+- Hardened-env exit run: `py_compile` clean; full pytest `132 passed`
+  (quick loop `109 passed, 23 deselected` after the review pass
+  slow-marked the legacy A/B); shape soak `384/384`; 300-step
+  AMP smoke passed both modes (bf16 parity 0.21–0.24%); backward gate
+  matrix 176 cells × 2 runs, 0 verification failures; dev row run 2
+  `hyb+b 1.152 / opt+b 0.880 / hyb f+b 2.262 / opt f+b 1.949 ms`; grid run
+  2 all 9 rows below their M10 `opt f+b` values; `import sparton`
+  stdout-silent; `git diff --check` clean. Compute Sanitizer is not
+  runnable on this WSL2 host (memo §5.4).
+
+### M11 T1–T2 — backward re-profile and distribution-aware harness
+
+#### Added
+
+- `benchmarks/ncu_backward_target.py`: parameterized direct-op backward
+  profiling target (NVTX `bwd_direct/` on the main thread, shapes/dtype/bias
+  via CLI, optional capture-bundle input) generalizing the `ncu_targets.py`
+  `hybrid_bwd_direct` pattern for the M11 before/after counter collection.
+- `benchmarks/capture_index_distributions.py`: captures real Sparton index
+  distributions (per-batch `hidden_shape`, `max_scores` fp16, `max_idx`
+  int16, `mask` uint8, plus active-fraction/density/index-collision stats)
+  from the cached tier-2 stack (xlm-roberta-base, swim-ir `de`), with an
+  optional 150-step fine-tune (the M10-validated recipe). Bundles of record:
+  `swimir_de_steps0.pt` / `swimir_de_steps150.pt` under `/root/m11_bundles/`
+  (not committed; rerun the script to regenerate). Measured stats, both
+  bundles: mean active fraction 1.0000, mean mask density 0.6675, mean
+  index top1-collision share 0.198 (untrained) / 0.184 (150 steps).
+- `benchmarks/bench_backward.py`: distribution-aware backward harness —
+  op-level `do_bench` timing over {uniform, zipf, captured-real} sources,
+  synthetic mask densities {25, 75, 100}%, fp16/bf16, bias/no-bias, with
+  per-cell verification against the production op and the recorded 5-repeat
+  determinism protocol. Baseline of record (run 2): synthetic at active
+  fraction 0.10 0.36–0.39 ms; real records 5.88–7.89 ms (V=250002).
+- `test_bench_backward_synthetic_inputs_honor_contract` (uniform + zipf):
+  pins the harness's documented synthetic input contract. Suite: 114 → 116.
+
+#### Measured (T1 entry evidence, dev shape fp16 + 16×512 bf16 corner)
+
+- Backward kernel unchanged since M2: 1.35 ms, SOL compute 6.14% / DRAM
+  8.67%, 248 regs/thread, 16.5% occupancy, 96.6M L2 reduction sectors at the
+  dev shape (premise check passed; full counter set in the M11 memo).
+
 ### Kernel-optimization method reference
 
 - Added

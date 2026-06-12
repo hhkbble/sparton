@@ -443,13 +443,19 @@ def get_slow_bwd_configs():
                             ))
     return configs
 
+# A/B reference of record for the M11 backward swap (the kernel the
+# segmented backward replaced; unchanged since M2). Exercised by
+# test_backward_matches_legacy_kernel and `bench_backward.py --impls
+# legacy`; remove when a later milestone supersedes the M11 comparison
+# evidence. Reachable only through legacy_fused_sparton_bwd — production
+# autograd never calls it.
 @triton.autotune(
     configs=get_fast_bwd_configs(),
     key=['batch_size', 'vocab_size', 'hidden_dim'],
     reset_to_zero=['hidden_grad_ptr', 'embed_grad_ptr', 'bias_grad_ptr']
 )
 @triton.jit
-def fused_sparton_bwd_kernel_with_bias(
+def legacy_fused_sparton_bwd_kernel_with_bias(
     grad_out_ptr, # [B, V], float32)
     max_scores_ptr, # [B, V], (float32)
     max_idx_ptr, # [B, V], (int64)
@@ -554,13 +560,16 @@ def fused_sparton_bwd_with_bias(
     embed_grad,
     bias_grad,
     has_bias: bool):
+    # Launches the LEGACY kernel into caller-provided buffers (the pre-M11
+    # exported helper, signature preserved); the production op uses the
+    # segmented path below.
     B, S, D = hidden.shape
     V, D_e = embed.shape
     assert D == D_e
     assert max_scores.shape == (B, V)
     assert max_idx.shape == (B, V)
     grid = lambda meta: (triton.cdiv(V, meta['BLOCK_V']), triton.cdiv(B, meta['BLOCK_B']))
-    fused_sparton_bwd_kernel_with_bias[grid](
+    legacy_fused_sparton_bwd_kernel_with_bias[grid](
         grad_out_ptr=grad_output,
         max_scores_ptr=max_scores,
         max_idx_ptr=max_idx,
@@ -574,6 +583,394 @@ def fused_sparton_bwd_with_bias(
         hidden_dim=D,
         vocab_size=V,
         HAS_BIAS=has_bias,
+    )
+    return hidden_grad, embed_grad, bias_grad
+
+
+def legacy_fused_sparton_bwd(
+    grad_out: torch.Tensor,
+    max_scores: torch.Tensor,
+    max_idx: torch.Tensor,
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Pre-M11 backward with the production op's signature (A/B reference)."""
+
+    assert grad_out.is_cuda, "legacy_fused_sparton_bwd only supports CUDA"
+    grad_out = grad_out.contiguous()
+    hidden_grad = torch.zeros_like(hidden, dtype=torch.float32)
+    embed_grad = torch.zeros_like(embed, dtype=torch.float32)
+    bias_grad = (
+        torch.zeros_like(bias, dtype=torch.float32)
+        if bias is not None
+        else torch.empty((), device=grad_out.device, dtype=torch.float32)
+    )
+    hidden_grad, embed_grad, bias_grad = fused_sparton_bwd_with_bias(
+        grad_out, max_scores, max_idx,
+        hidden, embed,
+        hidden_grad, embed_grad, bias_grad,
+        bias is not None,
+    )
+    return hidden_grad, embed_grad, bias_grad if bias is not None else None
+
+
+# --- M11 segmented backward (production path) -------------------------------
+#
+# Mechanism and measured evidence: docs/sparton_milestone11_backward_memo.md.
+# The legacy kernel above is L2 reduction-sector bound (one atomic lane per
+# active (b, v, d) element); this path removes the atomic traffic at its
+# source. Three stages inside the unchanged custom op:
+#   1. bwd_prep_kernel: g = grad_out * exp(-scores) where scores > 0 (the
+#      legacy kernel's exact fp32 math), int32 idx, and destination sort
+#      keys b*S + idx (sentinel B*S for inactive entries, which sort last);
+#   2. torch.sort by destination + one payload-gather kernel;
+#   3. embed_grad_kernel (exclusive-owner plain stores, no atomics) and
+#      segmented_hidden_grad_kernel (at most ~two partial-sum atomics per
+#      destination run instead of one per contribution).
+
+
+@triton.jit
+def bwd_prep_kernel(
+    scores_ptr,   # [B*V] input dtype
+    grad_ptr,     # [B*V] fp32
+    idx_ptr,      # [B*V] int64
+    g_ptr,        # [B*V] fp32 out
+    idx32_ptr,    # [B*V] int32 out
+    keys_ptr,     # [B*V] int32 out
+    total,
+    seq_len,
+    vocab_size,
+    num_rows,
+    BLOCK: tl.constexpr,
+):
+    offs = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    in_range = offs < total
+    scores = tl.load(scores_ptr + offs, mask=in_range, other=0.0).to(tl.float32)
+    grad = tl.load(grad_ptr + offs, mask=in_range, other=0.0).to(tl.float32)
+    idx = tl.load(idx_ptr + offs, mask=in_range, other=0)
+    valid = scores > 0
+    g = tl.where(valid, grad * tl.exp(-scores), 0.0)
+    b = (offs // vocab_size).to(tl.int32)
+    keys = tl.where(valid, b * seq_len + idx.to(tl.int32), num_rows)
+    tl.store(g_ptr + offs, g, mask=in_range)
+    tl.store(idx32_ptr + offs, idx.to(tl.int32), mask=in_range)
+    tl.store(keys_ptr + offs, keys, mask=in_range)
+
+
+@triton.jit
+def bwd_gather_payload_kernel(
+    perm_ptr,      # [B*V] int64 sort permutation
+    g_full_ptr,    # [B*V] fp32
+    g_sorted_ptr,  # [B*V] fp32 out
+    v_sorted_ptr,  # [B*V] int32 out
+    total,
+    vocab_size,
+    BLOCK: tl.constexpr,
+):
+    offs = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    in_range = offs < total
+    perm = tl.load(perm_ptr + offs, mask=in_range, other=0)
+    g = tl.load(g_full_ptr + perm, mask=in_range, other=0.0)
+    tl.store(g_sorted_ptr + offs, g, mask=in_range)
+    tl.store(v_sorted_ptr + offs, (perm % vocab_size).to(tl.int32), mask=in_range)
+
+
+def get_embed_grad_bwd_configs():
+    # Small BLOCK_B is admissible because exclusive embed-grad ownership no
+    # longer multiplies atomic traffic (there are no atomics at all);
+    # BLOCK_B * BLOCK_V * BLOCK_D <= 64K bounds the gathered register tile.
+    return [
+        triton.Config({'BLOCK_B': 8, 'BLOCK_V': 16, 'BLOCK_D': 32}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_B': 8, 'BLOCK_V': 16, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_B': 8, 'BLOCK_V': 32, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_B': 8, 'BLOCK_V': 32, 'BLOCK_D': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_B': 8, 'BLOCK_V': 64, 'BLOCK_D': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_B': 16, 'BLOCK_V': 16, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_B': 16, 'BLOCK_V': 16, 'BLOCK_D': 128}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_B': 16, 'BLOCK_V': 32, 'BLOCK_D': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_B': 16, 'BLOCK_V': 64, 'BLOCK_D': 32}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_B': 32, 'BLOCK_V': 16, 'BLOCK_D': 32}, num_stages=2, num_warps=4),
+    ]
+
+
+# Exclusive-owner embed/bias gradient kernel: each CTA owns one
+# embed_grad[v-tile, d-tile] patch and loops over the batch, so the stores
+# need no atomics and no zero-initialized output (every element is written
+# exactly once by construction — the d-axis is program_id(0) so consecutive
+# CTAs share one v-tile's g/idx stream in L2). g != 0 is a correct skip
+# condition regardless of why g is zero: a zero g contributes nothing.
+@triton.autotune(
+    configs=get_embed_grad_bwd_configs(),
+    key=['batch_size', 'vocab_size', 'hidden_dim'],
+)
+@triton.jit
+def embed_grad_kernel(
+    g_ptr,            # [B, V] fp32, precomputed grad_out * exp(-scores) where active
+    idx_ptr,          # [B, V] int32
+    hidden_ptr,       # [B*S, D] input dtype
+    embed_grad_ptr,   # [V, D] fp32, exclusive-owner plain store
+    bias_grad_ptr,    # [V] fp32, exclusive-owner plain store (d-block 0)
+    batch_size,
+    seq_len,
+    hidden_dim: tl.constexpr,
+    vocab_size: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    pid_v = tl.program_id(1)
+
+    offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
+    offs_d = (pid_d * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+    mask_v = offs_v < vocab_size
+    mask_d = offs_d < hidden_dim
+    vd_mask = mask_v[:, None] & mask_d[None, :]
+
+    acc_e = tl.zeros((BLOCK_V, BLOCK_D), dtype=tl.float32)
+    acc_bias = tl.zeros((BLOCK_V,), dtype=tl.float32)
+
+    for start_b in range(0, batch_size, BLOCK_B):
+        offs_b = (start_b + tl.arange(0, BLOCK_B)).to(tl.int64)
+        b_mask = offs_b < batch_size
+        bv_mask = b_mask[:, None] & mask_v[None, :]
+        bv_offs = offs_b[:, None] * vocab_size + offs_v[None, :]
+
+        g = tl.load(g_ptr + bv_offs, mask=bv_mask, other=0.0)
+        if tl.sum(tl.abs(g)) != 0:
+            idx = tl.load(idx_ptr + bv_offs, mask=bv_mask, other=0).to(tl.int64)
+            h_offs = (
+                offs_b[:, None, None] * (seq_len * hidden_dim)
+                + idx[:, :, None] * hidden_dim
+                + offs_d[None, None, :]
+            )
+            gather_mask = (g != 0)[:, :, None] & mask_d[None, None, :]
+            hidden_tile = tl.load(hidden_ptr + h_offs, mask=gather_mask, other=0.0).to(tl.float32)
+            acc_e += tl.sum(hidden_tile * g[:, :, None], axis=0)
+            if HAS_BIAS:
+                if pid_d == 0:
+                    acc_bias += tl.sum(g, axis=0)
+
+    vd_offs = offs_v[:, None] * hidden_dim + offs_d[None, :]
+    tl.store(embed_grad_ptr + vd_offs, acc_e, mask=vd_mask)
+    if HAS_BIAS:
+        if pid_d == 0:
+            tl.store(bias_grad_ptr + offs_v, acc_bias, mask=mask_v)
+
+
+def get_segmented_hidden_grad_configs():
+    # CHUNK x BLOCK_D is the in-register cumsum tile (val + csum live
+    # simultaneously); bounded like the embed-grad configs.
+    return [
+        triton.Config({'CHUNK': 32, 'BLOCK_D': 128}, num_stages=2, num_warps=4),
+        triton.Config({'CHUNK': 32, 'BLOCK_D': 256}, num_stages=2, num_warps=8),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 64}, num_stages=2, num_warps=4),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 128}, num_stages=3, num_warps=8),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 256}, num_stages=2, num_warps=8),
+        triton.Config({'CHUNK': 128, 'BLOCK_D': 64}, num_stages=2, num_warps=8),
+        triton.Config({'CHUNK': 128, 'BLOCK_D': 128}, num_stages=2, num_warps=8),
+        triton.Config({'CHUNK': 256, 'BLOCK_D': 64}, num_stages=2, num_warps=8),
+    ]
+
+
+# Sorted segmented-scan hidden-grad kernel. Contributions arrive sorted by
+# destination row key b*S + idx, so a run of equal keys is consecutive and
+# reduces to at most two partial-sum atomics: +cumsum at run ends (forced
+# at chunk boundaries — chunk-local partials compose across chunks because
+# a continued run emits its own partial with no start-correction) and
+# val - cumsum at run starts; single-lane runs collapse to one exact val
+# atomic. Worst case (all destinations distinct) equals the legacy kernel's
+# one atomic per contribution. The persistent stride plus the scalar
+# first-key check keeps sparse inputs (small nnz) at one wasted load per
+# CTA with no host-side nnz sync.
+@triton.autotune(
+    configs=get_segmented_hidden_grad_configs(),
+    # seq_len is in the key (unlike the legacy kernel's): destination-run
+    # length scales with V/S, so the optimal CHUNK for short-S inputs
+    # (long runs, fast path) differs from long-S inputs (M11 memo §5.2).
+    key=['batch_size', 'seq_len', 'vocab_size', 'hidden_dim'],
+    reset_to_zero=['hidden_grad_ptr'],
+)
+@triton.jit
+def segmented_hidden_grad_kernel(
+    keys_ptr,         # [B*V] int32, sorted destination keys (sentinel B*S last)
+    g_ptr,            # [B*V] fp32, payload g sorted to match keys
+    v_ptr,            # [B*V] int32, source vocab row sorted to match keys
+    embed_ptr,        # [V, D] input dtype
+    hidden_grad_ptr,  # [B*S, D] fp32
+    total,            # B*V
+    batch_size,
+    seq_len,
+    vocab_size,
+    hidden_dim: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    num_ctas = tl.num_programs(0)
+    num_rows = batch_size * seq_len  # sentinel value and destination bound
+
+    chunk = pid_chunk
+    keep_going = tl.load(keys_ptr + chunk * CHUNK) < num_rows
+    while keep_going:
+        offs_i = chunk * CHUNK + tl.arange(0, CHUNK)
+        in_range = offs_i < total
+        offs_d = (pid_d * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+        mask_d = offs_d < hidden_dim
+
+        keys = tl.load(keys_ptr + offs_i, mask=in_range, other=num_rows)
+        valid = in_range & (keys < num_rows)
+        g = tl.load(g_ptr + offs_i, mask=valid, other=0.0)
+        v = tl.load(v_ptr + offs_i, mask=valid, other=0).to(tl.int64)
+        val = (
+            tl.load(
+                embed_ptr + v[:, None] * hidden_dim + offs_d[None, :],
+                mask=valid[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            * g[:, None]
+        )
+
+        keys_min = tl.min(keys)
+        keys_max = tl.max(keys)
+        if keys_min == keys_max:
+            # Whole chunk belongs to one destination run — the common case
+            # on real index distributions (runs average V_active/S entries).
+            partial = tl.sum(val, axis=0)
+            tl.atomic_add(
+                hidden_grad_ptr + keys_min.to(tl.int64) * hidden_dim + offs_d,
+                partial, mask=mask_d, sem="relaxed",
+            )
+        else:
+            prev_keys = tl.load(keys_ptr + offs_i - 1,
+                                mask=in_range & (offs_i > 0), other=-2)
+            next_keys = tl.load(keys_ptr + offs_i + 1,
+                                mask=in_range & (offs_i + 1 < total), other=-3)
+            csum = tl.cumsum(val, axis=0)
+            lane = tl.arange(0, CHUNK)
+            is_end = valid & ((keys != next_keys) | (lane == CHUNK - 1))
+            is_start = valid & (keys != prev_keys)
+            dest = keys.to(tl.int64)[:, None] * hidden_dim + offs_d[None, :]
+            end_value = tl.where(is_start[:, None], val, csum)
+            tl.atomic_add(hidden_grad_ptr + dest, end_value,
+                          mask=is_end[:, None] & mask_d[None, :], sem="relaxed")
+            tl.atomic_add(hidden_grad_ptr + dest, val - csum,
+                          mask=(is_start & ~is_end)[:, None] & mask_d[None, :],
+                          sem="relaxed")
+
+        chunk += num_ctas
+        if chunk * CHUNK >= total:
+            keep_going = False
+        else:
+            keep_going = tl.load(keys_ptr + chunk * CHUNK) < num_rows
+
+
+_BWD_PREP_BLOCK = 1024
+
+
+def segmented_sparton_bwd(
+    grad_out: torch.Tensor,
+    max_scores: torch.Tensor,
+    max_idx: torch.Tensor,
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch the M11 segmented backward; returns fp32 gradient buffers."""
+
+    B, S, D = hidden.shape
+    V, D_e = embed.shape
+    assert D == D_e
+    assert max_scores.shape == (B, V)
+    assert max_idx.shape == (B, V)
+    # The chunk kernels index the flattened [B*V] payload streams (and the
+    # embed kernel the S*D row stride) with int32-derived arithmetic; both
+    # bounds are far beyond any allocatable problem, but fail loudly rather
+    # than wrap silently.
+    assert B * V < 2**31, "segmented backward: B*V exceeds int32 indexing"
+    assert S * D < 2**31, "segmented backward: S*D exceeds int32 stride arithmetic"
+
+    # hidden_grad accumulates atomically and keeps untouched rows at zero;
+    # embed_grad/bias_grad are fully covered by the embed kernel's
+    # unconditional exclusive-owner stores, so empty allocation is safe and
+    # skips the largest fp32 fill (V x D).
+    hidden_grad = torch.zeros_like(hidden, dtype=torch.float32)
+    embed_grad = torch.empty_like(embed, dtype=torch.float32)
+    bias_grad = (
+        torch.empty_like(bias, dtype=torch.float32)
+        if bias is not None
+        else torch.empty((), device=grad_out.device, dtype=torch.float32)
+    )
+
+    total = B * V
+    g_full = torch.empty((total,), device=grad_out.device, dtype=torch.float32)
+    idx32 = torch.empty((total,), device=grad_out.device, dtype=torch.int32)
+    keys_full = torch.empty((total,), device=grad_out.device, dtype=torch.int32)
+    bwd_prep_kernel[(triton.cdiv(total, _BWD_PREP_BLOCK),)](
+        scores_ptr=max_scores,
+        grad_ptr=grad_out,
+        idx_ptr=max_idx,
+        g_ptr=g_full,
+        idx32_ptr=idx32,
+        keys_ptr=keys_full,
+        total=total,
+        seq_len=S,
+        vocab_size=V,
+        num_rows=B * S,
+        BLOCK=_BWD_PREP_BLOCK,
+    )
+
+    embed_grid = lambda meta: (
+        triton.cdiv(D, meta['BLOCK_D']),
+        triton.cdiv(V, meta['BLOCK_V']),
+    )
+    embed_grad_kernel[embed_grid](
+        g_ptr=g_full,
+        idx_ptr=idx32,
+        hidden_ptr=hidden,
+        embed_grad_ptr=embed_grad,
+        bias_grad_ptr=bias_grad,
+        batch_size=B,
+        seq_len=S,
+        hidden_dim=D,
+        vocab_size=V,
+        HAS_BIAS=bias is not None,
+    )
+
+    keys_sorted, perm = torch.sort(keys_full)
+    g_sorted = torch.empty_like(g_full)
+    v_sorted = torch.empty_like(idx32)
+    bwd_gather_payload_kernel[(triton.cdiv(total, _BWD_PREP_BLOCK),)](
+        perm_ptr=perm,
+        g_full_ptr=g_full,
+        g_sorted_ptr=g_sorted,
+        v_sorted_ptr=v_sorted,
+        total=total,
+        vocab_size=V,
+        BLOCK=_BWD_PREP_BLOCK,
+    )
+
+    # Bounded persistent grid: enough CTAs to fill the device; each strides
+    # through chunks and stops at the sentinel region (sorted keys).
+    hidden_grid = lambda meta: (
+        min(triton.cdiv(total, meta['CHUNK']), 4096),
+        triton.cdiv(D, meta['BLOCK_D']),
+    )
+    segmented_hidden_grad_kernel[hidden_grid](
+        keys_ptr=keys_sorted,
+        g_ptr=g_sorted,
+        v_ptr=v_sorted,
+        embed_ptr=embed,
+        hidden_grad_ptr=hidden_grad,
+        total=total,
+        batch_size=B,
+        seq_len=S,
+        vocab_size=V,
+        hidden_dim=D,
     )
     return hidden_grad, embed_grad, bias_grad
 
@@ -623,19 +1020,8 @@ def fused_sparton_bwd_op(
     assert grad_out.is_cuda, "sparton::fused_sparton_bwd only supports CUDA"
     grad_out = grad_out.contiguous()
 
-    hidden_grad = torch.zeros_like(hidden, dtype=torch.float32)
-    embed_grad  = torch.zeros_like(embed,  dtype=torch.float32)
-    bias_grad = (
-        torch.zeros_like(bias, dtype=torch.float32)
-        if bias is not None
-        else torch.empty((), device=grad_out.device, dtype=torch.float32)
-    )
-
-    hidden_grad, embed_grad, bias_grad = fused_sparton_bwd_with_bias(
-        grad_out, max_scores, max_idx,
-        hidden, embed,
-        hidden_grad, embed_grad, bias_grad,
-        bias is not None,
+    hidden_grad, embed_grad, bias_grad = segmented_sparton_bwd(
+        grad_out, max_scores, max_idx, hidden, embed, bias
     )
     return hidden_grad, embed_grad, bias_grad if bias is not None else None
 

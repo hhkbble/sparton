@@ -3,8 +3,10 @@
 Validated probe/benchmark scripts for the Gluon backend refactor, promoted
 from session scratch on 2026-06-11. The forward plan and current rerun
 command catalogue live in
-[../docs/sparton_remaining_work_design_v3.md](../docs/sparton_remaining_work_design_v3.md);
-the post-M8 review findings and M9/M10 provenance remain in
+[../docs/sparton_remaining_work_design_v4.md](../docs/sparton_remaining_work_design_v4.md);
+the executed M11 plan of record remains in
+[../docs/sparton_remaining_work_design_v3.md](../docs/sparton_remaining_work_design_v3.md),
+the post-M8 review findings and M9/M10 provenance in
 [../docs/sparton_remaining_work_design_v2.md](../docs/sparton_remaining_work_design_v2.md),
 and the platform facts, profiling methodology, and original measured
 evidence in
@@ -39,6 +41,9 @@ hardware-specific to the validation machine named in the milestone docs.
 | `probe_training_smoke.py` | M10 gate 6 tier-1 training smoke: 300-step head-only contrastive+FLOPS training from identical fp32 master weights, fp16 AMP (GradScaler) and bf16 autocast, hybrid-vs-optimized loss parity; exits non-zero on failure | `env $ENV python -u probe_training_smoke.py` |
 | `ncu_runner.py` | Policy-derived Gluon GEMM launcher for `ncu --launch-skip`/`--launch-count` | see design doc §11 |
 | `ncu_targets.py` | NVTX-wrapped cuBLAS / hybrid-forward / direct-backward profiling targets | see design doc §11 |
+| `ncu_backward_target.py` | M11 parameterized direct-op backward profiling target: NVTX range `bwd_direct/` around main-thread `fused_sparton_bwd_op` calls, arbitrary shape/dtype/bias or a capture-bundle record; the M11 before/after counter source | `env $ENV PYTHONPATH=src ncu --nvtx --nvtx-include "bwd_direct/" -k "regex:sparton_bwd" --launch-skip 1 --launch-count 1 --metrics <M11 memo set> python -u benchmarks/ncu_backward_target.py --dtype fp16 --bias on` |
+| `capture_index_distributions.py` | M11 real index-distribution capture: cached xlm-roberta-base via `training/model.py` (`head="sparton"`), optional 150-step tier-2 fine-tune, saves per-batch `(hidden_shape, max_scores, max_idx, mask)` + stats bundles for `bench_backward.py`. Bundles live outside the repo (`/root/m11_bundles/`), never committed | `env $ENV PYTHONPATH=src python -u benchmarks/capture_index_distributions.py --train-steps {0,150} --out /root/m11_bundles/swimir_de_steps{0,150}.pt [--quick]` |
+| `bench_backward.py` | M11 distribution-aware backward harness: op-level `do_bench` timing of backward impls over {uniform, zipf, real-bundle} sources, mask densities, fp16/bf16, bias modes; per-cell verification vs `current` and the recorded 5-repeat determinism protocol; exits non-zero on failure | `env $ENV PYTHONPATH=src python -u benchmarks/bench_backward.py --sources uniform,zipf,real --bundle /root/m11_bundles/swimir_de_steps0.pt --bundle /root/m11_bundles/swimir_de_steps150.pt --active-fraction 0.10 --impls current --determinism [--quick]` |
 | `repro_inductor_env_defects.py` | Reproducer for the two cache-cold Inductor environment defects | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` + variants per its docstring |
 
 `python` above is the project venv interpreter,

@@ -111,7 +111,7 @@ The current Sparton implementation is a hybrid path: it uses compiled PyTorch/To
 hidden [B,S,D] → tiled matmul → Triton reduction → reps [B,V]
 ```
 
-Backward uses the saved max scores and indices to accumulate gradients for hidden states, decoder weights, and optional bias.
+Backward uses the saved max scores and indices to accumulate gradients for hidden states, decoder weights, and optional bias. Since M11 it is a segmented design shared by all backends: decoder-weight and bias gradients are written by exclusive owners (no atomics — exactly deterministic), and hidden-state gradients are sorted by destination row and reduced segment-wise before a handful of partial-sum atomics, which makes the backward 1.35–2.4x faster on real tokenized batches (where many vocabulary entries share one argmax position) and slightly faster on uniform synthetic inputs. The mask contract is the standard binary `{0,1}` tokenizer `attention_mask`, under which gradients are exact; non-binary mask values weight logits in the forward as an implementation property but are outside the contract and are not differentiated by the backward.
 
 ## Training
 

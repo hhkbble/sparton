@@ -1,7 +1,17 @@
 # Sparton Remaining-Work Design v3 (post-M10)
 
 Date: 2026-06-12.
-Status: **active guide for subsequent backend-refactor development.**
+Status: **superseded as the forward plan by
+[sparton_remaining_work_design_v4.md](sparton_remaining_work_design_v4.md)
+(2026-06-12, post-M11).** This document remains authoritative for the
+executed **M11 plan of record** (§3 M11 — the specification whose deviation
+ledger lives in the [M11 memo](sparton_milestone11_backward_memo.md)) and
+for the post-M10 state snapshot and floor-ratio derivations in §1. The
+incomplete forward work (M12) moved to v4 in refined form — re-grounded in
+the post-M11 measurements, with a production-forward profiling entry task,
+a jitter-aware launcher parity gate, and the new entry-gated backward
+residual track (M13); its original wording here is retained for the record
+but is no longer the specification.
 
 Supersession chain: [v1](sparton_gluon_remaining_work_design.md) remains
 authoritative for platform facts and the original measured evidence (sm_120
@@ -117,6 +127,23 @@ remaining 5–11% gap to the GEMM floor, and M12's entry gate explicitly asks
 whether the remaining forward gap is still worth chasing after M11 lands.
 
 ### M11 — Backward track (primary)
+
+Update, 2026-06-12: **M11 is complete** — the shared backward is now the
+three-kernel segmented backward (prep + exclusive-owner embed/bias kernel +
+sorted segmented-scan hidden-grad kernel), swapped inside the unchanged
+`sparton::fused_sparton_bwd` op; the pre-M11 kernel is retained as
+`legacy_fused_sparton_bwd`, the A/B reference of record. Evidence, gate
+ledger, and the analytic traffic model live in the
+[M11 memo](sparton_milestone11_backward_memo.md). Two recorded deviations
+from this section's spec: B2b was never built (the T3 counters showed the
+binder is L2 reduction-sector volume, which TMA cannot touch and which has
+no MMA shape — the B3/T5 mechanism was pulled into the decision probe
+instead), and `steps150` document records land at 1.35–1.43× vs the 1.5×
+exit clause (queries 2.15–2.39×, synthetic 1.13–1.30×, no cell regresses
+anywhere — promotion proceeded with the deviation recorded; memo §8). The
+T5 verdict and residual bottleneck are recorded at the end of the memo's
+§6 gate ledger; pre-existing gaps surfaced by the milestone's adversarial
+review (notably non-binary-mask gradients) are in memo §9.
 
 Goal: replace or improve the shared Triton backward so that fwd+bwd drops
 materially on realistic index distributions, without regressing the

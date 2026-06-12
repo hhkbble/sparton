@@ -231,6 +231,33 @@ Use CLC when:
 | Triton-Viz | Visualize Triton program behavior | Useful for memory-access visualization and education/debugging; not a replacement for hardware counters. |
 | PTXAS/compiler inspection | NVIDIA codegen/resource debugging | Use to inspect register count, spills, generated PTX/SASS, and ptxas-option experiments. |
 
+### 6.1 IR-stage visibility in practice (recipe added at M11)
+
+Triton (and Gluon, which shares the pipeline) keeps every compilation stage
+of a launched kernel in memory: walk `jit_fn.device_caches` (the function
+under an `@triton.autotune` wrapper is `.fn`) to the `CompiledKernel`s and
+read the `.asm` dict — keys `ttir`, `ttgir`, `llir`, `ptx`, `cubin`,
+`source`; `nvdisasm -c` on the cubin yields SASS. `TRITON_KERNEL_DUMP=1`
+(+`TRITON_DUMP_DIR`) dumps the same to disk; `MLIR_ENABLE_DUMP=1` adds
+per-pass IR. What each stage answers:
+
+- **TTGIR** — the optimization-relevant stage: chosen `#blocked`/shared
+  layouts (`sizePerThread`, `threadsPerWarp`, `order`), `tt.scan`/reduce
+  lowering, pipelining structure, swizzles. For Gluon kernels the layouts
+  are user-chosen, so this is where to verify they survived.
+- **PTX/SASS** — instruction mix and final forms: load vector widths
+  (`LDG.E.128` vs scalar), atomic forms (`REDG.E.ADD.F32x4` = 4-wide
+  vectorized reduction; `REDUX.*` = warp-level reduce), spills
+  (`ld.local/st.local`), predication, barrier count.
+
+Use it as a zero-GPU-cost "confirm the lowering" step between picking a
+config family and benchmarking it, and to settle ncu surprises by reading
+the instruction form instead of inferring it from counter arithmetic.
+M11 examples: the backward's 4-wide vectorized `REDG` (inferred indirectly
+from instruction counts in T1; one SASS grep proves it), and the
+`tl.cumsum` shuffle-tree whose cost was discovered by per-kernel timing —
+visible immediately as `tt.scan` + SHFL chains in TTGIR/SASS.
+
 ## 7. Common failure modes
 
 - **Tuning only wall time.** A faster microbenchmark can still be fragile if it relies on lower clocks, cache luck, or shape-specific artifacts.

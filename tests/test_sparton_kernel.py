@@ -226,6 +226,14 @@ def _score_tolerances(dtype: torch.dtype) -> dict[str, float]:
     return {"atol": 2e-3, "rtol": 2e-3}
 
 
+def _grad_tolerances(dtype: torch.dtype) -> dict[str, float]:
+    # Aligned with _score_tolerances: bf16 inputs round the products feeding
+    # the fp32 accumulators, so gradients carry the wider input tolerance.
+    if dtype is torch.bfloat16:
+        return {"atol": 5e-2, "rtol": 5e-2}
+    return {"atol": 2e-3, "rtol": 2e-3}
+
+
 def _device_profile(
     *,
     sm_count: int = 170,
@@ -833,72 +841,286 @@ def test_optimized_forward_nontiny_shapes(
     assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
+BACKWARD_CASES = [
+    pytest.param(True, torch.float16, id="bias-fp16"),
+    pytest.param(False, torch.float16, id="no_bias-fp16"),
+    pytest.param(True, torch.bfloat16, id="bias-bf16"),
+    pytest.param(False, torch.bfloat16, id="no_bias-bf16"),
+]
+
+
+def _assert_backward_matches_reference(
+    sparton_kernel,
+    cuda_device: torch.device,
+    forward,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    _skip_if_unsupported_dtype(dtype)
+    hidden, embed, bias, mask = _make_kernel_inputs(
+        device=cuda_device,
+        dtype=dtype,
+        use_bias=use_bias,
+    )
+    ref_hidden = _clone_leaf(hidden)
+    ref_embed = _clone_leaf(embed)
+    ref_bias = _clone_leaf(bias)
+
+    scores, _ = forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, ref_bias, mask)
+    upstream = torch.randn_like(scores)
+
+    scores.backward(upstream)
+    expected_scores.backward(upstream.detach().clone())
+
+    tol = _grad_tolerances(dtype)
+    assert_close(hidden.grad.float(), ref_hidden.grad.float(), **tol)
+    assert_close(embed.grad.float(), ref_embed.grad.float(), **tol)
+    if use_bias:
+        assert bias is not None
+        assert ref_bias is not None
+        assert_close(bias.grad.float(), ref_bias.grad.float(), **tol)
+    else:
+        assert bias is None
+
+
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
+@pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_fused_backward_matches_reference(
     sparton_kernel,
     cuda_device: torch.device,
     use_bias: bool,
+    dtype: torch.dtype,
 ) -> None:
-    hidden, embed, bias, mask = _make_kernel_inputs(
-        device=cuda_device,
-        dtype=torch.float16,
-        use_bias=use_bias,
+    _assert_backward_matches_reference(
+        sparton_kernel, cuda_device, sparton_kernel.fused_sparton_fwd_op, use_bias, dtype
     )
-    ref_hidden = _clone_leaf(hidden)
-    ref_embed = _clone_leaf(embed)
-    ref_bias = _clone_leaf(bias)
 
-    scores, _ = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
-    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, ref_bias, mask)
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
+def test_naive_backward_matches_reference(
+    sparton_kernel,
+    cuda_device: torch.device,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    _assert_backward_matches_reference(
+        sparton_kernel, cuda_device, sparton_kernel.naive_forward, use_bias, dtype
+    )
+
+
+NONTINY_BACKWARD_CASES = [
+    pytest.param(8, 128, 768, 1283, True, torch.float16, id="8x128x768x1283-bias-fp16"),
+    pytest.param(3, 345, 768, 2048, True, torch.bfloat16, id="3x345x768x2048-bias-bf16"),
+    pytest.param(2, 513, 1024, 1536, False, torch.float16, id="2x513x1024x1536-no_bias-fp16"),
+]
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.slow
+@pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_BACKWARD_CASES)
+def test_fused_backward_nontiny_shapes(
+    sparton_kernel,
+    cuda_device: torch.device,
+    B: int,
+    S: int,
+    D: int,
+    V: int,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Backward gradients vs a closed-form reference at non-tiny shapes.
+
+    Tiny shapes exercise only single-tile/single-chunk paths; these cases
+    cross tile and chunk boundaries in every grid dimension. The expectation
+    is computed from the kernel's own saved (scores, idx): the backward's
+    contract is conditional on the forward's saved tensors, and at random
+    non-tiny shapes the kernel and the PyTorch reference forward may
+    legitimately pick different near-tie winners (index contract of record),
+    which would re-route individual gradient elements and fail any direct
+    autograd-vs-autograd comparison. Masked sequence positions can never win
+    the max, so their hidden gradient must be exactly zero — asserted as a
+    structural invariant, not within tolerance.
+    """
+
+    _skip_if_unsupported_dtype(dtype)
+    hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
+    hidden.requires_grad_(True)
+    embed.requires_grad_(True)
+    if bias is not None:
+        bias.requires_grad_(True)
+
+    scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+
+    # Pin the forward outputs the expectation conditions on: score values
+    # against the reference (values are not tie-ambiguous) and indices via
+    # the tie-aware contract — otherwise a forward bug at these shapes would
+    # propagate identically into the closed-form expectation and pass.
+    with torch.no_grad():
+        ref_scores, _ = sparton_reference(
+            hidden.detach(), embed.detach(),
+            None if bias is None else bias.detach(), mask,
+        )
+        score_tol = _score_tolerances(dtype)
+        assert_close(scores.float(), ref_scores.float(), **score_tol)
+        assert_index_contract(
+            scores, idx, hidden.detach(), embed.detach(),
+            None if bias is None else bias.detach(), mask, **score_tol,
+        )
+
     upstream = torch.randn_like(scores)
-
     scores.backward(upstream)
-    expected_scores.backward(upstream.detach().clone())
 
-    assert_close(hidden.grad.float(), ref_hidden.grad.float(), atol=2e-3, rtol=2e-3)
-    assert_close(embed.grad.float(), ref_embed.grad.float(), atol=2e-3, rtol=2e-3)
+    with torch.no_grad():
+        g = torch.where(
+            scores.float() > 0,
+            upstream.float() * torch.exp(-scores.float()),
+            torch.zeros((), device=cuda_device, dtype=torch.float32),
+        )
+        gathered = hidden.detach().float()[
+            torch.arange(B, device=cuda_device)[:, None], idx
+        ]
+        expected_embed_grad = torch.einsum("bv,bvd->vd", g, gathered)
+        contrib = g[:, :, None] * embed.detach().float()[None, :, :]
+        expected_hidden_grad = torch.zeros(
+            (B, S, D), device=cuda_device, dtype=torch.float32
+        )
+        for b in range(B):
+            expected_hidden_grad[b].index_add_(0, idx[b], contrib[b])
+
+    tol = _grad_tolerances(dtype)
+    assert_close(hidden.grad.float(), expected_hidden_grad, **tol)
+    assert_close(embed.grad.float(), expected_embed_grad, **tol)
     if use_bias:
-        assert bias is not None
-        assert ref_bias is not None
-        assert_close(bias.grad.float(), ref_bias.grad.float(), atol=2e-3, rtol=2e-3)
-    else:
-        assert bias is None
+        assert_close(bias.grad.float(), g.sum(dim=0), **tol)
+
+    masked_positions = mask == 0
+    masked_grad = hidden.grad[masked_positions]
+    assert torch.equal(masked_grad, torch.zeros_like(masked_grad))
 
 
 @requires_cuda
 @pytest.mark.cuda
 @pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
-def test_naive_backward_matches_reference(
+def test_backward_zero_scores_produce_zero_gradients(
     sparton_kernel,
     cuda_device: torch.device,
     use_bias: bool,
 ) -> None:
-    hidden, embed, bias, mask = _make_kernel_inputs(
+    """All-negative logits pin the zero-score path: gradients exactly zero.
+
+    Constructed case (deterministic, exact equality per the testing
+    doctrine): every masked logit is negative, so every score is zero and
+    the backward's score > 0 guard must zero every gradient bit-exactly —
+    this pins the inactive/early-exit path of the backward kernels.
+    """
+
+    hidden = torch.full((2, 5, 16), -1.0, device=cuda_device, dtype=torch.float16,
+                        requires_grad=True)
+    embed = torch.ones((19, 16), device=cuda_device, dtype=torch.float16,
+                       requires_grad=True)
+    bias = None
+    if use_bias:
+        bias = torch.full((19,), -1.0, device=cuda_device, dtype=torch.float16,
+                          requires_grad=True)
+    mask = torch.ones((2, 5), device=cuda_device, dtype=torch.int32)
+
+    scores, _ = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    assert torch.equal(scores, torch.zeros_like(scores))
+
+    scores.backward(torch.randn_like(scores))
+
+    assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
+    assert torch.equal(embed.grad, torch.zeros_like(embed.grad))
+    if use_bias:
+        assert torch.equal(bias.grad, torch.zeros_like(bias.grad))
+
+
+@requires_cuda
+@pytest.mark.cuda
+def test_backward_masked_rows_yield_zero_hidden_gradient(
+    sparton_kernel,
+    cuda_device: torch.device,
+) -> None:
+    """Masked positions (including a fully masked batch row) get exact-zero
+    hidden gradients; unmasked gradients still match the reference.
+
+    Constructed case: positive logits everywhere, batch row 0 fully masked
+    and row 1 partially masked. Masked positions can never win the max, so
+    no backward path may touch them — exact equality, not tolerance.
+    """
+
+    hidden = torch.full((2, 5, 16), 0.1, device=cuda_device, dtype=torch.float16,
+                        requires_grad=True)
+    embed = torch.full((19, 16), 0.1, device=cuda_device, dtype=torch.float16,
+                       requires_grad=True)
+    bias = None
+    mask = torch.tensor(
+        [[0, 0, 0, 0, 0], [0, 1, 1, 0, 1]],
         device=cuda_device,
-        dtype=torch.float16,
-        use_bias=use_bias,
+        dtype=torch.int32,
     )
     ref_hidden = _clone_leaf(hidden)
     ref_embed = _clone_leaf(embed)
-    ref_bias = _clone_leaf(bias)
 
-    scores, _ = sparton_kernel.naive_forward(hidden, embed, bias, mask)
-    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, ref_bias, mask)
+    scores, _ = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, None, mask)
     upstream = torch.randn_like(scores)
 
     scores.backward(upstream)
     expected_scores.backward(upstream.detach().clone())
 
-    assert_close(hidden.grad.float(), ref_hidden.grad.float(), atol=2e-3, rtol=2e-3)
-    assert_close(embed.grad.float(), ref_embed.grad.float(), atol=2e-3, rtol=2e-3)
-    if use_bias:
-        assert bias is not None
-        assert ref_bias is not None
-        assert_close(bias.grad.float(), ref_bias.grad.float(), atol=2e-3, rtol=2e-3)
-    else:
-        assert bias is None
+    assert torch.equal(hidden.grad[0], torch.zeros_like(hidden.grad[0]))
+    masked_grad = hidden.grad[1][mask[1] == 0]
+    assert torch.equal(masked_grad, torch.zeros_like(masked_grad))
+    tol = _grad_tolerances(torch.float16)
+    assert_close(hidden.grad.float(), ref_hidden.grad.float(), **tol)
+    assert_close(embed.grad.float(), ref_embed.grad.float(), **tol)
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.slow
+@pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
+def test_backward_matches_legacy_kernel(
+    sparton_kernel,
+    cuda_device: torch.device,
+    use_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    """A/B of record for the M11 backward swap (design v3 M11-T4).
+
+    Runs the production backward op and the retained legacy kernel on
+    identical non-tiny inputs (slow: autotunes both kernel families at this
+    shape). Tolerance sits above the measured legacy atomic-order
+    self-spread (proxy spread <= 2.4e-5 relative, M11 memo §7) and far
+    below any real divergence.
+    """
+
+    _skip_if_unsupported_dtype(dtype)
+    B, S, D, V = 3, 345, 768, 2048
+    hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
+    with torch.no_grad():
+        scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    grad_out = torch.randn(scores.shape, device=cuda_device, dtype=torch.float32)
+
+    new_grads = sparton_kernel.fused_sparton_bwd_op(
+        grad_out, scores, idx, hidden, embed, bias, mask
+    )
+    legacy_grads = sparton_kernel.legacy_fused_sparton_bwd(
+        grad_out, scores, idx, hidden, embed, bias, mask
+    )
+
+    for name, new, old in zip(("hidden_grad", "embed_grad", "bias_grad"),
+                              new_grads, legacy_grads):
+        if not use_bias and name == "bias_grad":
+            assert new is None and old is None
+            continue
+        assert_close(new, old, atol=1e-4, rtol=1e-3, msg=name)
 
 
 AUTOCAST_DTYPES = [
@@ -938,6 +1160,65 @@ def test_training_parity_smoke_autocast(
     )
 
     assert failures == []
+
+
+SYNTHETIC_BWD_SOURCES = [
+    pytest.param("uniform", id="uniform"),
+    pytest.param("zipf", id="zipf"),
+]
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("source", SYNTHETIC_BWD_SOURCES)
+def test_bench_backward_synthetic_inputs_honor_contract(
+    cuda_device: torch.device,
+    source: str,
+) -> None:
+    """Pin the synthetic input contract of benchmarks/bench_backward.py.
+
+    The M11 backward harness documents its synthetic regime in its docstring;
+    this test single-sources the generator (no duplicated logic) and asserts
+    the contract: masks keep at least one unmasked position per row, scores
+    are exactly zero off the active set, the realized active fraction tracks
+    the request, and active indices point only at unmasked positions —
+    mirroring the forward's zero-baseline semantics.
+    """
+
+    from benchmarks.bench_backward import make_synthetic_case
+
+    active_fraction = 0.10
+    case = make_synthetic_case(
+        source=source,
+        batch_size=4,
+        seq_len=33,
+        dim=16,
+        vocab=2048,
+        density=0.25,
+        active_fraction=active_fraction,
+        zipf_s=1.1,
+        dtype=torch.float16,
+        bias_on=True,
+        seed=11,
+    )
+    mask = case["mask"]
+    scores = case["max_scores"]
+    idx = case["max_idx"]
+
+    assert bool((mask.sum(dim=1) >= 1).all()), "row with no unmasked position"
+
+    active = scores.float() > 0
+    realized = active.float().mean(dim=1)
+    assert bool(
+        ((realized - active_fraction).abs() <= 0.1 * active_fraction).all()
+    ), f"active fraction off target: {realized.tolist()}"
+    assert bool((scores.float()[~active] == 0).all()), "nonzero score off the active set"
+
+    chosen_mask = mask.gather(1, idx)
+    assert bool(
+        (chosen_mask[active] == 1).all()
+    ), "active index points at a masked position"
+    assert bool((idx[~active] == 0).all()), "inactive entries must carry idx 0"
 
 
 @requires_cuda
@@ -1006,36 +1287,16 @@ def test_forward_backward_under_autocast(
 @requires_optimized_gluon
 @pytest.mark.cuda
 @pytest.mark.optimized_gluon
-@pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
+@pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_optimized_backward_matches_reference(
     sparton_kernel,
     cuda_device: torch.device,
     use_bias: bool,
+    dtype: torch.dtype,
 ) -> None:
-    hidden, embed, bias, mask = _make_kernel_inputs(
-        device=cuda_device,
-        dtype=torch.float16,
-        use_bias=use_bias,
+    _assert_backward_matches_reference(
+        sparton_kernel, cuda_device, sparton_kernel.optimized_forward, use_bias, dtype
     )
-    ref_hidden = _clone_leaf(hidden)
-    ref_embed = _clone_leaf(embed)
-    ref_bias = _clone_leaf(bias)
-
-    scores, _ = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
-    expected_scores, _ = sparton_reference(ref_hidden, ref_embed, ref_bias, mask)
-    upstream = torch.randn_like(scores)
-
-    scores.backward(upstream)
-    expected_scores.backward(upstream.detach().clone())
-
-    assert_close(hidden.grad.float(), ref_hidden.grad.float(), atol=2e-3, rtol=2e-3)
-    assert_close(embed.grad.float(), ref_embed.grad.float(), atol=2e-3, rtol=2e-3)
-    if use_bias:
-        assert bias is not None
-        assert ref_bias is not None
-        assert_close(bias.grad.float(), ref_bias.grad.float(), atol=2e-3, rtol=2e-3)
-    else:
-        assert bias is None
 
 
 @requires_cuda
