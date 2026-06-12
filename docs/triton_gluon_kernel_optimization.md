@@ -258,12 +258,60 @@ from instruction counts in T1; one SASS grep proves it), and the
 `tl.cumsum` shuffle-tree whose cost was discovered by per-kernel timing —
 visible immediately as `tt.scan` + SHFL chains in TTGIR/SASS.
 
+### 6.2 Layout and lowering attribution in practice (lessons added at M13)
+
+Triton chooses tensor layouts from the *consuming* operations, and that
+choice propagates back into load vector widths. Lessons measured on the
+sparton backward (M13 memo §2/§5.4; IR dumps under
+`/root/profiles/m13/ir_dump/`):
+
+- **Reductions are layout-agnostic; scans are not.** A tile feeding only
+  `tl.sum` vectorizes freely (`LDG.E.128` at ordinary register budgets); a
+  tile feeding `tl.cumsum` along the row axis anchors a row-per-thread or
+  narrow layout — the measured outcome on a (CHUNK, BLOCK_D) gather tile
+  was scalar `ld.global.b32` on every config except the one-thread-per-row
+  shape, which paid `BLOCK_D` floats of live scan state per thread
+  (255 registers → 1 CTA/SM). Vectorize-or-occupancy was a structural
+  trade, not a tuning trade.
+- **Branch-local SSA separation is not layout separation.** Giving the hot
+  branch its own `tl.load` (separate SSA value from the scan branch's
+  load) compiled to vectorized *sites* in PTX/SASS, but the executed
+  instruction mix stayed scalar-class (runtime bytes-per-instruction
+  ≈ unchanged). The working fix classes are structural: a branch-free hot
+  kernel (split kernels with complementary predicates), or folding the
+  suppression into load *masks* — a per-row mask broadcast over the vector
+  axis preserves the wide form, while a branch around the load re-anchors
+  it.
+- **`while` walks do not software-pipeline; `tl.range` for-loops do.** The
+  persistent `while` + sentinel-exit pattern serializes each iteration's
+  keys→check→tile round trips; converting the hot pass to a bounded
+  for-loop (device-side trip count, e.g. an active-entry counter written
+  by an upstream kernel — no host sync) is what unlocked
+  pipelined/vectorized execution. Keep sentinel economics with masks, not
+  loop breaks.
+- **Attribute empirically when static reading stalls.** Two tools settle
+  what instruction listings cannot: (1) *differential compilation* —
+  compile the suspect region in isolation (a throwaway kernel with only
+  the hot branch) and diff its census against the full kernel's; (2)
+  *bytes-per-warp-instruction* — `sectors × 32 ÷
+  smsp__inst_executed_op_global_ld` from one ncu pass tells you the
+  executed width regardless of what the SASS sites suggest (≈3–4 B/lane =
+  scalar, ≈16 B/lane = v4). Three rounds of instruction-counting failed to
+  explain what these settled in minutes.
+- **Measured config equivalences are evidence.** Two autotune configs from
+  different occupancy classes (16.6% vs 24.8% warps) timing identically
+  eliminates occupancy-alone as the binder; a vectorized-but-1-CTA config
+  tying a scalar-but-3-CTA config localizes the constraint to the
+  layout coupling above. Read autotuner ties as information about the
+  bottleneck, not as jitter to suppress.
+
 ## 7. Common failure modes
 
 - **Tuning only wall time.** A faster microbenchmark can still be fragile if it relies on lower clocks, cache luck, or shape-specific artifacts.
 - **Over-fusion.** Fusion reduces memory traffic but can increase registers enough to reduce occupancy or tensor-core utilization.
 - **Too-large tiles.** Larger tiles improve reuse until they cause spills, shared-memory pressure, masks, or lower occupancy.
 - **Autotune key mismatch.** If key arguments omit a performance-relevant stride/shape/dtype, Triton may reuse a bad config.
+- **Independently tuned copies of a shared parameter.** When two cooperating kernels must agree on a partitioning parameter (a chunk/granule size whose predicates must complement), letting each autotune its own silently drops or double-counts work at the disagreement boundary — and a small-shape repro can pass because both tuners happen to agree there. Single-source the choice (one kernel tunes, the other reads `best_config` host-side) and assert the compatibility (M13 memo §5.4 item 2).
 - **Ignoring tails.** Non-power-of-two dimensions and ragged batches often dominate real workloads.
 - **Assuming Gluon layout changes are free.** Layout conversions and explicit shared-memory staging have real cost.
 - **Misusing async pipelines.** More stages do not help if barriers, live ranges, or producer/consumer imbalance dominate.

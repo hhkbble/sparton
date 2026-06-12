@@ -1082,6 +1082,92 @@ def test_backward_masked_rows_yield_zero_hidden_gradient(
     assert_close(embed.grad.float(), ref_embed.grad.float(), **tol)
 
 
+# The production uniform fast path deposits only when an aligned 64-entry
+# sorted-key chunk is single-destination, i.e. destination runs >= the
+# config family's CHUNK (src/sparton/_backend_hybrid.py,
+# get_uniform_hidden_grad_configs). Every random-input backward test has
+# expected run length V_active/S far below that, so without this case the
+# suite never executes the uniform deposit (the design v2 F3 class:
+# assert the activation, not just the outputs).
+_UNIFORM_PATH_CHUNK = 64
+
+
+@requires_cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
+def test_backward_uniform_chunk_path_matches_closed_form(
+    sparton_kernel,
+    cuda_device: torch.device,
+    use_bias: bool,
+) -> None:
+    """Long destination runs activate the M13 uniform-chunk fast path.
+
+    Constructed case: constant hidden rows make every (b, v) logit tie, so
+    ties resolve to the lowest unmasked index — one destination per batch
+    row, runs of length V >> CHUNK. The test first asserts the activation
+    property (every aligned 64-entry chunk of the sorted destination keys
+    is single-destination), then checks the gradients against the exact
+    closed form (assert_close at the standard fp16 backward tolerance: the
+    chunk-partial atomics legitimately reorder fp32 accumulation).
+    """
+
+    B, S, D, V = 2, 8, 64, 4096
+    c_h, c_e = 0.05, 0.0625  # dyadic: D * c_h * c_e = 0.2 exactly in fp32
+    hidden = torch.full((B, S, D), c_h, device=cuda_device, dtype=torch.float16)
+    embed = torch.full((V, D), c_e, device=cuda_device, dtype=torch.float16)
+    bias = (
+        torch.zeros((V,), device=cuda_device, dtype=torch.float16)
+        if use_bias
+        else None
+    )
+    # Row 0 masks position 0 so the two batch rows win different
+    # destinations (b=0 -> s=1, b=1 -> s=0).
+    mask = torch.ones((B, S), device=cuda_device, dtype=torch.int32)
+    mask[0, 0] = 0
+
+    scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    assert bool((scores > 0).all()), "constructed logits must all be active"
+    expected_idx = torch.tensor([1, 0], device=cuda_device, dtype=idx.dtype)
+    assert torch.equal(idx, expected_idx.unsqueeze(1).expand(B, V)), (
+        "tie policy must pick the lowest unmasked index"
+    )
+
+    # Activation assertion: the sorted destination keys b*S + idx form B
+    # runs of length V; with V a multiple of the production CHUNK, every
+    # aligned chunk is single-destination — the uniform kernel, not the
+    # mixed kernel, must carry every contribution.
+    keys = (
+        torch.arange(B, device=cuda_device).unsqueeze(1) * S + idx
+    ).flatten().sort().values
+    chunked = keys.view(-1, _UNIFORM_PATH_CHUNK)
+    uniform_chunks = (chunked == chunked[:, :1]).all(dim=1)
+    assert bool(uniform_chunks.all()), "every chunk must be single-destination"
+    assert chunked.shape[0] >= 2 * (V // _UNIFORM_PATH_CHUNK)
+
+    grad_out = torch.randn((B, V), device=cuda_device, dtype=torch.float32)
+    hidden_grad, embed_grad, bias_grad = sparton_kernel.fused_sparton_bwd_op(
+        grad_out, scores, idx, hidden, embed, bias, mask
+    )
+
+    # Closed form: with logit L = D*c_h*c_e (+0 bias) everywhere,
+    # g = grad_out / (1 + L); the winning row s_b collects sum_v g[b, v]
+    # * embed[v, :] and embed_grad[v, :] = sum_b g[b, v] * hidden[b, s_b, :].
+    g = grad_out / (1.0 + D * c_h * c_e)
+    expected_hidden = torch.zeros((B, S, D), device=cuda_device, dtype=torch.float32)
+    for b in range(B):
+        expected_hidden[b, int(expected_idx[b])] = g[b].sum() * c_e
+    expected_embed = g.sum(dim=0).unsqueeze(1) * c_h * torch.ones(
+        (V, D), device=cuda_device, dtype=torch.float32
+    )
+
+    assert_close(hidden_grad, expected_hidden, atol=1e-4, rtol=1e-3)
+    assert_close(embed_grad, expected_embed, atol=1e-4, rtol=1e-3)
+    if use_bias:
+        assert_close(bias_grad, g.sum(dim=0), atol=1e-4, rtol=1e-3)
+    else:
+        assert bias_grad is None
+
+
 @requires_cuda
 @pytest.mark.cuda
 @pytest.mark.slow
@@ -1092,13 +1178,15 @@ def test_backward_matches_legacy_kernel(
     use_bias: bool,
     dtype: torch.dtype,
 ) -> None:
-    """A/B of record for the M11 backward swap (design v3 M11-T4).
+    """A/B of record for the backward swap (M13: split vs segmented).
 
-    Runs the production backward op and the retained legacy kernel on
+    Runs the production backward op (the M13 split pass) and the retained
+    reference (the M11 segmented design, via legacy_fused_sparton_bwd) on
     identical non-tiny inputs (slow: autotunes both kernel families at this
-    shape). Tolerance sits above the measured legacy atomic-order
-    self-spread (proxy spread <= 2.4e-5 relative, M11 memo §7) and far
-    below any real divergence.
+    shape). Tolerance sits above the measured atomic-order self-spread of
+    both designs (proxy spread <= 2.4e-5 relative legacy / <= 4.2e-6
+    segmented, M11 memo §7; the M13 decision matrix verified 176 cells at
+    rtol=atol=1e-3) and far below any real divergence.
     """
 
     _skip_if_unsupported_dtype(dtype)

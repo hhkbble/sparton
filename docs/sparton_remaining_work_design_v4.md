@@ -58,8 +58,11 @@ consumes it.**
   M11 racecheck/memcheck/initcheck gates ran clean on the promoted tree.
 - Determinism: `embed_grad`/`bias_grad` are structurally deterministic
   (plain stores); `hidden_grad` order-nondeterminism remains but with ~60×
-  fewer atomics (per-call proxy spread ≤ 4.2e-6). The training-scale band
-  has **not** been re-measured since M11 (§3, M13-T0).
+  fewer atomics (per-call proxy spread ≤ 4.2e-6; the M13 split preserves
+  the atomic structure and the band — M13 memo §5.5). The training-scale
+  band was re-measured at M13-T0: same-config 150-step loss spread 16–38%
+  depending on backend and statistic (M13 memo §6); AGENTS.md's sharp
+  edge now carries the measured band.
 
 ### 1.2 Measured snapshot (runs of record)
 
@@ -116,7 +119,12 @@ Two residual costs, both with named mechanisms:
    bottleneck anywhere (L2 reduction sectors down 27.7× dev / 51.7× corner
    / 264× real query record). The 16 `steps150`-document harness cells at
    1.35–1.43× vs legacy (vs the 1.5× clause) are the recorded deviation
-   this residual explains.
+   this residual explains. *[Resolved at M13: the residual was recovered —
+   the split backward takes those cells to 1.568–1.596× vs the segmented
+   design (≈ 2.1–2.3× vs the M2 legacy the clause was written against, composed
+   from the preserved per-design ranges);
+   the embed-kernel attribution was corrected (binder = hidden-row gather
+   re-reads, already at the traffic floor) — M13 memo §2/§5.]*
 
 Host-side launch overhead of the optimized forward: ~0.119 ms/call
 wall-minus-GPU at `8×128×768×1280`, ~0.051 ms of it rebuilding the
@@ -171,6 +179,10 @@ revival triggers in §6, overhead kept visible by M12-T4.
    The sparse regime (`f ≪ 1`, late-stage FLOPS-regularized training)
    remains covered only by synthetic `--active-fraction 0.10` sources — a
    recorded gap that M13-T0 may close cheaply, or re-record.
+   *(Re-recorded at M13-T0: a 3-attempt shortened-warmup probe brackets
+   the λ transition — dense at 1e-2, collapsed to f = 0 at 1e-1 — without
+   landing inside it; ~25 s/attempt, so a λ-bisection is cheap if the
+   regime ever gates a decision. M13 memo §7.)*
 
 ---
 
@@ -379,6 +391,32 @@ only — it does not close T3.
   threshold — these are documentation of record, not pass/fail numbers.
 
 ### M13 — Backward residual track (entry-gated)
+
+Update, 2026-06-13: **M13 is complete — entry rule passed, kernel work
+executed, split backward promoted.** T0's validated traffic model
+(per-buffer residuals ≤ 1% on the decision counters; the embed kernel
+measured *at* its floor, correcting the M11 §6 attribution — its binder
+is hidden-row gather re-reads, not g/idx streams) priced the segmented
+kernel at 3.2× its L2 floor on real records with a SASS-confirmed
+mechanism: the gather's vector width is layout-coupled to the cumsum
+tile (scalarize, or pay 255 regs for 1 CTA/SM). Conservative recoverable:
+38% of the doc-record backward — the ≥10% rule passed ~4×. T1/T2
+delivered the **split segmented backward** (branch-free pipelined
+vectorized uniform-chunk pass — production profile 1.43 ms at 56
+regs/73.5% occupancy on the doc record vs the 1.34 ms modeled
+conservative floor — plus the segmented scan on run-boundary chunks
+only, complementary at a shared 64-entry granule): captured-real backward
+1.46–1.60× vs M11 (steps150 docs 1.568–1.596×), every canonical grid row
+within band or improved (dev implied bwd 1.061 → 0.982 ms), synthetic
+f=0.10 short-run cells −6…−16% (recorded deviation, v1 §9's
+regression-without-gain criterion; no real capture exhibits the regime).
+Sanitizer clean; AMP smoke unchanged; suite 134. The A/B baton passed
+(segmented design = the test-pinned reference, M2-era kernel deleted).
+Training-scale debt closed (tier-2 parity holds; same-config band
+measured 16–38%, replacing the "~20%" sharp edge). Sparse-regime capture
+probed and not materialized (λ-transition brackets to f=0); synthetic
+f=0.10 stays the regime of record. Evidence:
+[M13 memo](sparton_milestone13_backward_memo.md).
 
 Goal: decide — with a model, on real distributions — whether the
 segmented backward's named residual (embed-gather latency; g/idx stream
@@ -657,6 +695,12 @@ Still deferred, new home in this document:
 | GEMM bring-up kernel 63.9% tensor pipe vs cuBLAS 86.6% (same occupancy/instruction family) | [v1](sparton_gluon_remaining_work_design.md) §3.5 — **GEMM benchmark kernel, not the production forward** |
 | Distribution stats: f = 1.0000, top1 collision 0.184–0.198, query collision factor ≈10417 | M11 memo §3/§4 (capture bundles) |
 | Suite 132 / quick 109; soak 384/384; smoke parity 0.21–0.24% (bf16) | M11 memo §6 gate ledger |
+| M13 gather model: seg L2-read/red residuals ≤ 1% on four shapes; seg floor 1.04/1.34 ms vs 3.31 measured (doc) | [M13 memo](sparton_milestone13_backward_memo.md) §4 (`/root/m13_runs/m13_traffic_model_out.txt`, `/root/profiles/m13/bwd_*.txt`) |
+| M13 baselines: real-record bwd 3.29–4.32 ms (run 3 of record; run-2 contamination classified); A-vs-A ≤ 2.45% | M13 memo §3 (`bwd_baseline_run{1,2,3}.log`) |
+| M13 split backward: real cells 1.46–1.60× vs segmented; grid implied bwd 1.430–3.522 ms (dev 0.982); synthetic f=0.10 −6…−16% | M13 memo §5.5/§5.6 (`bench_decision_fixed_run2.log`, `gate_ab_run2.log`, `gate_grid_run2.log`, `gate_dev_run2.log`) |
+| Uniform-pass floor attainment: 1.37 ms vs 1.34 modeled (doc, ncu regime) | M13 memo §5.4 (`bwd_segv3_doc_r1.txt`) |
+| Training-scale same-config band 16–38%; tier-2 parity holds | M13 memo §6 (`tier2_*_s42_run{1..3}.log`) |
+| Embed-key audit: doc-tuned vs query-tuned 0.69% (immaterial) | M13 memo §2.2 (`embed_key_audit_*.log`) |
 
 ## Appendix B. Rerun commands
 

@@ -5,6 +5,93 @@ the date they land in the repository unless a formal release tag exists.
 
 ## 2026-06-13
 
+### M13 — backward residual track: split backward promoted (milestone complete)
+
+#### Decision
+
+- **M13's entry rule passed ~4× and the kernel work shipped.** T0 built a
+  per-buffer gather/traffic model for the M11 segmented backward and
+  validated it against fresh ncu counters on four shapes (dev fp16, the
+  16×512 bf16 corner, one real query and one real doc record): segmented
+  L2-read and red-sector formulas land within **≤1%** everywhere
+  (`(chunks + 2·runs)·D/8` for the atomics), and the embed kernel measures
+  *at* its traffic floor — correcting the M11 §6 attribution (its binder
+  is hidden-row gather re-reads at 82–104% LTS, not g/idx streams). The
+  segmented hidden-grad kernel sat at 3.2× its floor with a SASS-confirmed
+  mechanism: the gather's vector width is layout-coupled to the
+  `tl.cumsum` tile — every autotune config either scalarizes the gather
+  (`ld.global.b32`, L1TEX-issue-bound at 66–71%) or pays 255
+  registers for one CTA/SM (16.6% occupancy). Conservative recoverable:
+  **38% of the doc-record backward** vs the pre-registered ≥10% rule.
+  Evidence, the runnable model, the candidate-sizing walk (three
+  candidates killed by number, one kept), and the deviations ledger:
+  [docs/sparton_milestone13_backward_memo.md](docs/sparton_milestone13_backward_memo.md);
+  transcripts under `/root/profiles/m13/` and `/root/m13_runs/`.
+
+#### Changed (T1/T2 — the promoted backward)
+
+- **`sparton::fused_sparton_bwd` now runs the M13 split segmented
+  backward** (schema-safe swap; op schema, fake registration, autograd
+  wiring, and saved tensors untouched). The hidden-grad pass is two
+  complementary kernels at one shared 64-entry chunk granularity:
+  `uniform_hidden_grad_kernel`, a branch-free software-pipelined streaming
+  reduction over single-destination chunks (vectorized `LDG.E.128`
+  embed-row gathers; the promoted kernel profiles at 1.43 ms / 56
+  regs/thread / 73.5% occupancy on the real doc record, vs the 1.34 ms
+  modeled conservative floor; the development variant measured 1.37 ms), and
+  `mixed_hidden_grad_kernel`, the segmented scan covering only chunks
+  with a run boundary (1D granule walk, sub-tiled scans composing via the
+  run-boundary invariant; not autotuned — it must run at the uniform
+  winner's CHUNK or the complement breaks). `bwd_prep_kernel` gains a
+  device-side active-entry counter (sparse inputs stay O(live), no host
+  sync); shared host stages factored into `_bwd_shared_stages`.
+- **Measured (runs of record)**: captured-real backward improves
+  **1.46–1.60×** over the M11 segmented design (steps150 doc records —
+  the M11 1.35–1.43× deviation cells — now 1.568–1.596×; against the
+  M2-era legacy those cells compose to ≈2.1–2.3×, clearing even the old
+  1.5× clause); every canonical grid row's implied backward holds or improves
+  (dev 1.061 → 0.982 ms; 16×256 1.26×; worst row −1%, in-band); the
+  synthetic `f=0.10` short-run cells regress 6–16% (~45 µs/call) — a
+  recorded deviation sanctioned by v1 §9's regression-without-gain
+  criterion; no real capture exhibits that regime. Determinism band
+  unchanged (`embed_grad` exactly 0; loss proxy ≤ 4.2e-6).
+- **A/B baton passed** (design v4 §2): the M11 segmented design is the
+  new test-pinned reference behind `legacy_fused_sparton_bwd`
+  (`test_backward_matches_legacy_kernel` re-pointed); the M2-era atomic
+  kernel, its launcher, and its config helpers
+  (`legacy_fused_sparton_bwd_kernel_with_bias`,
+  `fused_sparton_bwd_with_bias`, `get_fast_bwd_configs`,
+  `get_slow_bwd_configs`) are deleted, with their facade re-exports
+  (`split_segmented_sparton_bwd` and `get_uniform_hidden_grad_configs`
+  exported instead).
+- Gates: full suite **134 passed**; `compute-sanitizer`
+  racecheck/memcheck/initcheck clean (the split's complementary-writer
+  invariant validated mechanically); 300-step AMP smoke passed (parity
+  0.04% fp16 / 0.24% bf16); `bench_backward.py current,legacy` over all
+  sources ×2 = 176 cells/run, 0 verification failures; grid + dev
+  baselines ×2.
+
+#### Added / closed debts (T0)
+
+- `benchmarks/capture_index_distributions.py` gains
+  `--lambda-l1/--lambda-flops/--reg-warmup-steps` pass-through (sparse
+  -regime probe; values recorded in bundle metadata; default recipe
+  byte-identical). The probe itself bracketed the λ transition (dense at
+  1e-2, collapsed to f=0 at 1e-1, 150 steps) without producing a usable
+  `f ≪ 1` bundle — synthetic `--active-fraction 0.10` stays the sparse
+  regime of record.
+- **Training-scale debt closed**: tier-2 150-step parity rerun on the
+  promoted backward (optimized final losses inside the hybrid same-config
+  range) and the same-config loss-spread band re-measured at **16–38%**
+  (3 seed-matched repeats per backend) — AGENTS.md's "~20%" sharp edge
+  replaced with the measured band.
+- Autotune-key audit: the embed kernel's missing `seq_len` key
+  (query-tuned configs serving doc records) priced at **0.69%** —
+  inside the noise band, classified immaterial, no fix.
+- `benchmarks/README.md`: the backward ncu invocation now names the
+  five-kernel family (`regex:sparton_bwd` matched only the deleted M2
+  kernel); capture-script row documents the new flags.
+
 ### M12 — forward track closed without kernel work (milestone complete)
 
 #### Decision

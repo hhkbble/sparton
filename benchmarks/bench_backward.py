@@ -41,7 +41,10 @@ relative spread of the grad norms and of a fixed strided-sum loss proxy
 Output is one markdown row per (source, cell, dtype, bias, impl) with ms and
 speedup vs ``current``; a provenance header logs versions, GPU, and seed.
 Exits non-zero listing verification failures. ``--quick`` runs a small
-development subset; the full matrix is the M11 gate.
+development subset; the full matrix is the gate of record. Note that
+``--quick`` pins contract-relevant axes (``bias=on``, fp16 only): it
+cannot prove the axes it holds fixed — the M13 prototypes' bias_grad
+optionality bug survived every quick gate (M13 memo §8 item 2).
 """
 
 from __future__ import annotations

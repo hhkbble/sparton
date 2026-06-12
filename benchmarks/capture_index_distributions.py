@@ -22,6 +22,12 @@ a backbone forward per measurement and runs reproduce across sessions
 Bundles are written outside the repository (convention: /root/m11_bundles/)
 and are never committed; rerun this script to regenerate them.
 
+``--lambda-l1`` / ``--lambda-flops`` / ``--reg-warmup-steps`` (M13-T0) pass
+through to ``LSRTrainingArguments`` so a shortened-warmup fine-tune can probe
+the sparse regime (``f << 1``) without the 10000-step default warmup; unset,
+the fine-tune recipe is byte-identical to the M11 captures. The values used
+are recorded in the bundle metadata.
+
 Indices are recovered by calling the head's bound forward wrapper directly —
 ``SpartonHead.forward`` discards them. Capture runs under
 ``torch.autocast("cuda", bfloat16)`` to mirror the tier-2 training regime.
@@ -121,6 +127,17 @@ def maybe_finetune(model, tokenizer, dataset, args) -> None:
         LSRTrainingArguments,
     )
 
+    # Regularizer overrides are forwarded only when set, so the default
+    # recipe stays byte-identical to the M11 captures (M13-T0 sparse probe).
+    reg_overrides = {
+        key: value
+        for key, value in (
+            ("lambda_l1", args.lambda_l1),
+            ("lambda_flops", args.lambda_flops),
+            ("reg_warmup_steps", args.reg_warmup_steps),
+        )
+        if value is not None
+    }
     training_args = LSRTrainingArguments(
         output_dir=args.work_dir,
         max_steps=args.train_steps,
@@ -130,6 +147,7 @@ def maybe_finetune(model, tokenizer, dataset, args) -> None:
         save_strategy="no",
         logging_steps=50,
         report_to=[],
+        **reg_overrides,
     )
     trainer = LSRTrainer(
         model_args=LSRModelArguments(model_name_or_path=args.model, head="sparton"),
@@ -159,6 +177,12 @@ def main() -> int:
     parser.add_argument("--query-max-length", type=int, default=64)
     parser.add_argument("--document-max-length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lambda-l1", type=float, default=None,
+                        help="override LSRTrainingArguments.lambda_l1 (default: trainer default)")
+    parser.add_argument("--lambda-flops", type=float, default=None,
+                        help="override LSRTrainingArguments.lambda_flops (default: trainer default)")
+    parser.add_argument("--reg-warmup-steps", type=int, default=None,
+                        help="override LSRTrainingArguments.reg_warmup_steps (default: trainer default)")
     parser.add_argument("--work-dir", type=str, default="/root/m11_bundles/work")
     parser.add_argument("--quick", action="store_true",
                         help="2 batches, no fine-tune")
@@ -208,6 +232,9 @@ def main() -> int:
         "languages": args.languages,
         "train_steps": args.train_steps,
         "seed": args.seed,
+        "lambda_l1": args.lambda_l1,
+        "lambda_flops": args.lambda_flops,
+        "reg_warmup_steps": args.reg_warmup_steps,
         "tokenizer": args.model,
         "query_max_length": args.query_max_length,
         "document_max_length": args.document_max_length,
