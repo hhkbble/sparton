@@ -1,7 +1,7 @@
 """Dump the backward kernels' autotune selections and per-config IR/SASS.
 
 The standing config+lowering visibility tool for the split backward
-(method ref §6.1–§6.2; promoted from the M13-T0 session probe). For each
+(METHODOLOGY.md §6.1–§6.2; promoted from the M13-T0 session probe). For each
 requested shape it runs one production `fused_sparton_bwd_op` call, reads
 the autotuner selections host-side (cache-hit selections print nothing
 under TRITON_PRINT_AUTOTUNING — the M12 lesson), then warmup-compiles each

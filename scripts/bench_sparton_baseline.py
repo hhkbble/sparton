@@ -12,7 +12,7 @@ leaves every other input draw untouched). The naive backend uses production
 Triton autotune; pass ``--optimized-policy on`` to include the experimental
 Gluon forward with runtime GPU-derived active autotune candidates.
 Needs PYTHONPATH=src and the hardened env prefix from
-docs/sparton_gluon_remaining_work_design.md section 2.4.
+ARCHITECTURE.md §2.4.
 """
 
 from __future__ import annotations

@@ -9,7 +9,7 @@ description = "Sparton: Fast and Memory-Efficient Triton Kernel for Learned Spar
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
-authors = [{name="Your Name", email="you@example.com"}]
+authors = [{name="hhkbble", email="hhkbble@users.noreply.github.com"}]
 
 dependencies = [
     "triton>=3.3.1",
@@ -22,7 +22,7 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/thongnt99/sparton"
+Homepage = "https://github.com/hhkbble/sparton"
 
 [tool.pytest]
 minversion = "9.0"

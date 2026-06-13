@@ -149,7 +149,7 @@ def assert_index_contract(
     atol: float,
     rtol: float,
 ) -> None:
-    """Index contract of record (design v2 §6.2).
+    """Index contract of record (ARCHITECTURE.md §3.2).
 
     Wherever the returned score is positive, the chosen sequence index must
     hold a masked input-dtype logit within tolerance of the per-(b, v)
@@ -1087,7 +1087,7 @@ def test_backward_masked_rows_yield_zero_hidden_gradient(
 # config family's CHUNK (src/sparton/_backend_hybrid.py,
 # get_uniform_hidden_grad_configs). Every random-input backward test has
 # expected run length V_active/S far below that, so without this case the
-# suite never executes the uniform deposit (the design v2 F3 class:
+# suite never executes the uniform deposit (the DEVELOPMENT.md M9 F3 class:
 # assert the activation, not just the outputs).
 _UNIFORM_PATH_CHUNK = 64
 
@@ -1185,7 +1185,7 @@ def test_backward_matches_legacy_kernel(
     identical non-tiny inputs (slow: autotunes both kernel families at this
     shape). Tolerance sits above the measured atomic-order self-spread of
     both designs (proxy spread <= 2.4e-5 relative legacy / <= 4.2e-6
-    segmented, M11 memo §7; the M13 decision matrix verified 176 cells at
+    segmented, DEVELOPMENT.md M11 §7; the M13 §5.5 decision matrix verified 176 cells at
     rtol=atol=1e-3) and far below any real divergence.
     """
 

@@ -16,7 +16,7 @@ The driver uses Triton/Gluon autotune over a bounded, runtime-pruned policy
 set and gates the selected result against cuBLAS.
 
 Validated results on RTX 5090 / Triton 3.6.0:
-docs/sparton_gluon_remaining_work_design.md §3.1 and Appendix A.
+DEVELOPMENT.md M8 (GEMM gate) and ARCHITECTURE.md §6.5.
 """
 
 import argparse
@@ -168,8 +168,8 @@ def build_autotuned_kernel(args):
     # stay separate because this one materializes C while the production
     # kernel runs the Sparton max/argmax epilogue. D2 was discharged by
     # re-affirmation at the M12 close (no persistent rewrite; see
-    # docs/sparton_milestone12_forward_memo.md); see also
-    # docs/sparton_remaining_work_design_v2.md (D2) before deduplicating.
+    # docs/DEVELOPMENT.md M12); see also
+    # docs/ARCHITECTURE.md §4.4 (D2) before deduplicating.
     @autotune(
         configs=configs,
         key=["M", "N", "K"],

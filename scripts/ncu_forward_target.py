@@ -21,7 +21,7 @@ an epilogue multiply, not control flow).
 Intended invocation (hardened env, serial; see scripts/README.md):
 
   ncu --nvtx --nvtx-include "fwd_direct/" --launch-skip 1 --launch-count 1 \
-      --section ... --metrics <set recorded in the M12 memo> -o <report> \
+      --section ... --metrics <set recorded in DEVELOPMENT.md M12> -o <report> \
       python -u scripts/ncu_forward_target.py --dtype fp16 --bias on
 
 Prints one summary line; exits non-zero if the forward op fails.

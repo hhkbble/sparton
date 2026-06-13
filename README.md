@@ -63,12 +63,12 @@ with the reason when unavailable.
 The `optimized` forward is a single TMA + `mma_v2` Gluon kernel with bounded
 autotune (a fixed production policy universe pruned at launch from the actual
 CUDA device profile and problem shape). It was promoted to the default after
-the M10 gates in
-[docs/sparton_remaining_work_design_v2.md](docs/sparton_remaining_work_design_v2.md):
+the M10 gates
+([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 it is faster than hybrid on every measured shape, uses output-only memory
 (~14x less peak than hybrid on the dev shape), and matches the reference on
 the full correctness matrix; evidence in
-[docs/sparton_milestone10_promotion_memo.md](docs/sparton_milestone10_promotion_memo.md).
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) (M10).
 
 To pin a backend explicitly (rollback path), pass the constructor argument or
 set the environment variable before importing `sparton`:
@@ -189,7 +189,7 @@ CUDA kernel tests require a CUDA device. In this workspace, Triton/TorchInductor
 
 ## Project Notes
 
-Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). Design and audit notes for the Gluon/backend refactor live in [docs/](docs/), including [sparton_gluon_current_platform_design.md](docs/sparton_gluon_current_platform_design.md), [sparton_gluon_design_review.md](docs/sparton_gluon_design_review.md), and [sparton_milestone2_bias_none_backward_memo.md](docs/sparton_milestone2_bias_none_backward_memo.md).
+Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). The `docs/` directory holds three references for the Gluon/backend work: the built architecture in [ARCHITECTURE.md](docs/ARCHITECTURE.md), the development history (milestones M2–M13, with evidence and decisions) in [DEVELOPMENT.md](docs/DEVELOPMENT.md), and the working method plus kernel-optimization technique in [METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Citation
 

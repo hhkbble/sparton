@@ -12,7 +12,7 @@ the two regimes are never compared) over three index-distribution sources:
             rank-to-id mapping, so the active set concentrates at low vocab
             ids: a documented proxy for hot-token concentration in v-tile
             space (early-exit skew, load imbalance). It does NOT model
-            index collisions (below) — never sufficient alone (v1 §8).
+            index collisions (below) — never sufficient alone (METHODOLOGY.md §A.3).
   real      records captured by ``capture_index_distributions.py``. These
             carry the property no synthetic source reproduces: hot-row index
             collisions (measured ~20% of active vocab entries choosing the
@@ -44,7 +44,7 @@ Exits non-zero listing verification failures. ``--quick`` runs a small
 development subset; the full matrix is the gate of record. Note that
 ``--quick`` pins contract-relevant axes (``bias=on``, fp16 only): it
 cannot prove the axes it holds fixed — the M13 prototypes' bias_grad
-optionality bug survived every quick gate (M13 memo §8 item 2).
+optionality bug survived every quick gate (DEVELOPMENT.md M13 §8 item 2).
 """
 
 from __future__ import annotations

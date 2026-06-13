@@ -9,7 +9,7 @@ LLVM codegen failures abort the process, so the driver runs each probe in a
 subprocess and records exit status plus the tail of the output.
 
 Validated results on RTX 5090 / Triton 3.6.0:
-docs/sparton_gluon_remaining_work_design.md §2.2.
+ARCHITECTURE.md §2.2.
 """
 
 import sys

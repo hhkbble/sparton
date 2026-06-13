@@ -17,7 +17,7 @@ pattern depends only on ``max_scores``'s sparsity pattern, ``max_idx``, and
 the shapes, so ``bench_backward.py`` synthesizes operand values at the
 recorded shapes. Capture-to-disk exists so backward benchmarking never pays
 a backbone forward per measurement and runs reproduce across sessions
-(design v3 M11-T2).
+(DEVELOPMENT.md M11 §4, the M11-T2 capture).
 
 Bundles default to ``tests/data/bundles/swimir_de_steps{N}.pt`` (gitignored
 — large generated data per ``tests/data/README.md``). If the output file

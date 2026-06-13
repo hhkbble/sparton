@@ -1,6 +1,6 @@
 """M13 analytic traffic model: per-buffer formulas vs measured counters.
 
-The runnable model of record for the M13 backward decision (memo §4): it
+The runnable model of record for the M13 backward decision (DEVELOPMENT.md M13 §4): it
 validates the segmented-backward traffic formulas against the M13-T0 ncu
 counters on the four T0 shapes (dev fp16, the 16x512 bf16 corner, one real
 query record, one real doc record). Formulas are in (B, S, V, D, f, elt)
@@ -10,7 +10,7 @@ count, mixed-chunk fraction, active fraction) are computed from the
 — never estimated.
 
 The MEASURED tables below are the M13-T0 counters of record, transcribed
-from the deposited ncu transcripts (M13 memo §2; session artifacts). The
+from the deposited ncu transcripts (DEVELOPMENT.md M13 §2; session artifacts). The
 CONFIG table pins the autotune selections those transcripts ran under —
 if the autotuner's selections move (config-list edits re-key the caches),
 re-profile and update both tables together: the model is only meaningful
@@ -22,7 +22,7 @@ Real-record rows need the capture bundles (default
 contain different records, so the embedded measured counters then no
 longer correspond; see ``tests/data/README.md``). Sector = 32 B. Output:
 the expected-vs-measured table per buffer per shape and per-kernel time
-floors with named anchors (memo §4.2).
+floors with named anchors (DEVELOPMENT.md M13 §4.2).
 
 Usage (CUDA required; bundle-dependent rows are skipped with a notice if
 the bundles are absent):
@@ -51,7 +51,7 @@ L2_ACHIEVABLE = 6.6e12     # B/s, M12-measured fabric rate at 89-91% busy
 L2_CONSERVATIVE = 5.1e12   # ~70% of implied peak: conservative attainment
 DRAM_ACHIEVABLE = 1.5e12   # B/s (prep kernel measured 84% of nameplate)
 
-# Measured counters of record (M13-T0 ncu transcripts; memo §2).
+# Measured counters of record (M13-T0 ncu transcripts; DEVELOPMENT.md M13 §2).
 # Sectors are counts; dram_* in MB; durations in microseconds (ncu regime —
 # structure only, never compared with do_bench latencies).
 MEASURED = {
@@ -73,7 +73,7 @@ MEASURED = {
     },
 }
 
-# Autotune selections the measured counters ran under (M13 memo §2 tables).
+# Autotune selections the measured counters ran under (DEVELOPMENT.md M13 §2 tables).
 CONFIG = {
     "dev_fp16": dict(seg_chunk=32, seg_bd=128, emb_bv=64, emb_bd=64),
     "corner_bf16": dict(seg_chunk=64, seg_bd=64, emb_bv=32, emb_bd=64),

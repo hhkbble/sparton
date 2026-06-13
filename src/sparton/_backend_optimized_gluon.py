@@ -77,7 +77,7 @@ def _argmax_strict_combine(value_a, index_a, value_b, index_b):
 # materializes C. The persistent rewrite once planned for this mainloop was
 # declined at the M12 entry gate (tensor pipe already 92-94% utilized, no
 # scheduling bubbles to recover — D2 discharged by re-affirmation; see
-# docs/sparton_milestone12_forward_memo.md and design v2 (D2)). Revisit only
+# docs/DEVELOPMENT.md (M12) and ARCHITECTURE.md §4.4 (D2)). Revisit only
 # if a future milestone reopens the kernel body.
 @autotune(
     configs=get_optimized_forward_configs(),

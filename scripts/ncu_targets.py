@@ -5,11 +5,11 @@ Provides ranges for `ncu --nvtx --nvtx-include "<range>/"`:
   hybrid_fwd/        one fused_sparton_fwd_op call (all per-tile kernels)
   hybrid_bwd/        tensor.backward() — captures NOTHING under ncu: autograd
                      runs on a worker thread and NVTX ranges are thread-local
-                     (kept as a documented negative example; see design doc §2.5)
+                     (kept as a documented negative example; see ARCHITECTURE.md §2.5)
   hybrid_bwd_direct/ fused_sparton_bwd_op called directly on the main thread
 
 Needs PYTHONPATH=src and the hardened env prefix; see
-docs/sparton_gluon_remaining_work_design.md §3.5, §11, Appendix B.
+ARCHITECTURE.md §2.5 (profilers and measurement regimes).
 """
 
 import torch

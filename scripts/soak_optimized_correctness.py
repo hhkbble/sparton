@@ -1,13 +1,13 @@
 """Shape-soak correctness gate for the optimized Gluon forward (M10 gate 5).
 
-Sweeps the design-v2 §5 M10 grid — S in {1, 7, 64, 127, 128, 129, 255, 511},
+Sweeps the M10 grid (DEVELOPMENT.md M10) — S in {1, 7, 64, 127, 128, 129, 255, 511},
 B in {1, 2, 5}, D in {768, 1024}, V in {30522, 151936}, bias in {yes, no},
 dtype in {fp16, bf16} — with 75%-density random masks where batch row 0 is
 fully zeroed (the all-zero-row edge; for B=1 the whole batch is masked).
 
 Each case checks scores against a vectorized input-dtype reference and the
-returned indices against the tie-aware index contract of record (design v2
-§6.2): wherever the score is positive, the masked logit at the chosen index
+returned indices against the tie-aware index contract of record
+(ARCHITECTURE.md §3.2): wherever the score is positive, the masked logit at the chosen index
 must be within score tolerance of the per-(b, v) maximum.
 
 Exits non-zero listing every failing case. Use ``--quick`` for a small smoke
