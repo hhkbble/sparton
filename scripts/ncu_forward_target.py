@@ -18,11 +18,11 @@ backward target's 0.75) so profiles correspond to the all-ones canonical
 grid rows they gate; the kernel's work is mask-value-invariant (the mask is
 an epilogue multiply, not control flow).
 
-Intended invocation (hardened env, serial; see benchmarks/README.md):
+Intended invocation (hardened env, serial; see scripts/README.md):
 
   ncu --nvtx --nvtx-include "fwd_direct/" --launch-skip 1 --launch-count 1 \
-      --section ... --metrics <set recorded in the M12 memo> -o <report> \
-      python -u benchmarks/ncu_forward_target.py --dtype fp16 --bias on
+      --section ... --metrics <set recorded in DEVELOPMENT.md M12> -o <report> \
+      python -u scripts/ncu_forward_target.py --dtype fp16 --bias on
 
 Prints one summary line; exits non-zero if the forward op fails.
 """
@@ -84,13 +84,13 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("ncu_forward_target.py requires CUDA")
-    from sparton._gluon_runtime import is_gluon_backend_available
+    from sparton._backend_runtime import is_optimized_backend_available
 
-    available, reason = is_gluon_backend_available()
+    available, reason = is_optimized_backend_available()
     if not available:
         raise RuntimeError(
-            "ncu_forward_target.py requires the optimized Gluon backend "
-            f"(CUDA sm_80+ and importable triton.experimental.gluon): {reason}"
+            "ncu_forward_target.py requires the optimized backend "
+            f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 
     import sparton.sparton_kernel as sk

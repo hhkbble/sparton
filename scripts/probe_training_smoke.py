@@ -230,13 +230,13 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("probe_training_smoke.py requires CUDA")
-    from sparton._gluon_runtime import is_gluon_backend_available
+    from sparton._backend_runtime import is_optimized_backend_available
 
-    available, reason = is_gluon_backend_available()
+    available, reason = is_optimized_backend_available()
     if not available:
         raise RuntimeError(
-            "probe_training_smoke.py requires the optimized Gluon backend "
-            f"(CUDA sm_80+ and importable triton.experimental.gluon): {reason}"
+            "probe_training_smoke.py requires the optimized backend "
+            f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 
     modes = [mode.strip() for mode in args.modes.split(",") if mode.strip()]

@@ -391,8 +391,8 @@ def fused_sparton_fwd(hidden, embed, bias, mask):
 
 # --- M13 split segmented backward (production path) -------------------------
 #
-# Mechanism and measured evidence: docs/sparton_milestone13_backward_memo.md
-# (the M11 memo carries the segmented design this splits). Stages inside the
+# Mechanism and measured evidence: docs/DEVELOPMENT.md (M13 backward)
+# (DEVELOPMENT.md M11 carries the segmented design this splits). Stages inside the
 # unchanged custom op:
 #   1. bwd_prep_kernel: g = grad_out * exp(-scores) where scores > 0 (the
 #      original kernel's exact fp32 math), int32 idx, destination sort keys
@@ -402,11 +402,11 @@ def fused_sparton_fwd(hidden, embed, bias, mask):
 #   3. embed_grad_kernel (exclusive-owner plain stores, no atomics) and the
 #      split hidden-grad pass: uniform_hidden_grad_kernel (branch-free
 #      pipelined streaming reduction over single-destination chunks — the
-#      vectorized-gather fast path, M13 memo §5.4) plus
+#      vectorized-gather fast path, DEVELOPMENT.md M13 §5.4) plus
 #      mixed_hidden_grad_kernel (the segmented scan, covering only chunks
 #      with a run boundary). The two kernels' predicates are exact
 #      complements at one shared CHUNK granularity; independent granularities
-#      silently drop contributions (M13 memo §5.4 item 2), which is why the
+#      silently drop contributions (DEVELOPMENT.md M13 §5.4 item 2), which is why the
 #      mixed kernel is not autotuned and runs at the uniform winner's CHUNK.
 
 
@@ -550,8 +550,8 @@ def get_uniform_hidden_grad_configs():
     # the mixed fraction scales with the shared granule (m ~ runs*CHUNK/N),
     # so a larger uniform-side CHUNK silently multiplies the mixed pass's
     # coverage and forces its scan tile register-heavy (measured at
-    # GRANULE=256 as a 1.30 ms mixed pass doing ~3% of the work — M13 memo
-    # §5.4 item 4). At CHUNK=64 the extra chunk-partial atomics are ~2% of
+    # GRANULE=256 as a 1.30 ms mixed pass doing ~3% of the work — DEVELOPMENT.md
+    # M13 §5.4 item 4). At CHUNK=64 the extra chunk-partial atomics are ~2% of
     # kernel bytes on the doc shape — the cheaper side of the trade by an
     # order of magnitude.
     return [
@@ -571,7 +571,7 @@ def get_uniform_hidden_grad_configs():
 # the shared CHUNK granularity so each contribution is deposited exactly
 # once. Suppression is folded into the load MASKS, not a branch: a branch
 # around the tile load re-anchors its layout and de-vectorizes the gather
-# (M13 memo §5.4 items 1 and 6).
+# (DEVELOPMENT.md M13 §5.4 items 1 and 6).
 @triton.autotune(
     configs=get_uniform_hidden_grad_configs(),
     key=['batch_size', 'seq_len', 'vocab_size', 'hidden_dim'],
@@ -628,8 +628,8 @@ def uniform_hidden_grad_kernel(
 
 
 # Mixed-chunk pass of the split. NOT autotuned: the granule size must equal
-# the uniform kernel's selected CHUNK or the complement breaks (M13 memo
-# §5.4 item 2). A mixed granule is processed as SUB-row segmented-scan
+# the uniform kernel's selected CHUNK or the complement breaks (DEVELOPMENT.md
+# M13 §5.4 item 2). A mixed granule is processed as SUB-row segmented-scan
 # tiles with an inner d-loop: chunk-local partials compose across tile
 # boundaries (the run-boundary composition invariant), so the working tile
 # need not match the granule — but SUB must divide GRANULE or the
@@ -743,7 +743,7 @@ def get_segmented_hidden_grad_configs():
     # seq_len is in the key (unlike the deleted M2-era kernel's, which this
     # function's name once denoted): destination-run length scales with
     # V/S, so the optimal CHUNK for short-S inputs (long runs, fast path)
-    # differs from long-S inputs (M11 memo §5.2).
+    # differs from long-S inputs (DEVELOPMENT.md M11 §5.2).
     key=['batch_size', 'seq_len', 'vocab_size', 'hidden_dim'],
     reset_to_zero=['hidden_grad_ptr'],
 )

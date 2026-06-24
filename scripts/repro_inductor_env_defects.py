@@ -7,7 +7,7 @@ Run with TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 to force fresh compiles:
   - with CPATH but the Inductor cache under noexec /tmp: dlopen fails with
     "failed to map segment from shared object".
 Both pass with the hardened env prefix. Mechanism and fix:
-docs/sparton_gluon_remaining_work_design.md §2.4.
+ARCHITECTURE.md §2.4.
 """
 
 import torch
