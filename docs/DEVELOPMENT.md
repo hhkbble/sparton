@@ -496,7 +496,7 @@ V=250002).
 
 ### M11 §3 — analytic traffic model
 
-Per-buffer L2 reduction-sector counts for the legacy kernel (sectors = 32 B =
+Per-buffer L2 reduction-sector counts for the M2-era kernel (sectors = 32 B =
 8 fp32 lanes):
 
 | buffer | red-sector formula | dev (f≈1) | corner (f=1) |
@@ -552,10 +552,10 @@ baseline (5 same-input repeats/cell): `embed_grad` norm spread exactly 0;
 **§5.1 B2a, and why it cannot reach the gate.** `aggregated_bwd` (B2a): grid
 `(cdiv(D,BLOCK_D), cdiv(V,BLOCK_V))`, in-CTA batch loop, plain-store
 `embed_grad`/`bias_grad`, embed tile loaded once per CTA. ncu on the real query
-record r0 (B=16, S=24, V=250002, fp16, bias; legacy re-deposited post-promotion,
-B2a reproducible only on the T3 tree, commit b5acd9c):
+record r0 (B=16, S=24, V=250002, fp16, bias; M2-era kernel re-deposited
+post-promotion, B2a reproducible only on the T3 tree, commit b5acd9c):
 
-| metric | legacy | B2a |
+| metric | M2-era | B2a |
 |---|---|---|
 | duration | 8.37 ms | 7.77 ms |
 | **L2 (LTS) throughput** | **55.98%** | **57.89%** |
@@ -578,8 +578,8 @@ because the binder B2b cannot touch was already named).
 **§5.2 The B3 segmented design** (T5 mechanism pulled forward to T3). The
 implemented design:
 1. **Prep kernel** (`bwd_prep_kernel`, one pass over `B·V`): `g =
-   grad_out·exp(-scores)` where `scores > 0` in fp32 (bit-identical to legacy),
-   int32 indices, destination sort key `b·S + idx` (sentinel `B·S` for inactive
+   grad_out·exp(-scores)` where `scores > 0` in fp32 (bit-identical to the
+   M2-era kernel), int32 indices, destination sort key `b·S + idx` (sentinel `B·S` for inactive
    entries → sort last). Replaces ~7 torch elementwise launches; this fusion
    alone flipped the sparse-synthetic cells from −8% to +10–20% (launch latency,
    not bandwidth, dominates at 0.36 ms scale).
@@ -596,14 +596,14 @@ implemented design:
    in-register inclusive `tl.cumsum` and emit ≤2 atomics per run — `+csum` at run
    ends (forced at chunk boundaries, whose local partials compose across chunks),
    `val − csum` at run starts, single-lane runs collapsing to one exact `val`
-   atomic. Worst case equals (never exceeds) the legacy one-atomic-per-contribution.
+   atomic. Worst case equals (never exceeds) the M2-era one-atomic-per-contribution.
 
 Correctness subtleties (each caught by the harness's per-cell verification before
 any timing): runs spanning ≥3 chunks lost middle-chunk partials until
 chunk-boundary lanes were forced to be run ends; the sort key must bound `B·S`
 (int32); `prev/next` boundary loads are global reads so cross-chunk composition is
 local arithmetic only. **Autotune key:** `seq_len` **is** in the segmented
-kernel's key (unlike legacy). Measured defect when absent: all real records share
+kernel's key (unlike the M2-era kernel). Measured defect when absent: all real records share
 `(B=16, V=250002, D=768)`, so the config tuned on the first cell (a query, S=24,
 long runs) was silently reused for documents (S=192, short runs), costing ~7%
 (1.37–1.39× before the fix; the runs of record settle at 1.35–1.43× after
@@ -611,7 +611,7 @@ autotune jitter) — the §7 "autotune key mismatch" failure mode caught by §4.
 config-logging hygiene.
 
 **§5.3 Decision matrix** (final, 264 cells × 2 runs, run 2 of record; every cell
-verified `assert_close` vs the production op before timing). Speedup vs the legacy
+verified `assert_close` vs the production op before timing). Speedup vs the M2-era
 kernel:
 
 | impl | uniform (12 cells) | zipf (12) | real queries (32) | real docs (32) |
@@ -619,7 +619,7 @@ kernel:
 | B2a | 1.165–1.197× | 1.153–1.190× | 1.126–1.173× | 1.162–1.216× |
 | **B3** | **1.126–1.214×** | **1.160–1.295×** | **2.153–2.385×** | **1.368–1.677×** |
 
-Legacy absolute on real records 5.90–7.93 ms; B3 brings them to 3.3–4.4 ms. 16 of
+M2-era absolute on real records 5.90–7.93 ms; B3 brings them to 3.3–4.4 ms. 16 of
 64 real cells (all four `steps150` document records × dtypes × bias) sit below the
 1.5× clause at 1.368–1.402× (1.35–1.43× across preserved runs); the shortfall is
 sensitive to autotune jitter (±5%) and its residual mechanism is embed-gather
@@ -637,7 +637,7 @@ numerical verification (0 failures across 264 cells × 2 runs), and the
 determinism protocol (a racing store would show as nonzero `embed_grad` spread;
 measured exactly 0). After the maintainer restarted the host, the gate ran on the
 promoted tree (`fa168b6`; small shape B=4 S=33 D=64 V=2048, density 25%, fp16,
-bias on/off, `--impls current,legacy` — all 18 segmented configs swept):
+bias on/off, A/B over the M2-era and segmented backwards — all 18 segmented configs swept):
 ```text
 racecheck  -> 0 hazards displayed (0 errors, 0 warnings)
 memcheck   -> 0 errors
@@ -652,10 +652,15 @@ Code changes (`_backend_hybrid.py` only; op schema, fake registration, autograd
 wiring, saved tensors, all forward code untouched): `fused_sparton_bwd_op` calls
 `segmented_sparton_bwd`; `embed_grad`/`bias_grad` allocate with `torch.empty` (the
 V×D fp32 zero-fill, 768 MB at V=250002, disappears); `hidden_grad` stays
-zero-filled. The pre-M11 kernel becomes `legacy_fused_sparton_bwd` (the A/B
-reference of record, module-accessible, not in `__all__`). Winner-only wiring (no
-runtime adaptivity). `scripts/bwd_prototypes.py` deleted; `bench_backward.py`
-resolves `current` and `legacy`.
+zero-filled. The pre-M11 (M2-era) kernel was retained as the A/B reference of
+record (module-accessible, not in `__all__`). (At M13 the reference symbol was
+reassigned to the segmented design and renamed `segmented_reference_bwd`; that
+design was subsequently **removed** when the backward was reduced to
+`{mono, optimized}` — the M2 atomic kernel was restored as `mono` and is now the
+A/B baseline.) Winner-only wiring (no runtime adaptivity).
+`scripts/bwd_prototypes.py` deleted; `bench_backward.py` resolved the production
+and reference impls (the `--impls` labels are `optimized,mono` after the backward
+was reduced to two kernels).
 
 Tests (suite 114 → **132**): `BACKWARD_CASES` extends the
 `*_backward_matches_reference` tests to bias/no-bias × fp16/bf16;
@@ -664,8 +669,9 @@ saved `(scores, idx)` — see §8 item 6 — with those outputs pinned vs
 `sparton_reference` + `assert_index_contract`);
 `test_backward_zero_scores_produce_zero_gradients`,
 `test_backward_masked_rows_yield_zero_hidden_gradient` (constructed, exact);
-`test_backward_matches_legacy_kernel` (slow; A/B at 3×345×768×2048, atol=1e-4
-rtol=1e-3). Red→green: two new tests first failed on test defects (non-leaf
+`test_backward_matches_reference_kernel` (slow; A/B at 3×345×768×2048, atol=1e-4
+rtol=1e-3; this is the post-M13 name — the M11 test carried the now-retired
+reference-naming term). Red→green: two new tests first failed on test defects (non-leaf
 `-torch.ones(...)`; autograd-through-reference near-tie flips), classified as gate
 bugs — the kernel was never wrong.
 
@@ -677,9 +683,9 @@ pytest -q -m "not slow"                          -> 109 passed, 23 deselected
 soak_optimized_correctness.py (full sweep)       -> 384/384, max score err 0.001953, max index gap 0.0
 probe_training_smoke.py (300 steps fp16+bf16)    -> passed (bf16 parity 0.21-0.24%)
 compute-sanitizer racecheck/memcheck/initcheck   -> 0 / 0 / 0 (discharged post-restart, §5.4)
-bench_backward current vs legacy x2 (run 2)      -> 176 cells, 0 verification failures
-  real cells:      current 1.35-2.40x legacy (16 steps150-doc cells at 1.35-1.43x, recorded deviation)
-  synthetic cells: current 1.09-1.29x legacy (no regression anywhere)
+bench_backward current vs M2-era x2 (run 2)      -> 176 cells, 0 verification failures
+  real cells:      current 1.35-2.40x M2-era (16 steps150-doc cells at 1.35-1.43x, recorded deviation)
+  synthetic cells: current 1.09-1.29x M2-era (no regression anywhere)
 bench dev row x2 (run 2)                          -> hyb+b 1.152 / opt+b 0.880 / hyb f+b 2.262 / opt f+b 1.949 ms
 import sparton                                    -> stdout-silent (['SpartonHead'])
 git diff --check                                  -> clean
@@ -703,7 +709,7 @@ favorable to the segmented design):
 
 Counter before/after:
 
-| | legacy dev | segmented dev (4 kernels) | legacy corner | segmented corner |
+| | M2-era dev | segmented dev (4 kernels) | M2-era corner | segmented corner |
 |---|---|---|---|---|
 | kernel time | 1.35 ms | 0.012+0.214+0.016+0.766 ≈ 1.01 ms | 4.39 ms | 0.022+0.762+0.035+2.60 ≈ 3.42 ms |
 | L2 red sectors | 96.57 M | **3.49 M** (27.7×↓; embed/bias/prep/gather: 0) | 330.63 M | **6.40 M** (51.7×↓) |
@@ -725,7 +731,7 @@ Per cell, 5 same-input repeats; max relative spread of `‖hidden_grad‖`,
 
 | impl | ‖hidden_grad‖ spread | ‖embed_grad‖ spread | proxy spread |
 |---|---|---|---|
-| legacy (T2 baseline / T4 gate) | 1.14e-07 | exactly 0 | 1.35e-05 / 2.32e-05 |
+| M2-era (T2 baseline / T4 gate) | 1.14e-07 | exactly 0 | 1.35e-05 / 2.32e-05 |
 | segmented (production, T4 gate) | 1.14e-07 | exactly 0 | 4.12e-06 |
 
 `embed_grad`/`bias_grad` are now **structurally** deterministic (no atomics)
@@ -763,7 +769,7 @@ norm-level spreads do not extrapolate to chaotic-regime loss spreads).
 ### M11 §9 — known gaps
 
 - **Non-binary mask gradients — resolved as expected behavior under the original
-  contract (maintainer ruling, 2026-06-12).** The shared backward (legacy and
+  contract (maintainer ruling, 2026-06-12).** The shared backward (M2-era and
   segmented) omits the `mask[b, idx]` factor. The original Sparton formulation
   defines the attention mask as binary {0, 1}, and under that contract the
   omission is exact (a masked winner forces score 0, so the `scores > 0` guard
@@ -1011,8 +1017,11 @@ deviation cells now clear even the old 1.5× clause); every canonical grid row
 holds or improves (dev implied backward 1.061 → 0.982 ms); the synthetic
 `f = 0.10` short-run cells **regress 6–16% (~45 µs/call)** — a recorded deviation
 with a named mechanism, sanctioned by v1 §9's regression-without-gain criterion.
-The baton passed: the M11 segmented kernel is the test-pinned A/B reference behind
-`legacy_fused_sparton_bwd`; the M2-era atomic kernel is deleted. The embed kernel
+The baton passed: at M13 the M11 segmented kernel became the test-pinned A/B
+reference and the M2-era atomic kernel was deleted. (Both later changed when the
+backward was reduced to `{mono, optimized}`: the segmented reference was removed
+and the M2 atomic kernel restored as `mono` — see the closing Post-M13 section.)
+The embed kernel
 was *not* touched (fresh counters show it at its traffic floor, correcting the M11
 §6 attribution — its binder is gather re-reads, not g/idx streams). Residual at
 exit: the uniform pass runs at LTS ≈61–67% (config-dependent) vs the embed
@@ -1306,8 +1315,10 @@ facade re-exports, the A/B test's docstring; op schema/fake registration/autogra
 wiring/saved tensors/all forward code untouched): the split pass wired inside the
 op; `bwd_prep_kernel` gains the active-entry counter; shared host stages factored
 into `_bwd_shared_stages`; the segmented kernel + `segmented_sparton_bwd` retained
-behind `legacy_fused_sparton_bwd` (role comment names the removal condition); the
-M2-era kernel deleted; `scripts/bwd_prototypes.py` deleted.
+behind the A/B-reference symbol (`segmented_reference_bwd` after the post-M13
+reorganization; role comment names the removal condition; **later removed** when
+the backward was reduced to `{mono, optimized}`); the M2-era kernel deleted (and
+**later restored as `mono`**); `scripts/bwd_prototypes.py` deleted.
 
 ```text
 full pytest suite                               -> 134 passed at promotion; 136 at close
@@ -1317,7 +1328,7 @@ soak_optimized_correctness.py (full sweep)      -> 384/384, max score err 0.0019
 compute-sanitizer racecheck/memcheck/initcheck  -> 0 / 0 / 0 (small shape B4 S33 D64 V2048
                                                    exercises the non-divisible-D mask path)
 probe_training_smoke.py (300 steps fp16+bf16)   -> passed (parity 0.04% fp16 / 0.24% bf16)
-bench_backward current,legacy all sources x2    -> 176 cells x2, 0 failures; real cells current 1.46-1.60x legacy
+bench_backward current vs M11-segmented x2      -> 176 cells x2, 0 failures; real cells current 1.46-1.60x M11-segmented
 bench grid x2 (run 2) implied bwd vs M12 column -> 1.08/1.04/0.99/1.21/1.11/1.03/1.26/1.12/1.09x
                                                    (every row within band or improved)
 bench dev row x2 (run 2)                         -> opt+b 0.897 / opt f+b 1.879; implied bwd 0.982 ms (M12: 1.061)
@@ -1422,10 +1433,13 @@ correctness; every number vs its transcript; doctrine compliance) ran before clo
     contract-level call, because that source is the repo's designated sparse regime
     of record (M11 §9) — the M11 "no cell regresses" precedent does not fully cover
     it, so per the fourth verdict it goes to the maintainer. The promotion stands on
-    v1 §9's criterion and the regime's measured absence from real data (§7); the
-    revert path is one commit (re-wire `fused_sparton_bwd_op` to
-    `segmented_sparton_bwd` and re-run the §5.6 gate block). If ratified, record the
-    ruling here and in AGENTS.md's sharp edges.
+    v1 §9's criterion and the regime's measured absence from real data (§7); at
+    M13 the revert path was one commit (re-wire the shared backward op to the
+    segmented design and re-run the §5.6 gate block). (Moot after the backward was
+    reduced to `{mono, optimized}`: the segmented design was removed, and the
+    `f = 0.10` short-run regime is now near-parity against the restored `mono`
+    baseline rather than a regression against the segmented design — so there is no
+    standing regression to ratify against that baseline.)
 
 ### M13 §9 — known gaps
 
@@ -1461,7 +1475,9 @@ notes are archived out of tree).
 grid-stride fused max/argmax/ReLU/log1p forward in stock `@triton.jit`. Host-side TMA descriptors
 (`triton.tools.tensor_descriptor.TensorDescriptor`) + `tl.dot`; `D`/`V` `constexpr`; the compiler
 owns SMEM staging (launch `num_stages`) and the optional producer/consumer split
-(`tl.range(warp_specialize=)`). Backward unchanged (shared M13 split `fused_sparton_bwd_op`).
+(`tl.range(warp_specialize=)`). Backward unchanged at this date (the shared M13 split
+`fused_sparton_bwd_op`; later renamed `optimized_bwd_op` / `sparton::optimized_bwd`
+and wired only to the optimized forward — see the closing Post-M13 section).
 
 **Host-side TMA, no `set_allocator` (Phase-0 spike).** Host `TensorDescriptor` is driver-filled
 (`fill_tma_descriptor_tiled`), leaving `global_scratch_size == 0`; only device-side
@@ -1575,4 +1591,183 @@ tree. In order:
 Forward-only / max-only (dropping the index when no grad is needed) was also evaluated and
 **rejected** — no speedup (matmul/overhead-bound), not worth the schema/grad-detection complexity.
 
+---
 
+## Post-M13 — package reorganization + kernel-term rename (2026-06-25)
+
+**Not a milestone** (no kernel logic, numerics, autotune config lists, or op
+schemas changed — both production tracks stay closed). This is a structural and
+naming pass over the package and the docs: the umbrella term for an
+implementation moves from **"backend" to "kernel"**, the flat `_backend_*.py`
+layout becomes a `forward/`+`backward/` tree, and one structural inversion plus
+two dead-code paths are removed. Current-state design of record:
+[ARCHITECTURE.md](ARCHITECTURE.md) (module map, §4.1, §5); user-visible summary
+in [../CHANGELOG.md](../CHANGELOG.md) 2026-06-25.
+
+### Findings → decisions
+
+- **Finding: "backend" overloaded the compiler/compute-target sense.** The
+  kernel-selection concept (`SpartonHead(backend=)`, `SPARTON_BACKEND`,
+  `resolve_backend`, `.backend`, training `sparton_backend`) collided with the
+  ordinary GPU/compiler "backend" vocabulary. **Decision:** rename the concept
+  to **kernel** across the public API — `SpartonHead(kernel=)`, the `.kernel`
+  attribute, `SPARTON_KERNEL`, `resolve_kernel`, and training `sparton_kernel`.
+  This is a **breaking** rename (no compatibility shim — a clean break, the
+  M-series precedent for unknown-selector handling).
+
+- **Finding: the shared backward lived inside the hybrid *forward* module.**
+  `_backend_hybrid.py` carried both the hybrid forward *and* the shared backward,
+  so `naive`/`optimized` imported the backward op out of the hybrid forward
+  module — a dependency inversion (a forward depended on another forward to reach
+  a direction-neutral op). **Decision:** reorganize the package by
+  **[direction, variant]**. Forward kernels move to
+  `forward/{hybrid,naive,optimized}.py`; the backward variants to
+  `backward/{split,segmented}.py` with their common stages
+  (`_bwd_shared_stages`, `bwd_prep_kernel`, the exclusive-owner
+  `embed_grad_kernel`, `bwd_gather_payload_kernel`) in `backward/_common.py`.
+  (This backward layout was reshaped the same day: when the backward was reduced
+  to `{mono, optimized}`, `split.py` became `optimized.py` and absorbed
+  `_common.py`, while `segmented.py`/`_common.py` were removed — see the closing
+  Post-M13 section.) The backward kernels now live in the neutral `backward/`
+  package, and the only cross-package edge is `forward/* → backward` (no cycle).
+  The facade/router
+  `sparton_kernel.py` became `api.py`; `_backend_runtime.py` became `_runtime.py`;
+  device resolution moved to a new `_device.py` and `DEVICE` left the public
+  surface (kept only as an import-time DEBUG log).
+
+- **Finding: two dead-code paths and stale "fast/slow" naming.** The values-only
+  forward (`fused_sparton_fwd` and a values-only `reduce_seq_max_log1p_relu`
+  reduction + kernel) had **zero callers** — autograd needs the indices, so only
+  the values+indices helper is ever used; and `get_slow_forward_configs` was
+  unused while `get_fast_forward_configs` was the only live config getter.
+  **Decision:** delete the values-only forward + reduction path and
+  `get_slow_forward_configs`; rename the surviving getter to
+  `get_hybrid_forward_configs` (the "fast/slow" pair is gone). Doc consequence:
+  the AGENTS.md "two reduction helpers" invariant was now false and was rewritten
+  to the single surviving helper.
+
+- **Finding: three byte-identical autograd registrations and three parallel
+  wrapper bodies.** Each forward op repeated the same
+  `register_fake`/`_setup_context`/`_backward`, and each wrapper repeated the
+  same autocast → validate → `.contiguous()` sequence. **Decision (DRY, behavior
+  preserved):** factor the forward autograd into `forward/_autograd.py`
+  (`shared_fwd_fake` / `shared_setup_context` / `shared_backward` /
+  `register_shared_forward`) — registration is still applied **per op**, so each
+  op keeps its own registration record — and factor the wrapper canonicalization
+  into `_validation.prepare_forward_inputs`, the one seam all three wrappers now
+  call (the M9 symmetry-rule lesson, expressed as a shared helper instead of
+  three line-for-line copies).
+
+- **Op-string renames.** `sparton::fused_sparton_fwd` → `sparton::hybrid_fwd`
+  and `sparton::fused_sparton_bwd` → `sparton::bwd` (the `naive_fwd` /
+  `optimized_fwd` strings are unchanged); the Python op symbols are now
+  `hybrid_fwd_op` and `bwd_op`. The autograd **saved-tensor set is unchanged**,
+  so the backward stays schema-safe by the same M11→M13 argument.
+
+- **Retired-term cleanup.** The A/B-reference backward symbol and its
+  `bench_backward.py` label were renamed to `segmented_reference_bwd` /
+  `--impls segmented` (the production impl at that point was `split` → `bwd_op`);
+  the prior reference-naming term is no longer used anywhere in the package or
+  docs. (This was short-lived: the same-day backward reduction removed the
+  segmented reference entirely and made the A/B baseline `mono` /
+  `--impls optimized,mono` — see the closing Post-M13 section.)
+
+### Validation
+
+Behavior-preserving by construction (kernel bodies, numerics, autotune configs,
+op schemas, saved tensors all untouched). Gates: `py_compile` over
+`src/sparton/*.py` and the package subdirs clean; `import sparton` stdout-silent
+(prints `['SpartonHead']`); full pytest suite **135 passed** (the test file
+`tests/test_sparton_kernel.py` and `conftest.py` were updated for the new
+import paths and the `kernel=` parameter, but the suite size and the assertions
+are unchanged from the post-Gluon-removal 135). The renames touched
+`README.md`, `AGENTS.md`, `CHANGELOG.md`, and the three `docs/` references plus
+`scripts/README.md` to the new names/terms; the historical M2→M13 prose above
+keeps its period-accurate names, with this section and the CHANGELOG documenting
+the supersession.
+
+---
+
+## Post-M13 — backward reduced to {mono, optimized} (2026-06-25)
+
+**Not a milestone** (no kernel logic, numerics, autotune config lists, or
+forward op schemas changed — both production tracks stay closed). This is a
+backward-surface reshaping for evidence clarity: the backward goes from the
+`{split (production), segmented (M11 A/B reference)}` pair to exactly two kernels,
+**`mono`** and **`optimized`**, selected per-forward. Current-state design of
+record: [ARCHITECTURE.md](ARCHITECTURE.md) §5.4–§5.5; user-visible summary in
+[../CHANGELOG.md](../CHANGELOG.md) 2026-06-25.
+
+### Why
+
+The repo's headline claim is an end-to-end speedup over the original SPLADE
+projection head, but the A/B reference of record (`segmented_reference_bwd`) was
+the M11 *segmented* design — itself already an optimization over the original M2
+fully-atomic backward. So "optimized vs reference" compared two optimizations,
+not "ours vs the original". Restoring the original M2 atomic backward as a
+first-class, production-wired kernel (`mono`) makes the comparison the one users
+actually care about: `kernel=hybrid` (original-ish forward + `mono` backward) is
+the original project end-to-end; `kernel=optimized` is the current best; the gap
+between them is the real win. This also retires the awkward two-retained-references
+shape — `mono` is simultaneously the A/B baseline and the hybrid/naive production
+backward, so it is exercised, not dead.
+
+### What changed
+
+- **Restored `mono`** — the M2-era `fused_sparton_bwd_kernel_with_bias` lifted
+  verbatim from commit `6e19af3` into `src/sparton/backward/mono.py`
+  (`mono_bwd_kernel`, `get_mono_bwd_configs`, `mono_bwd`). It loads the saved
+  argmax index, computes `g = grad_out · exp(−scores)` where `scores > 0` (the
+  same exact gradient as the optimized backward), and `atomic_add`s the
+  hidden/embed/bias contributions into **zero-initialized** fp32 buffers
+  (`torch.zeros`, NOT `torch.empty` — the kernel only touches argmax-winner rows,
+  so untouched rows must read 0). A CTA-level `tl.sum(block_max_logits) == 0`
+  early-exit skips fully-inactive blocks. Slow by design.
+- **Renamed `split` → `optimized`.** The prior `split` design (uniform-chunk
+  streaming pass + run-boundary mixed pass + the shared prep/sort/exclusive-owner-
+  embed/gather stages) moved to `src/sparton/backward/optimized.py`, which
+  **absorbed the former `_common.py` stages** (`bwd_prep_kernel`,
+  `embed_grad_kernel`, `bwd_gather_payload_kernel`, `_bwd_shared_stages`) alongside
+  `uniform_hidden_grad_kernel`, `mixed_hidden_grad_kernel`, and `optimized_bwd`.
+  The three split correctness invariants (complement at one granularity,
+  sorted-prefix bound, sub-tile composition — M13 §5.4/§5.6) carry over unchanged;
+  they now describe the `optimized` backward.
+- **Deleted `segmented`.** `backward/split.py`, `backward/segmented.py`, and
+  `backward/_common.py` are gone; the M11 `segmented_hidden_grad_kernel` /
+  `segmented_bwd` / `segmented_reference_bwd` no longer exist.
+- **Two ops replace one.** `backward/__init__.py` now defines
+  `optimized_bwd_op` (`sparton::optimized_bwd`) and `mono_bwd_op`
+  (`sparton::mono_bwd`) — identical saved-tensor schema, one `register_fake` each.
+  The single shared `bwd_op` / `sparton::bwd` is removed. `api.py` exports
+  `mono_bwd_op` + `optimized_bwd_op` (dropping `bwd_op` and
+  `segmented_reference_bwd`).
+- **Per-forward selection.** `forward/_autograd.py` gains
+  `register_forward(op, bwd_op)`, which binds the shared fake/setup_context plus a
+  per-kernel backward onto a forward op. The optimized forward registers
+  `optimized_bwd_op`; the hybrid and naive forwards register `mono_bwd_op`.
+  Selection is therefore resolved once at forward construction, not dispatched per
+  call. Forward selection (optimized still the default where available) is
+  untouched.
+
+### Evidence
+
+- **Gradient identity:** `mono ≡ optimized` to ~1e-6 across the backward A/B
+  matrix (the harness verifies every cell against the production backward before
+  timing; 0 failures).
+- **Speedup (captured-real swim-ir, fp16):** the `optimized` backward is
+  **2–3.7× faster** than `mono` (mono ≈ 0.27–0.48× of optimized). On the sparse
+  synthetic `f = 0.10` short-run regime the two are near-parity — `mono`'s
+  zero-block early-exit skips the fully-inactive blocks that dominate that regime,
+  so its full-scatter penalty is small there.
+- **Suite:** full pytest **135 passed**; backward A/B (`bench_backward.py
+  --impls optimized,mono`) 0 failures. Op schemas (forward), saved-tensor set, and
+  forward kernels untouched.
+
+### Naming note for the historical prose below
+
+The M11 and M13 milestone sections, and the two earlier Post-M13 sections,
+describe the backward as it stood then: the M11 *segmented* design, retained at
+M13 as `segmented_reference_bwd` while the `split` design shipped behind
+`bwd_op` / `sparton::bwd`. Those names were accurate at their dates and are kept
+as period-accurate record; this section documents their supersession (`split` →
+`optimized`, `segmented` deleted, `mono` restored, `bwd_op` → the two ops above).

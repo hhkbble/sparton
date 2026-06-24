@@ -14,7 +14,7 @@ Requirements:
 - `triton>=3.3.1`
 
 The development environment used for this repository is the NGC container
-image `nvcr.io/nvidia/pytorch:26.05-py3` (torch 2.12 nightly, Triton 3.6.0,
+image `nvcr.io/nvidia/pytorch:26.05-py3` (torch 2.12 nightly, Triton 3.7.1,
 CUDA 13.2 toolchain) — the validated configuration behind the documented
 benchmarks and tests.
 
@@ -50,15 +50,15 @@ sparse_reps = head(hidden, inputs["attention_mask"])  # [1, vocab_size]
 
 See [model.py](training/model.py) for a full example integrating Sparton into a SPLADE model.
 
-### Backend Selection
+### Kernel Selection
 
-`SpartonHead` defaults to the `optimized` pure-Triton fused-forward backend
+`SpartonHead` defaults to the `optimized` pure-Triton fused-forward kernel
 wherever it is available (CUDA sm_90+ plus an importable
 `triton.tools.tensor_descriptor`; validated with Triton 3.7.1). On platforms
 where it is unavailable — including sm_80/sm_89, since the kernel uses host-side
-TMA — the default resolves to the `hybrid` backend with a one-time
+TMA — the default resolves to the `hybrid` kernel with a one-time
 `RuntimeWarning`. This availability-adaptive behavior applies only to the
-*default*: an explicitly selected backend never falls back and raises with the
+*default*: an explicitly selected kernel never falls back and raises with the
 reason when unavailable.
 
 The `optimized` forward is a single persistent `@triton.jit` kernel: host-side
@@ -72,18 +72,18 @@ removing Gluon from the package**; design and evidence in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.1 and
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-To pin a backend explicitly (rollback path), pass the constructor argument or
+To pin a kernel explicitly (rollback path), pass the constructor argument or
 set the environment variable before importing `sparton`:
 
 ```python
-head = SpartonHead(vocab_size, hidden_dim, use_bias=True, backend="hybrid")
+head = SpartonHead(vocab_size, hidden_dim, use_bias=True, kernel="hybrid")
 ```
 
 ```bash
-SPARTON_BACKEND=hybrid python train.py ...
+SPARTON_KERNEL=hybrid python train.py ...
 ```
 
-Available backends: `optimized` (default where available), `hybrid` (the
+Available kernels: `optimized` (default where available), `hybrid` (the
 previous default — compiled tiled matmul + Triton reduction; the
 compatibility path), and `naive` (a Triton-only `tl.dot` debug baseline).
 All three share the same Triton backward and the same numerics contract.
@@ -91,14 +91,14 @@ All three share the same Triton backward and the same numerics contract.
 Mixed precision: the forward wrappers mirror `torch.autocast` semantics —
 under an active CUDA autocast region, fp32 master parameters are cast to the
 autocast dtype (fp16/bf16) like any autocast-aware matmul, so standard AMP
-training works with every backend.
+training works with every kernel.
 
-Index semantics across backends: the returned index for a vocabulary entry is
+Index semantics across kernels: the returned index for a vocabulary entry is
 meaningful only where its score is greater than zero (zero-baseline policy).
-Within one backend, ties resolve to the lowest sequence index. Across
-backends, `naive` and `optimized` accumulate logits in fp32 while `hybrid`
+Within one kernel, ties resolve to the lowest sequence index. Across
+kernels, `naive` and `optimized` accumulate logits in fp32 while `hybrid`
 produces input-dtype logits, so at near-ties (logit gaps within input-dtype
-rounding) different backends may legitimately return different winners. The
+rounding) different kernels may legitimately return different winners. The
 guaranteed contract, enforced by the test suite, is that the chosen position's
 masked logit stays within score tolerance of the true maximum.
 
@@ -118,7 +118,7 @@ The current Sparton implementation is a hybrid path: it uses compiled PyTorch/To
 hidden [B,S,D] → tiled matmul → Triton reduction → reps [B,V]
 ```
 
-Backward uses the saved max scores and indices to accumulate gradients for hidden states, decoder weights, and optional bias. Since M11 it is a segmented design shared by all backends: decoder-weight and bias gradients are written by exclusive owners (no atomics — exactly deterministic), and hidden-state gradients are sorted by destination row and reduced segment-wise before a handful of partial-sum atomics, which makes the backward 1.35–2.4x faster on real tokenized batches (where many vocabulary entries share one argmax position) and slightly faster on uniform synthetic inputs. The mask contract is the standard binary `{0,1}` tokenizer `attention_mask`, under which gradients are exact; non-binary mask values weight logits in the forward as an implementation property but are outside the contract and are not differentiated by the backward.
+Backward uses the saved max scores and indices to accumulate gradients for hidden states, decoder weights, and optional bias. There are two backward kernels and the selection follows the forward: `mono` — the original fully-atomic scatter (every active gradient `atomic_add`ed into zero-initialized buffers) — backs the `hybrid` and `naive` forwards, while `optimized` backs the `optimized` forward. The `optimized` backward writes decoder-weight and bias gradients by exclusive owners (no atomics — exactly deterministic) and computes hidden-state gradients by sorting contributions by destination row and reducing them segment-wise (a vectorized uniform-chunk streaming pass plus a run-boundary mixed pass) before a handful of partial-sum atomics. Both produce the same gradient (matching to ~1e-6); the split lets you run a clean original-vs-optimized A/B — the `optimized` backward is roughly 2–3.7x faster than `mono` on real tokenized batches (where many vocabulary entries share one argmax position). The mask contract is the standard binary `{0,1}` tokenizer `attention_mask`, under which gradients are exact; non-binary mask values weight logits in the forward as an implementation property but are outside the contract and are not differentiated by the backward.
 
 ## Training
 
@@ -191,7 +191,7 @@ CUDA kernel tests require a CUDA device. In this workspace, Triton/TorchInductor
 
 ## Project Notes
 
-Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). The `docs/` directory holds three references for the kernel/backend work: the built architecture in [ARCHITECTURE.md](docs/ARCHITECTURE.md), the development history (milestones M2–M13, with evidence and decisions) in [DEVELOPMENT.md](docs/DEVELOPMENT.md), and the working method plus kernel-optimization technique in [METHODOLOGY.md](docs/METHODOLOGY.md).
+Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). The `docs/` directory holds three references for the kernel work: the built architecture in [ARCHITECTURE.md](docs/ARCHITECTURE.md), the development history (milestones M2–M13, with evidence and decisions) in [DEVELOPMENT.md](docs/DEVELOPMENT.md), and the working method plus kernel-optimization technique in [METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Citation
 

@@ -10,4 +10,4 @@ if not torch.cuda.is_available():
     __all__ = []
 else:
     __all__ = ["SpartonHead"]
-    from .sparton_kernel import SpartonHead
+    from .api import SpartonHead

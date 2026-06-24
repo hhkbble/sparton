@@ -3,11 +3,11 @@
 Head-only synthetic training with no Hub downloads: a fixed dataset of
 (query, document) hidden-state pairs, an in-batch contrastive cross-entropy
 loss plus a FLOPS-style sparsity regularizer, and AdamW for ``--steps``
-optimizer steps. Runs the hybrid and optimized backends from identical fp32
+optimizer steps. Runs the hybrid and optimized kernels from identical fp32
 master parameters under fp16 AMP (autocast + GradScaler) and bf16 autocast.
 
 Gate assertions per mode:
-  - every per-step loss is finite for both backends;
+  - every per-step loss is finite for both kernels;
   - bf16 (no GradScaler): every sampled gradient is finite;
   - fp16 (GradScaler): scaler-skipped steps are bounded (early overflow while
     the scale calibrates is expected AMP behavior) and none occur in the
@@ -61,7 +61,7 @@ def make_dataset(
 
 
 def run_training(
-    backend: str,
+    kernel: str,
     *,
     autocast_dtype: torch.dtype,
     use_scaler: bool,
@@ -76,12 +76,12 @@ def run_training(
     lambda_flops: float,
     grad_check_every: int,
 ) -> list[float]:
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     queries, documents, query_mask, document_mask = dataset
     pairs = queries.shape[0]
 
-    head = sk.SpartonHead(vocab, dim, use_bias=True, backend=backend).to("cuda")
+    head = sk.SpartonHead(vocab, dim, use_bias=True, kernel=kernel).to("cuda")
     head.load_state_dict(init_state)
     head = head.float()
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr)
@@ -113,15 +113,15 @@ def run_training(
             torch.nn.functional.cross_entropy(sim, labels)
             + lambda_flops * ramp * (flops_regularizer(reps_q) + flops_regularizer(reps_d))
         )
-        assert torch.isfinite(loss), f"{backend} step {step}: non-finite loss"
+        assert torch.isfinite(loss), f"{kernel} step {step}: non-finite loss"
 
         scaler.scale(loss).backward()
         if not use_scaler and step % grad_check_every == 0:
             # No scaler: gradients must be finite, no excuses.
             for name, param in head.named_parameters():
-                assert param.grad is not None, f"{backend} step {step}: no grad for {name}"
+                assert param.grad is not None, f"{kernel} step {step}: no grad for {name}"
                 assert bool(torch.isfinite(param.grad).all()), (
-                    f"{backend} step {step}: non-finite grad for {name}"
+                    f"{kernel} step {step}: non-finite grad for {name}"
                 )
         scale_before = scaler.get_scale() if use_scaler else None
         scaler.step(optimizer)
@@ -132,11 +132,11 @@ def run_training(
 
     if use_scaler:
         assert len(skipped_steps) <= max(2, steps // 4), (
-            f"{backend}: GradScaler skipped {len(skipped_steps)}/{steps} steps"
+            f"{kernel}: GradScaler skipped {len(skipped_steps)}/{steps} steps"
         )
         last_quarter = steps - max(1, steps // 4)
         assert all(step < last_quarter for step in skipped_steps), (
-            f"{backend}: GradScaler still skipping in the final quarter "
+            f"{kernel}: GradScaler still skipping in the final quarter "
             f"({[s for s in skipped_steps if s >= last_quarter]})"
         )
     return losses
@@ -156,20 +156,20 @@ def run_mode(
     lambda_flops: float,
     parity_tolerance: float,
 ) -> list[str]:
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     autocast_dtype = torch.float16 if mode == "fp16" else torch.bfloat16
     use_scaler = mode == "fp16"
 
     torch.manual_seed(seed)
-    reference_head = sk.SpartonHead(vocab, dim, use_bias=True, backend="hybrid").to("cuda")
+    reference_head = sk.SpartonHead(vocab, dim, use_bias=True, kernel="hybrid").to("cuda")
     init_state = {key: value.detach().clone() for key, value in reference_head.state_dict().items()}
     dataset = make_dataset(pairs=64, seq_len=seq_len, dim=dim, seed=seed)
 
     curves: dict[str, list[float]] = {}
-    for backend in ("hybrid", "optimized"):
-        curves[backend] = run_training(
-            backend,
+    for kernel in ("hybrid", "optimized"):
+        curves[kernel] = run_training(
+            kernel,
             autocast_dtype=autocast_dtype,
             use_scaler=use_scaler,
             steps=steps,
@@ -197,10 +197,10 @@ def run_mode(
         f"mean rel diff {mean_rel:.4f}, final rel diff {final_rel:.4f}",
         flush=True,
     )
-    for backend, losses in curves.items():
+    for kernel, losses in curves.items():
         if not losses[-1] < losses[0]:
             failures.append(
-                f"{mode}/{backend}: loss did not decrease ({losses[0]:.4f} -> {losses[-1]:.4f})"
+                f"{mode}/{kernel}: loss did not decrease ({losses[0]:.4f} -> {losses[-1]:.4f})"
             )
     if final_rel > parity_tolerance:
         failures.append(
@@ -230,12 +230,12 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("probe_training_smoke.py requires CUDA")
-    from sparton._backend_runtime import is_optimized_backend_available
+    from sparton._runtime import is_optimized_kernel_available
 
-    available, reason = is_optimized_backend_available()
+    available, reason = is_optimized_kernel_available()
     if not available:
         raise RuntimeError(
-            "probe_training_smoke.py requires the optimized backend "
+            "probe_training_smoke.py requires the optimized kernel "
             f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 

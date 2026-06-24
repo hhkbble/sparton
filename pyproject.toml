@@ -39,7 +39,7 @@ strict_parametrization_ids = true
 strict_xfail = true
 markers = [
     "cuda: tests that require a CUDA device",
-    "optimized: tests that require the optimized (pure-Triton TMA) backend",
+    "optimized: tests that require the optimized (pure-Triton TMA) kernel",
     "slow: tests that are comparatively expensive",
 ]
 

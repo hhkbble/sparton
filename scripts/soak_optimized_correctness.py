@@ -1,9 +1,9 @@
 """Shape-soak correctness gate for the optimized (pure-Triton) forward (M10 gate 5).
 
-The `optimized` backend (`src/sparton/_backend_optimized.py`) is the pure-Triton
+The `optimized` kernel (`src/sparton/forward/optimized.py`) is the pure-Triton
 persistent fused forward; it is bit-close to `naive` by construction (fp32
 accumulation). Routes through the public `optimized_forward`, so it tests
-whichever tile the backend selects (the self-tuner is defaulted OFF here —
+whichever tile the kernel selects (the self-tuner is defaulted OFF here —
 correctness is tile-independent; see main()).
 
 Sweeps the M10 grid (DEVELOPMENT.md M10) — S in {1, 7, 64, 127, 128, 129, 255,
@@ -16,7 +16,7 @@ returned indices against the tie-aware index contract of record
 (ARCHITECTURE.md §3.2): wherever the score is positive, the masked logit at the
 chosen index must be within score tolerance of the per-(b, v) maximum.
 
-Honors the optimized env knobs read by the backend launcher
+Honors the optimized env knobs read by the kernel launcher
 (``SPARTON_OPTIMIZED_AUTOTUNE`` / ``SPARTON_OPTIMIZED_WARP_SPECIALIZE`` /
 ``SPARTON_OPTIMIZED_NUM_CTAS`` / ``SPARTON_OPTIMIZED_CTAS_PER_SM``) — set them
 in the environment to soak a specific variant.
@@ -128,16 +128,16 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("soak_optimized_correctness.py requires CUDA")
-    from sparton._backend_runtime import is_optimized_backend_available
+    from sparton._runtime import is_optimized_kernel_available
 
-    available, reason = is_optimized_backend_available()
+    available, reason = is_optimized_kernel_available()
     if not available:
         raise RuntimeError(
-            "soak_optimized_correctness.py requires the optimized backend "
+            "soak_optimized_correctness.py requires the optimized kernel "
             f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     s_values = QUICK_S if args.quick else FULL_S
     b_values = QUICK_B if args.quick else FULL_B

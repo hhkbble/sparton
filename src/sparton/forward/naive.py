@@ -4,8 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ._backend_hybrid import fused_sparton_bwd_op
-from ._validation import autocast_canonicalize, validate_forward_inputs
+from .._validation import prepare_forward_inputs
+from ..backward import mono_bwd_op
+from ._autograd import register_forward
 
 
 def _naive_config(block_s: int, block_v: int, block_d: int, warps: int, stages: int):
@@ -37,7 +38,7 @@ def get_naive_forward_configs():
     cache_results=True,
 )
 @triton.jit
-def sparton_naive_forward_kernel(
+def naive_forward_kernel(
     hidden_ptr,
     embed_ptr,
     bias_ptr,
@@ -146,7 +147,7 @@ def _launch_naive_fwd(
     def grid(meta):
         return (B, triton.cdiv(V, meta["BLOCK_V"]))
 
-    sparton_naive_forward_kernel[grid](
+    naive_forward_kernel[grid](
         hidden,
         embed,
         bias,
@@ -186,36 +187,7 @@ def naive_fwd_op(
     return _launch_naive_fwd(hidden, embed, bias, mask)
 
 
-@naive_fwd_op.register_fake
-def _(hidden, embed, bias, mask):
-    B, S, D = hidden.shape
-    V, D2 = embed.shape
-    out_scores = hidden.new_empty((B, V))
-    out_idx = torch.empty((B, V), device=hidden.device, dtype=torch.int64)
-    return out_scores, out_idx
-
-
-def _setup_context(ctx, inputs, output):
-    hidden, embed, bias, mask = inputs
-    scores, idx = output
-    ctx.save_for_backward(scores, idx, hidden, embed, bias, mask)
-
-
-def _backward(ctx, grad_scores, grad_idx):
-    scores, idx, hidden, embed, bias, mask = ctx.saved_tensors
-    hidden_g, embed_g, bias_g = fused_sparton_bwd_op(
-        grad_scores,
-        scores,
-        idx,
-        hidden,
-        embed,
-        bias,
-        mask,
-    )
-    return hidden_g, embed_g, bias_g, None
-
-
-naive_fwd_op.register_autograd(_backward, setup_context=_setup_context)
+register_forward(naive_fwd_op, mono_bwd_op)
 
 
 def naive_forward(
@@ -224,13 +196,9 @@ def naive_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
-    validate_forward_inputs(hidden, embed, bias, mask, backend="naive")
-    hidden = hidden.contiguous()
-    embed = embed.contiguous()
-    mask = mask.contiguous()
-    if bias is not None:
-        bias = bias.contiguous()
+    hidden, embed, bias, mask = prepare_forward_inputs(
+        hidden, embed, bias, mask, kernel="naive"
+    )
     return naive_fwd_op(hidden, embed, bias, mask)
 
 
@@ -238,5 +206,5 @@ __all__ = [
     "get_naive_forward_configs",
     "naive_forward",
     "naive_fwd_op",
-    "sparton_naive_forward_kernel",
+    "naive_forward_kernel",
 ]

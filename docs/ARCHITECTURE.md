@@ -1,7 +1,7 @@
 # Sparton Architecture
 
 This document describes the **built system** as it ships today: the three
-backends, the platform facts they run on, the mathematical and API contract
+kernels, the platform facts they run on, the mathematical and API contract
 they implement, the layering rules that hold across them, the kernel designs
 of record, the measured performance state with its named residuals, and the
 validation gates.
@@ -29,44 +29,66 @@ original platform survey.
 `SpartonHead` (in `src/sparton/`) replaces the MLM projection head of a
 SPLADE-style model with a CUDA-only fused projection head that avoids
 materializing the full `[B, S, V]` logits tensor. It exposes three
-implementation backends that share one numerics contract, one forward op
-schema family, and one shared backward:
+implementation kernels that share one numerics contract and one forward op
+schema family; the backward is two kernels selected per-forward:
 
-| Backend | Role | Forward implementation |
+| Kernel | Role | Forward implementation |
 |---|---|---|
 | `optimized` | **Default** where available (CUDA sm_90+ with importable `triton.tools.tensor_descriptor`); the production fast path | Single pure-Triton (`@triton.jit`) persistent kernel: host-side TMA descriptors + `tl.dot` mainloop + fused max/argmax/ReLU/log1p epilogue; measured self-tuner; warp specialization as a tuned dimension |
 | `hybrid` | Compatibility path; must stay behaviorally stable | Compiled (TorchInductor) tiled matmul per vocab tile + Triton sequence-reduction kernel; materializes per-tile `[B, S, V_tile]` logits |
 | `naive` | `tl.dot` fused-forward debug baseline | Single Triton kernel with `tl.dot`, bounded autotune; a one-tile, no-TMA implementation that isolates fused semantics |
 
-All three forwards delegate backward to the same op (`fused_sparton_bwd_op`),
-which runs the **M13 split segmented backward** (§5). `optimized` was promoted
-to the default after the M10 gates (forward faster than hybrid on every
-measured shape, output-only memory, full correctness matrix green); promotion
-gates and evidence are in [DEVELOPMENT.md](DEVELOPMENT.md) M10. The optimized
-forward was **reimplemented in pure Triton post-M13**, replacing the original
-Gluon kernel and removing Gluon from the package entirely (§5.1; DEVELOPMENT.md
+The backward is selected per-forward: the optimized forward uses the
+**`optimized`** backward (`optimized_bwd_op`, op `sparton::optimized_bwd`) — the
+uniform + mixed hidden-grad design; the hybrid and naive forwards use the
+**`mono`** backward (`mono_bwd_op`, op `sparton::mono_bwd`) — the restored M2
+fully-atomic scatter, which is also the optimized↔mono A/B baseline (§5).
+`optimized` was promoted to the default after the M10 gates (forward faster
+than hybrid on every measured shape, output-only memory, full correctness
+matrix green); promotion gates and evidence are in
+[DEVELOPMENT.md](DEVELOPMENT.md) M10. The optimized forward was
+**reimplemented in pure Triton post-M13**, replacing the original Gluon kernel
+and removing Gluon from the package entirely (§5.1; DEVELOPMENT.md
 "Post-M13 — optimized promoted to a pure-Triton TMA forward").
 
 ### Module map (`src/sparton/`)
 
+The package is organized by **[direction, variant]**: a `forward/` package and
+a `backward/` package, with the facade/router beside them. The only
+cross-package edge is `forward/* → backward` (no cycle) — the backward kernels
+live in the neutral `backward/` package, not inside the hybrid forward module.
+
 ```text
 src/sparton/
   __init__.py                  # exports SpartonHead only when CUDA is available
-  sparton_kernel.py            # public facade/router: resolve_backend, SpartonHead,
-                               #   re-exports, lazy __getattr__ for optimized symbols
-  _backend_hybrid.py           # hybrid forward (compiled tiled matmul + Triton reduction)
-                               #   AND the shared backward used by all backends:
-                               #   the M13 split segmented backward
-                               #   (split_segmented_sparton_bwd, wired into
-                               #   sparton::fused_sparton_bwd) plus the retained M11
-                               #   segmented design behind legacy_fused_sparton_bwd
-  _backend_naive.py            # tl.dot fused-forward debug baseline, bounded autotune
-  _backend_optimized.py        # pure-Triton persistent fused forward (host-side TMA + tl.dot),
-                               #   self-contained measured tile self-tuner, WS as a tuned dimension
-                               #   (the default backend)
-  _backend_runtime.py          # is_optimized_backend_available(): CUDA + sm_90 capability +
+  api.py                       # public facade/router: resolve_kernel, SpartonHead,
+                               #   _default_kernel, re-exports, lazy __getattr__ for optimized symbols
+  forward/
+    __init__.py                # eager hybrid + naive; lazy optimized via __getattr__
+    _autograd.py               # shared forward autograd: shared_fwd_fake / shared_setup_context /
+                               #   shared_backward / register_shared_forward (registered per op)
+    hybrid.py                  # hybrid forward (compiled tiled matmul + Triton reduction):
+                               #   hybrid_fwd_op (op sparton::hybrid_fwd), hybrid_forward
+    naive.py                   # tl.dot fused-forward debug baseline:
+                               #   naive_fwd_op (op sparton::naive_fwd), naive_forward
+    optimized.py               # pure-Triton persistent fused forward (host-side TMA + tl.dot),
+                               #   self-contained measured tile self-tuner, WS as a tuned dimension;
+                               #   optimized_fwd_op (op sparton::optimized_fwd) — the default kernel
+  backward/
+    __init__.py                # two backward ops, identical schema, one register_fake each:
+                               #   optimized_bwd_op (op sparton::optimized_bwd),
+                               #   mono_bwd_op (op sparton::mono_bwd)
+    optimized.py               # the OPTIMIZED backward (used by the optimized forward): uniform +
+                               #   mixed hidden-grad kernels + optimized_bwd, plus the folded shared
+                               #   prep stages (_bwd_shared_stages + bwd_prep_kernel + exclusive-owner
+                               #   embed_grad_kernel + bwd_gather_payload_kernel)
+    mono.py                    # the MONO backward (used by hybrid/naive; the A/B baseline): the
+                               #   restored M2 fully-atomic scatter (mono_bwd_kernel + mono_bwd)
+  _runtime.py                  # is_optimized_kernel_available(): CUDA + sm_90 capability +
                                #   importable triton.tools.tensor_descriptor (the default-resolution gate)
-  _validation.py               # shared autocast canonicalization + input-contract validation
+  _device.py                   # resolves DEVICE (import-time DEBUG log); no longer public
+  _validation.py               # autocast canonicalization, prepare_forward_inputs (the shared
+                               #   autocast+validate+contiguous helper), validate_forward_inputs(kernel=...)
 ```
 
 Adjacent, **not** part of the installable package: `training/` is a Hugging
@@ -82,7 +104,7 @@ tooling.
 This section is the single authoritative copy of the platform facts the system
 was built and validated against. Treat them as version-sensitive: re-verify
 installed `torch`/`triton` versions and upstream docs before relying on stale
-notes, and re-validate the optimized backend on any GPU or Triton change.
+notes, and re-validate the optimized kernel on any GPU or Triton change.
 
 ### 2.1 Runtime snapshot (validation platform)
 
@@ -103,16 +125,16 @@ The dev environment is the NGC container image
 `hidden` activation for typical dev shapes (`4096 x 768` fp16 = 6 MiB), which
 matters for GEMM scheduling policy.
 
-### 2.2 Optimized backend availability (sm_90+ host-side TMA)
+### 2.2 Optimized kernel availability (sm_90+ host-side TMA)
 
 The optimized forward is built on **host-side TMA descriptors**
 (`triton.tools.tensor_descriptor.TensorDescriptor`) — a Hopper-class feature — so it is gated at
-CUDA capability **sm_90+**. `_backend_runtime.is_optimized_backend_available(device)` is the cheap
-check used by default-backend resolution: it returns `(False, reason)` if CUDA is unavailable, if
+CUDA capability **sm_90+**. `_runtime.is_optimized_kernel_available(device)` is the cheap
+check used by default-kernel resolution: it returns `(False, reason)` if CUDA is unavailable, if
 `torch.cuda.get_device_capability(device) < (9, 0)`, or if `triton.tools.tensor_descriptor` does
 not import; otherwise `(True, "sm_<major><minor>")`. It imports no kernel code.
 
-This is a deliberate narrowing from the removed Gluon optimized backend (which ran on sm_80+ via
+This is a deliberate narrowing from the removed Gluon optimized kernel (which ran on sm_80+ via
 `mma_v2`): host-side TMA does not exist below Hopper. On an sm_80 (Ampere) device default
 resolution falls back to `hybrid` with a one-time `RuntimeWarning`; an explicitly selected
 `optimized` still raises with the reason. The validation GPU is sm_120 (Blackwell), where the gate
@@ -195,8 +217,8 @@ concurrently when comparing results; serialize for attributable timings.
 ### 2.6 Packaging floors
 
 - Declared `torch>=2.7.1`, `triton>=3.3.1`, Python `>=3.10`.
-- The declared `triton>=3.3.1` floor is the **hybrid backend's** floor. The
-  `optimized` backend additionally requires CUDA **sm_90+** and an importable
+- The declared `triton>=3.3.1` floor is the **hybrid kernel's** floor. The
+  `optimized` kernel additionally requires CUDA **sm_90+** and an importable
   `triton.tools.tensor_descriptor` (host-side TMA; §2.2); the validated Triton is
   3.7.1. Where those are missing, default resolution falls back to `hybrid` and an
   explicitly selected `optimized` raises with the reason (§2.2).
@@ -241,7 +263,7 @@ The baseline `0` is intentional: the downstream activation is ReLU then
 `log1p`, so if all valid logits are negative the score is zero and the index is
 not semantically meaningful. Tie-breaking uses a **strict `>`** update,
 matching the kernel: a position updates running state only if its value
-strictly exceeds the current running value, so within a backend ties resolve to
+strictly exceeds the current running value, so within a kernel ties resolve to
 the lowest sequence index.
 
 Backward, from the saved score and index:
@@ -257,13 +279,13 @@ d_hidden[b, idx, d]    += g[b, v] * embed[v, d]     (idx = indices[b, v])
 ### 3.2 Index contract of record (tie-aware)
 
 The returned index for a vocabulary entry is **meaningful only where its score
-is greater than zero** (zero-baseline policy). Within one backend, ties resolve
+is greater than zero** (zero-baseline policy). Within one kernel, ties resolve
 to the lowest sequence index.
 
-**Across backends with different accumulation precision, the winner at a
+**Across kernels with different accumulation precision, the winner at a
 near-tie is explicitly unspecified.** `naive`/`optimized` accumulate logits in
 fp32; `hybrid` produces input-dtype logits. So at near-ties (logit gaps within
-input-dtype rounding) different backends may legitimately return different
+input-dtype rounding) different kernels may legitimately return different
 winners — every observed mismatch's chosen logit was within one fp16 ULP of the
 reference max (fp16) or exactly equal in reference precision (bf16); hybrid
 matches the input-dtype reference bit-for-bit.
@@ -299,7 +321,7 @@ scan would need a device sync.
 - Forward output follows the hidden/logit dtype. `naive`/`optimized` accumulate
   logits in **fp32** and apply bias/mask/max/log1p in fp32 before casting the
   stored score — *more* precise than hybrid's input-dtype logits, and the
-  intended behavior for all future backends. Cross-backend score agreement is
+  intended behavior for all future kernels. Cross-kernel score agreement is
   within tolerance (fp16 2e-3, bf16 5e-2).
 - Backward gradient buffers (`hidden_grad`, `embed_grad`, `bias_grad`) are
   accumulated in **float32**. `hidden_grad` is zero-filled (atomic
@@ -313,27 +335,33 @@ scan would need a device sync.
 
 ### 3.5 Supported dtypes
 
-| Backend | Supported `hidden`/`embed`/`bias` dtype |
+| Kernel | Supported `hidden`/`embed`/`bias` dtype |
 |---|---|
 | `optimized` | fp16, bf16 (descriptor `element_bitwidth=16`; also requires `D * element_size % 16 == 0` for TMA) |
 | `naive` | fp16, bf16 |
-| `hybrid` | fp16, bf16, fp32 (fp32 is permitted legacy, not benchmark-covered) |
+| `hybrid` | fp16, bf16, fp32 (fp32 is a permitted compatibility path, not benchmark-covered) |
 
 ### 3.6 Custom op schemas and autograd saved-tensor set
 
-Op names and schemas are the stable layer. The hybrid op names
-(`sparton::fused_sparton_fwd`/`fused_sparton_bwd`) stay bound to their
-implementation forever (compat with anything that captured them); each backend
-registers its own forward op so schemas may diverge without touching hybrid.
-All three forwards register autograd that calls the single backward op
-`fused_sparton_bwd_op`.
+Op names and schemas are the stable layer. Each kernel registers its own
+forward op (so schemas may diverge without touching the others), and each
+forward registers autograd that calls the backward op matching its kernel: the
+optimized forward → `optimized_bwd_op` (op `sparton::optimized_bwd`); the hybrid
+and naive forwards → `mono_bwd_op` (op `sparton::mono_bwd`). The two backward ops
+share one saved-tensor schema (one `register_fake` each). The current op names —
+`sparton::hybrid_fwd`, `sparton::naive_fwd`, `sparton::optimized_fwd`,
+`sparton::optimized_bwd`, and `sparton::mono_bwd` — are the stable layer; the
+`hybrid_fwd` name replaced the earlier `fused_sparton_fwd` name in the post-M13
+reorganization (a one-time breaking rename; see CHANGELOG 2026-06-25).
 
 ```text
-sparton::fused_sparton_fwd (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # hybrid
-sparton::fused_sparton_bwd (Tensor grad_out, Tensor max_scores, Tensor max_idx, Tensor hidden,
-                            Tensor embed, Tensor? bias, Tensor mask)               -> (Tensor, Tensor, Tensor?)
-sparton::naive_fwd         (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # naive
-sparton::optimized_fwd     (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # optimized
+sparton::hybrid_fwd    (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # hybrid
+sparton::naive_fwd     (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # naive
+sparton::optimized_fwd (Tensor hidden, Tensor embed, Tensor? bias, Tensor mask) -> (Tensor, Tensor)   # optimized
+sparton::optimized_bwd (Tensor grad_out, Tensor max_scores, Tensor max_idx, Tensor hidden,
+                        Tensor embed, Tensor? bias, Tensor mask)               -> (Tensor, Tensor, Tensor?)
+sparton::mono_bwd      (Tensor grad_out, Tensor max_scores, Tensor max_idx, Tensor hidden,
+                        Tensor embed, Tensor? bias, Tensor mask)               -> (Tensor, Tensor, Tensor?)  # identical schema
 ```
 
 **Autograd saves**: max scores, max indices, hidden states, decoder weights,
@@ -347,24 +375,27 @@ requires a new op name.
 
 ### 4.1 The layering of record
 
-`SpartonHead.forward` resolves a backend **once at construction** (the instance
-binds the per-backend wrapper; the env var `SPARTON_BACKEND` is read once at
+`SpartonHead.forward` resolves a kernel **once at construction** (the instance
+binds the per-kernel wrapper; the env var `SPARTON_KERNEL` is read once at
 import, never per call) and `forward` just calls the bound wrapper:
 
 ```text
 SpartonHead.forward
-  └─ <backend>_forward(hidden, embed, bias, mask)      # public per-backend wrapper
-       ├─ _validation.autocast_canonicalize(...)       # mirrors torch.autocast: casts fp32
-       │                                                #   master params to the autocast dtype
-       ├─ _validation.validate_forward_inputs(...)      # shared contract checks; raises named errors
-       ├─ .contiguous() canonicalization (all inputs)
-       └─ sparton::<backend>_fwd custom op              # stable schema; assumes validated, contiguous inputs
-            └─ kernel launch (+ autograd that saves the op's inputs;
-               backward → fused_sparton_bwd_op)
+  └─ <kernel>_forward(hidden, embed, bias, mask)       # public per-kernel wrapper
+       └─ _validation.prepare_forward_inputs(..., kernel=<kernel>)   # the one shared helper:
+            ├─ autocast_canonicalize(...)              # mirrors torch.autocast: casts fp32
+            │                                          #   master params to the autocast dtype
+            ├─ validate_forward_inputs(..., kernel=<kernel>)  # contract checks; raises named errors
+            └─ .contiguous() canonicalization (all inputs)
+       └─ sparton::<kernel>_fwd custom op              # stable schema; assumes validated, contiguous inputs
+            └─ kernel launch (+ autograd that saves the op's inputs; backward →
+               optimized_bwd_op for optimized, mono_bwd_op for hybrid/naive)
 ```
 
 Wrappers (`hybrid_forward`, `naive_forward`, `optimized_forward`) are the only
-public callables; `SpartonHead` binds wrappers, never raw ops. The ops assume
+public callables; `SpartonHead` binds wrappers, never raw ops. All three
+wrappers run the same `prepare_forward_inputs` seam (de-duplicated from the
+formerly line-for-line-parallel wrapper bodies). The ops assume
 validated, contiguous inputs — **raw-op callers (e.g. profiling targets) bypass
 validation by design**; do not "fix" that by validating inside the ops.
 
@@ -372,47 +403,53 @@ validation by design**; do not "fix" that by validating inside the ops.
 under an active CUDA autocast region it casts `hidden`/`embed`/`bias` to the
 autocast dtype (fp16/bf16) the way `torch.matmul` would, and leaves everything
 unchanged outside autocast (`mask` is never cast). This is what makes standard
-AMP training with fp32 master parameters work on every backend.
+AMP training with fp32 master parameters work on every kernel.
 
-### 4.2 Cross-backend rules
+### 4.2 Cross-kernel rules
 
 - **Symmetry rule.** The Nth implementation of a pattern mirrors the others
   byte-for-byte where semantics allow. The three forward wrappers are
-  intentionally line-for-line parallel; the historical hybrid no-contiguity bug
-  existed precisely because hybrid lacked the wrapper the others had.
-- **One-seam changes.** New cross-backend behavior is one shared helper called
-  at exactly one layer (`autocast_canonicalize` at the top of each wrapper; the
-  shared backward under all three forwards), never N divergent copies.
-- **Backend isolation.** Backends never import each other except that the
-  naive/optimized backends import the shared backward op from
-  `_backend_hybrid`. `_backend_runtime` (the availability gate) imports no kernel
-  code and stays importable on any machine.
+  intentionally parallel — now over the shared `prepare_forward_inputs` seam;
+  the historical hybrid no-contiguity bug existed precisely because hybrid
+  lacked the canonicalization the others had.
+- **One-seam changes.** New cross-kernel behavior is one shared helper called
+  at exactly one layer (`prepare_forward_inputs` at the top of each wrapper;
+  `_bwd_shared_stages` shared by the optimized backward's two hidden-grad
+  passes), never N divergent copies.
+- **Kernel isolation.** Forward kernels never import each other; the only
+  cross-package edge is `forward/* → backward` (each forward imports its backward
+  op — optimized → `optimized_bwd_op`, hybrid/naive → `mono_bwd_op` — from
+  `backward`). `_runtime` (the availability gate) imports no kernel code and
+  stays importable on any machine.
 - **No silent fallbacks.** The single sanctioned exception is *default
-  resolution*: with no `backend` argument and no `SPARTON_BACKEND`, an
-  unavailable optimized backend falls back to hybrid with a one-time
-  `RuntimeWarning` (M10). An explicitly selected backend that is unavailable
+  resolution*: with no `kernel` argument and no `SPARTON_KERNEL`, an
+  unavailable optimized kernel falls back to hybrid with a one-time
+  `RuntimeWarning` (M10). An explicitly selected kernel that is unavailable
   **raises with the reason**. No second exception may be added — data-dependent
   algorithm dispatch inside an op would also need a host sync, which is why the
   backward ships fixed kernel families (§5.4).
 - **No data-dependent algorithm dispatch inside an op.** It would need a host
-  sync and a second fallback seam. The backward launches its kernels
-  unconditionally with complementary device-side predicates — no dispatch.
+  sync and a second fallback seam. The optimized backward launches its uniform +
+  mixed kernels unconditionally with complementary device-side predicates — no
+  dispatch. (Kernel selection happens once at forward construction, not per call.)
 - **Backward swap is schema-safe.** A backward change that keeps the
-  saved-tensor set swaps inside `sparton::fused_sparton_bwd` without touching
-  forward op schemas or autograd wiring (proven by M11→M13). A changed
-  saved-tensor set requires a new op name.
+  saved-tensor set swaps inside a backward op (`sparton::optimized_bwd` /
+  `sparton::mono_bwd`) without touching forward op schemas or autograd wiring
+  (proven by M11→M13). A changed saved-tensor set requires a new op name.
 - **Diagnostics** go through `logging.getLogger("sparton")` at DEBUG; library
   code never `print`s (a regression test enforces silent import).
 
 ### 4.3 Retained-reference and decision rules in force
 
-- **`legacy_fused_sparton_bwd` is the test-pinned A/B reference of record** —
-  the M11 segmented design, retained with a role comment naming its removal
-  condition (it stays until a later milestone supersedes the comparison
-  evidence). Retired implementations are either deleted or promoted to an
-  explicit, test-pinned reference; never silent dead code, and never two legacy
-  copies (when M13 promoted the split, the baton passed: the segmented design
-  became the reference and the M2-era kernel was deleted in the same change).
+- **The `mono` backward is the test-pinned original-vs-optimized A/B baseline** —
+  the restored M2 fully-atomic scatter (in `backward/mono.py`). Unlike a pure
+  reference, it is also a **production** backward: the hybrid and naive forwards
+  use it, so `kernel=hybrid`/`naive` runs the original-ish path end-to-end while
+  `kernel=optimized` runs the current best — a clean A/B with one switch. Retired
+  implementations are either deleted or promoted to an explicit, test-pinned
+  reference; never silent dead code, and never two retained references (when the
+  backward was reduced to `{mono, optimized}`, the M11 segmented design was
+  deleted and the M2 atomic kernel restored as `mono`).
 
 ---
 
@@ -480,18 +517,19 @@ Mechanism details that hold:
   The offline pick was provably non-optimal (the measured winner for some shapes is the
   128-family tile — a ~14% lever the autotuner captures).
 - **Numerics.** fp32 `tl.dot` accumulation; outputs in hidden dtype; indices int32
-  internally, int64 stored. Op schema / saved-tensor set / shared backward identical
-  to the other backends.
+  internally, int64 stored. Forward op schema / saved-tensor set identical to the
+  other kernels; the optimized forward's backward is the `optimized` backward
+  (§5.4), which shares its saved-tensor schema with `mono` (§5.5).
 
 History: this kernel replaced a Gluon (TMA + `mma_v2`, mbarrier-staged, 11-policy
 autotune-bank) optimized forward post-M13; the Gluon path and the intermediate
-`experiment` backends were removed. The convergent arc, the WS blocker/fix, the
+`experiment` kernels were removed. The convergent arc, the WS blocker/fix, the
 `do_bench` measurement caveat, and the re-baseline are in DEVELOPMENT.md "Post-M13 —
 optimized promoted to a pure-Triton TMA forward".
 
 ### 5.2 Naive forward (debug baseline)
 
-One Triton kernel, `sparton_naive_forward_kernel`: a program owns a
+One Triton kernel, `naive_forward_kernel`: a program owns a
 `batch_block × vocab_block` tile, loops over sequence chunks and over K chunks
 with `tl.dot` (fp32 accumulate), applies bias and mask, runs online max/argmax
 with the same zero-baseline strict-`>` semantics and tail handling, and stores
@@ -504,18 +542,19 @@ kernel — expected to be slower than hybrid on GEMM-dominated shapes.
 
 The compatibility path: a compiled (TorchInductor) tiled matmul/matmul-bias per
 vocab tile (`v_tile_from_bs` chooses the tile count), then the Triton reduction
-kernel `reduce_seq_max_log1p_relu_kernel_with_indices` for masking, sequence
-max/argmax, ReLU, and `log1p`. It materializes per-tile `[B, S, V_tile]` logits
-(not the full `[B, S, V]`). Two reduction helpers exist — one returns max
-values plus indices (for autograd), one returns only values (skips the `[B, V]`
-int64 buffer in inference paths); their memory trade-off is intentional. The
-hybrid path must stay behaviorally stable.
+kernel `reduce_seq_max_log1p_relu_kernel` (host helper
+`reduce_seq_max_log1p_relu`) for masking, sequence max/argmax, ReLU, and
+`log1p`. It materializes per-tile `[B, S, V_tile]` logits (not the full
+`[B, S, V]`). The reduction helper returns max values **plus** indices (the
+path autograd needs); the earlier values-only reduction variant was deleted as
+dead code (zero callers). The hybrid path must stay behaviorally stable.
 
-### 5.4 Backward — the M13 split segmented backward (shared by all backends)
+### 5.4 The optimized backward (selected by the optimized forward)
 
-`fused_sparton_bwd_op` → `split_segmented_sparton_bwd`. It accumulates
-`hidden_grad`, `embed_grad`, `bias_grad` in fp32 from the saved `(scores, idx,
-hidden, embed, bias)`. Stages:
+`optimized_bwd_op` (op `sparton::optimized_bwd`) → `optimized_bwd`
+(`backward/optimized.py`); the uniform + mixed hidden-grad design promoted at M13
+(then named `split`). It accumulates `hidden_grad`, `embed_grad`, `bias_grad` in
+fp32 from the saved `(scores, idx, hidden, embed, bias)`. Stages:
 
 1. **Prep** (`bwd_prep_kernel`): compute `g = grad_out * exp(-scores)` where
    `scores > 0`, build the flat payload `(g, idx32, keys = b·S + idx)`, and a
@@ -527,8 +566,8 @@ hidden, embed, bias)`. Stages:
    rows are contiguous and all active entries precede all sentinels, then
    `bwd_gather_payload_kernel` reorders the gradient/index payload by the sort
    permutation into the sorted streams (`g_sorted`, `v_sorted`) the hidden-grad
-   passes consume. (Stages 1–3 are the shared `_bwd_shared_stages` helper, also
-   used by the legacy path in §5.5.)
+   passes consume. (Stages 1–3 are the `_bwd_shared_stages` helper, folded into
+   `backward/optimized.py` alongside the two hidden-grad passes.)
 4. **Two complementary hidden-grad passes** at one shared CHUNK granularity:
    - a **vectorized uniform-chunk streaming pass**
      (`uniform_hidden_grad_kernel`): branch-free, pipelined; deposits exactly
@@ -565,14 +604,27 @@ host assert. CHUNK is pinned to 64 because the mixed fraction scales with the
 shared granule (`m ~ runs·CHUNK/N`), so a larger uniform-side CHUNK would
 silently multiply the mixed pass's work.
 
-### 5.5 Retained reference: `legacy_fused_sparton_bwd` (M11 segmented)
+### 5.5 The `mono` backward (restored M2 fully-atomic scatter)
 
-The M11 segmented backward (`segmented_sparton_bwd`: prep + exclusive-owner
-embed/bias kernel + `torch.sort` + payload gather + a single segmented
-hidden-grad scan kernel) is retained, reachable only through
-`legacy_fused_sparton_bwd`, as the test-pinned A/B reference of record (§4.3).
-It is the design the split supersedes and the baseline its speedups are quoted
-against.
+`mono_bwd_op` (op `sparton::mono_bwd`) → `mono_bwd` (`backward/mono.py`), the M2-era
+fully-atomic backward restored verbatim from commit `6e19af3`. One kernel
+(`mono_bwd_kernel`): it loads the saved argmax index, computes
+`g = grad_out · exp(−scores)` where `scores > 0` (the **same exact gradient** as
+§5.4), and `atomic_add`s the hidden/embed/bias contributions into
+**zero-initialized** fp32 buffers (`torch.zeros`, not `torch.empty` — every active
+gradient is atomically accumulated and only argmax-winner rows are touched, so
+untouched rows must read 0). A CTA-level `tl.sum(block_max_logits) == 0` early-exit
+skips fully-inactive blocks. It is an unoptimized full scatter — non-deterministic
+in every buffer and slow by design.
+
+It is **production** for the hybrid and naive forwards (which register
+`mono_bwd_op`), and simultaneously the **original-vs-optimized A/B baseline**
+(§4.3): the §5.4 optimized backward's speedups are quoted against it. On
+captured-real records the optimized backward is ~2–3.7× faster (mono ≈ 0.27–0.48×
+of optimized), gradients matching to ~1e-6; on the synthetic `f = 0.10` short-run
+regime the two are near-parity (mono's zero-block early-exit). The M11 segmented
+design that the optimized backward grew from was removed in the same change that
+restored `mono`.
 
 ---
 
@@ -617,32 +669,34 @@ masks; B∈{4,8,16}, S∈{256,512,768}):
   implied backward **1.430–3.522 ms** (dev 0.982 ms).
 - Derived backward share (re-derived on one provenance at M12): **18.5–52.3%**
   of optimized fwd+bwd across the grid, **54.9%** on the dev shape.
-- Captured-real records (V=250002): backward **3.3–4.4 ms** post-M11;
-  M13 split takes the captured-real cells to **1.46–1.60×** vs the M11
-  segmented design (steps150 docs 1.568–1.596×); every canonical grid row is
+- Captured-real records (V=250002): backward **3.3–4.4 ms** post-M11; at M13 the
+  optimized backward (then `split`) took the captured-real cells to **1.46–1.60×**
+  vs the since-removed M11 segmented design (steps150 docs 1.568–1.596×); every canonical grid row is
   within band or improved.
 
 ### 6.3 Host launch overhead
 
 The Gluon optimized forward carried **~0.119 ms/call** wall-minus-GPU host overhead
 at `8×128×768×1280`, of which **~0.051 ms** was rebuilding a 22-descriptor bank every
-call — the motivation for "launcher v2" (§6.7). The pure-Triton optimized backend that
+call — the motivation for "launcher v2" (§6.7). The pure-Triton optimized kernel that
 replaced it builds **one** descriptor pair per call (no bank, no `POLICY_ID` if-chain),
 so that specific bank-rebuild cost is gone; its steady-state host overhead on the new
-backend is unremeasured but bounded below the Gluon figure. Irrelevant at ≥1 ms GPU
+kernel is unremeasured but bounded below the Gluon figure. Irrelevant at ≥1 ms GPU
 times — which is every documented workload; it would bind only for a small-shape
 latency-critical caller of the head itself, which nothing in the repo exercises (the
 deferred F9 overhead, §6.7).
 
 ### 6.4 Determinism band
 
-`embed_grad`/`bias_grad` are structurally deterministic (exclusive-owner plain
-stores). `hidden_grad` atomic-accumulation order still varies, but with ~60×
-fewer atomics than the pre-M11 kernel. Per-call relative spread: gradient-norm
-≤ 1.2e-7, element-sensitive loss-proxy ≤ 4.2e-6 (the M13 split preserves the
-M11 atomic structure and band). At **training scale** the chaotic early regime
+For the **`optimized`** backward, `embed_grad`/`bias_grad` are structurally
+deterministic (exclusive-owner plain stores) and `hidden_grad` atomic-accumulation
+order still varies, but with ~60× fewer atomics than the pre-M11 kernel. Per-call
+relative spread: gradient-norm ≤ 1.2e-7, element-sensitive loss-proxy ≤ 4.2e-6
+(the uniform + mixed passes preserve the M11 atomic structure and band). The
+**`mono`** backward `atomic_add`s all three gradients, so none of its buffers is
+deterministic (expected for the unoptimized baseline). At **training scale** the chaotic early regime
 amplifies this to a measured same-config 150-step loss spread of **16–38%**
-depending on backend and statistic (3 seed-matched repeats per backend; this
+depending on kernel and statistic (3 seed-matched repeats per kernel; this
 supersedes the M10-era "~20%" estimate). Establish same-config noise bands
 before reading meaning into cross-config training differences; do not promise
 bitwise-reproducible training.
@@ -662,7 +716,7 @@ rows at 10.16–10.51%, inside the noise band) but the second clause failed
 (tensor pipe ~18 points above the 74% binder threshold). **Terminal forward
 residual: per-cycle pipe efficiency + L2 pressure at the autotuned 64×64×32 tile
 shape — a tile-shape question, not a scheduling one.** (That M12 profile was of the
-Gluon optimized; the pure-Triton backend that replaced it re-baselines to **≈parity**
+Gluon optimized; the pure-Triton kernel that replaced it re-baselines to **≈parity**
 at this large/throughput shape — consistent with the dual-saturation finding, where
 beating a saturated forward needs *doing less work* — and **wins** the small/serving
 (≈0.68×) and small-V (≈0.65×) regimes via its measured tile + tuned warp
@@ -671,9 +725,10 @@ DEVELOPMENT.md "Post-M13 …".)
 
 ### 6.6 Backward residual (M13)
 
-The M13 split recovered the residual the M11 design left (the embed-kernel
-attribution was corrected — its binder is hidden-row gather re-reads, already at
-the traffic floor, not g/idx streams). Validated traffic model: per-buffer
+The optimized backward (promoted at M13, then `split`) recovered the residual the
+M11 design left (the embed-kernel attribution was corrected — its binder is
+hidden-row gather re-reads, already at the traffic floor, not g/idx streams).
+Validated traffic model: per-buffer
 residuals ≤1% on the decision counters across four shapes; the uniform pass
 attains its floor (production profile 1.43 ms at 56 regs / 73.5% occupancy on
 the doc record vs the 1.34 ms modeled conservative floor). **Terminal backward
@@ -686,7 +741,7 @@ dev / 51.7× corner / 264× real query record vs pre-M11).
 
 The launcher-v2 *core* — building **one** descriptor pair per call instead of a
 22-slot bank, with no `POLICY_ID` if-chain — **shipped** with the pure-Triton
-`optimized` backend (post-M13). So the §6.3 descriptor-bank rebuild cost (~0.051 ms)
+`optimized` kernel (post-M13). So the §6.3 descriptor-bank rebuild cost (~0.051 ms)
 is gone from the default path, and the tile comes from a measured self-tuner cache.
 
 What remains deferred (by maintainer decision) is any further trimming of the
@@ -697,13 +752,13 @@ What remains deferred (by maintainer decision) is any further trimming of the
    ≥1 ms GPU times where host launch work overlaps it; the per-call host cost binds
    only for a small-shape latency-critical caller of the head itself, which nothing
    in the repo exercises.
-2. **The residual is small and unprototyped on the new backend** — its steady-state
+2. **The residual is small and unprototyped on the new kernel** — its steady-state
    host overhead has not been re-measured, and trimming the shared machinery below
    ~0.013 ms/call has no built prototype.
 
 **Revival triggers:** a real latency/small-shape user appears, or a future
 forward-kernel rewrite forces the kernel signature open anyway. **On revival:**
-re-measure the actual host floor of the pure-Triton backend before committing to a
+re-measure the actual host floor of the pure-Triton kernel before committing to a
 target; keep full suite + shape soak parity and grid/dev rows within ±5%.
 
 ### 6.8 Out of scope (hardware/scope)
@@ -746,7 +801,7 @@ live in [../AGENTS.md](../AGENTS.md) "Validation" — do not duplicate it.
   score-gradients in early steps — skipped calibration steps are expected, not
   a bug.
 - **Backward-kernel changes:** `scripts/bench_backward.py --impls
-  current,legacy` over {uniform, zipf} **and** the captured-real bundles in
+  split,segmented` over {uniform, zipf} **and** the captured-real bundles in
   `tests/data/bundles/` (regenerable by `scripts/capture_index_distributions.py`,
   which reuses existing files). The harness numerically verifies every cell
   against production before timing it. **Uniform-only evidence is never
@@ -761,7 +816,7 @@ live in [../AGENTS.md](../AGENTS.md) "Validation" — do not duplicate it.
   claim (§3.4).
 - **Validation error templates are part of the API.** Each `_validation.py` rule
   has a `pytest.raises(..., match=...)` test pinning a stable message substring;
-  the template shape is `sparton {backend} forward: ...`.
+  the template shape is `sparton {kernel} forward: ...`.
 - **Training behavior:** prefer the synthetic smoke probe; full Hub-backed
   `training/train.py` runs are expensive and not casual validation (a
   steady-state 150-step tier-2 run is ~25 s on this host after the cold first

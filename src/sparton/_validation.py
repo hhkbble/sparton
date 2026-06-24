@@ -17,7 +17,7 @@ Contract notes:
   below); rejecting non-binary values would need a data scan and a device
   sync.
 - Empty tensors (``B``, ``S``, or ``V`` equal to 0) are not validated here and
-  backend behavior for them is unspecified.
+  kernel behavior for them is unspecified.
 - The custom ops themselves assume validated, contiguous ("canonical")
   inputs; callers that invoke the raw ops bypass these checks by design.
 
@@ -31,9 +31,9 @@ from typing import Optional
 
 import torch
 
-_FUSED_DTYPES = (torch.float16, torch.bfloat16)
-# fp32 hybrid is permitted legacy behavior: it works through the compiled
-# matmul + Triton reduction path but is not benchmark-covered.
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+# fp32 is a retained compatibility path for the hybrid kernel: it works through
+# the compiled matmul + Triton reduction path but is not benchmark-covered.
 _HYBRID_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -43,11 +43,11 @@ def validate_forward_inputs(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
     *,
-    backend: str,
+    kernel: str,
 ) -> None:
     """Raise ValueError/TypeError naming the argument, value, and requirement."""
 
-    prefix = f"sparton {backend} forward:"
+    prefix = f"sparton {kernel} forward:"
 
     if hidden.ndim != 3:
         raise ValueError(
@@ -91,7 +91,7 @@ def validate_forward_inputs(
                 f"({hidden.device}); got {tensor.device}"
             )
 
-    supported = _HYBRID_DTYPES if backend == "hybrid" else _FUSED_DTYPES
+    supported = _HYBRID_DTYPES if kernel == "hybrid" else _HALF_DTYPES
     if hidden.dtype not in supported:
         names = ", ".join(str(dtype) for dtype in supported)
         raise TypeError(
@@ -113,7 +113,7 @@ def validate_forward_inputs(
             f"got {mask.dtype}"
         )
 
-    if backend == "optimized":
+    if kernel == "optimized":
         row_bytes = dim * hidden.element_size()
         if row_bytes % 16 != 0:
             raise ValueError(
@@ -157,4 +157,31 @@ def autocast_canonicalize(
     return _cast(hidden), _cast(embed), _cast(bias)
 
 
-__all__ = ["autocast_canonicalize", "validate_forward_inputs"]
+def prepare_forward_inputs(
+    hidden: torch.Tensor,
+    embed: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    mask: torch.Tensor,
+    *,
+    kernel: str,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Shared forward input canonicalization: autocast -> validate -> contiguous.
+
+    The single expression of the wrapper layering rule (wrapper ->
+    ``autocast_canonicalize`` -> ``validate_forward_inputs`` -> ``.contiguous()``
+    -> op) that all three forward wrappers share. ``kernel`` selects the
+    per-kernel validation branch (hybrid additionally accepts fp32; optimized
+    adds the TMA 16-byte alignment check) and labels the error messages.
+    """
+
+    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
+    validate_forward_inputs(hidden, embed, bias, mask, kernel=kernel)
+    hidden = hidden.contiguous()
+    embed = embed.contiguous()
+    mask = mask.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    return hidden, embed, bias, mask
+
+
+__all__ = ["autocast_canonicalize", "prepare_forward_inputs", "validate_forward_inputs"]

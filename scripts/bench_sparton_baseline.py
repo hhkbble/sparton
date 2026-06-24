@@ -1,4 +1,4 @@
-"""Merged Sparton backend baseline on a fixed B/S grid.
+"""Merged Sparton kernel baseline on a fixed B/S grid.
 
 Defaults model the projection-head dimensions of naver/splade-code-06B:
   - hidden size 1024
@@ -8,7 +8,7 @@ Defaults model the projection-head dimensions of naver/splade-code-06B:
 The benchmark runs one row per (B, S) pair with all-ones attention masks by
 default; ``--mask-density p`` switches to seeded Bernoulli(p) masks (M12-T4
 sweep dimension — density 1.0 is byte-identical to the all-ones default and
-leaves every other input draw untouched). The naive backend uses production
+leaves every other input draw untouched). The naive kernel uses production
 Triton autotune; pass ``--optimized-policy on`` to include the pure-Triton
 ``optimized`` forward (persistent grid + measured self-tuner), which honors the
 ``SPARTON_OPTIMIZED_*`` env knobs that select its kernel variant.
@@ -340,7 +340,7 @@ def parse_args(argv: Sequence[str] | None = None):
         default="random",
         help="random: Bernoulli(--mask-density) scatter (density-independence diagnostic). "
         "contiguous: variable-length right-padding (the realistic serving workload that "
-        "triggers the experiment backend's SPARTON_OPTIMIZED_SKIP_MASKED early exit).",
+        "triggers the experiment kernel's SPARTON_OPTIMIZED_SKIP_MASKED early exit).",
     )
     parser.add_argument(
         "--min-len-frac",
@@ -371,17 +371,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("default bf16 benchmark requires CUDA BF16 support; pass --dtype fp16")
     if args.optimized_policy == "on":
-        from sparton._backend_runtime import is_optimized_backend_available
+        from sparton._runtime import is_optimized_kernel_available
 
-        available, reason = is_optimized_backend_available()
+        available, reason = is_optimized_kernel_available()
         if not available:
             raise RuntimeError(
                 "bench_sparton_baseline.py --optimized-policy on requires the "
-                "optimized backend (CUDA sm_90+ and importable "
+                "optimized kernel (CUDA sm_90+ and importable "
                 f"triton.tools.tensor_descriptor): {reason}"
             )
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     shapes = build_shape_grid(args.batch_sizes, args.seq_lens)
     print(

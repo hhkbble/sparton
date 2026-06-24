@@ -2,7 +2,7 @@
 
 Standing documentation of the deferred-F9 launch overhead (ARCHITECTURE.md §6.7) and
 the baseline any future latency user would revive launcher v2 against. Per
-(shape, backend) it reports
+(shape, kernel) it reports
 
   gpu ms    ``triton.testing.do_bench`` (the GPU latency of record), and
   wall ms   an N-call wall-clock loop timed with ``time.perf_counter`` and
@@ -24,7 +24,7 @@ Measures the public wrappers (``hybrid_forward``/``naive_forward``/
 ``optimized_forward``): F9 is about the production call path — validation,
 canonicalization, and descriptor plumbing included. Record, don't threshold
 (v4 M12-T4): the script gates nothing and exits 0 after printing its table;
-failures to *run* a requested backend still raise.
+failures to *run* a requested kernel still raise.
 
 Needs PYTHONPATH handling via its own bootstrap and the hardened env prefix;
 see scripts/README.md.
@@ -47,7 +47,7 @@ if str(SRC) not in sys.path:
 
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
-BACKENDS = ("hybrid", "naive", "optimized")
+KERNELS = ("hybrid", "naive", "optimized")
 DEFAULT_SHAPES = "8x128x768x1280,32x128x768x30522"
 
 
@@ -77,14 +77,14 @@ def parse_shape_list(value: str) -> tuple[tuple[int, int, int, int], ...]:
     return tuple(shapes)
 
 
-def parse_backend_list(value: str) -> tuple[str, ...]:
+def parse_kernel_list(value: str) -> tuple[str, ...]:
     items = tuple(part.strip() for part in value.split(",") if part.strip())
     if not items:
-        raise argparse.ArgumentTypeError("expected a comma-separated list of backends")
+        raise argparse.ArgumentTypeError("expected a comma-separated list of kernels")
     for item in items:
-        if item not in BACKENDS:
+        if item not in KERNELS:
             raise argparse.ArgumentTypeError(
-                f"unknown backend '{item}' (choose from {', '.join(BACKENDS)})"
+                f"unknown kernel '{item}' (choose from {', '.join(KERNELS)})"
             )
     return items
 
@@ -97,7 +97,7 @@ def main() -> int:
                         "anchor plus the dev shape)")
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
     parser.add_argument("--bias", choices=("on", "off"), default="on")
-    parser.add_argument("--backends", type=parse_backend_list, default=BACKENDS)
+    parser.add_argument("--kernels", type=parse_kernel_list, default=KERNELS)
     parser.add_argument("--calls", type=int, default=300,
                         help="wall-clock loop length (one trailing sync)")
     parser.add_argument("--warmup", type=int, default=4)
@@ -107,18 +107,18 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("bench_host_overhead.py requires CUDA")
-    if "optimized" in args.backends:
-        from sparton._backend_runtime import is_optimized_backend_available
+    if "optimized" in args.kernels:
+        from sparton._runtime import is_optimized_kernel_available
 
-        available, reason = is_optimized_backend_available()
+        available, reason = is_optimized_kernel_available()
         if not available:
             raise RuntimeError(
-                "bench_host_overhead.py with the optimized backend requires the "
-                "optimized backend (CUDA sm_90+ and importable "
+                "bench_host_overhead.py with the optimized kernel requires the "
+                "optimized kernel (CUDA sm_90+ and importable "
                 f"triton.tools.tensor_descriptor): {reason}"
             )
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
     from bench_sparton_baseline import ShapeSpec, bench_ms, make_inputs
 
     wrappers = {
@@ -139,8 +139,8 @@ def main() -> int:
         )
         if args.bias == "off":
             bias = None
-        for backend in args.backends:
-            wrapper = wrappers[backend]
+        for kernel in args.kernels:
+            wrapper = wrappers[kernel]
 
             def fwd_call():
                 return wrapper(hidden, embed, bias, mask)
@@ -160,7 +160,7 @@ def main() -> int:
             wall_ms = (t1 - t0) / args.calls * 1e3
 
             rows.append({
-                "backend": backend,
+                "kernel": kernel,
                 "B": batch_size,
                 "S": seq_len,
                 "D": dim,
@@ -177,16 +177,16 @@ def main() -> int:
         f"warmup/rep={args.warmup}/{args.rep} (wall has one trailing sync)"
     )
     print()
-    print("| backend | B | S | D | V | wall ms | gpu ms | host ms |")
+    print("| kernel | B | S | D | V | wall ms | gpu ms | host ms |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in rows:
         print(
-            f"| {row['backend']} | {row['B']} | {row['S']} | {row['D']} | {row['V']} "
+            f"| {row['kernel']} | {row['B']} | {row['S']} | {row['D']} | {row['V']} "
             f"| {row['wall_ms']:.3f} | {row['gpu_ms']:.3f} | {row['host_ms']:.3f} |"
         )
     print(
         f"host_overhead done: shapes={len(args.shapes)} "
-        f"backends={','.join(args.backends)} dtype={args.dtype} calls={args.calls}",
+        f"kernels={','.join(args.kernels)} dtype={args.dtype} calls={args.calls}",
         flush=True,
     )
     return 0

@@ -1,4 +1,4 @@
-"""Pure-Triton persistent fused forward (the `optimized` backend, default).
+"""Pure-Triton persistent fused forward (the `optimized` kernel, default).
 
 A stock-`@triton.jit` implementation: a persistent grid-stride kernel over the
 `(batch, vocab-tile)` output tiles, host-side TMA descriptors, `tl.dot`, and the fused
@@ -29,8 +29,8 @@ Design of record: docs/ARCHITECTURE.md §5.1. Two load-bearing findings shape th
 
 Host-side `TensorDescriptor` (not device-side `tl.make_tensor_descriptor`) means the kernel
 needs no `triton.set_allocator` (no global-scratch side-effect). Forward output follows the
-hidden dtype; logits/max accumulate in fp32. The op schema, saved-tensor set, and backward
-delegation match the hybrid and naive backends exactly (shared `fused_sparton_bwd_op`).
+hidden dtype; logits/max accumulate in fp32. The op schema and saved-tensor set match the
+hybrid and naive kernels exactly; the backward is the optimized design (`optimized_bwd_op`).
 """
 from __future__ import annotations
 
@@ -43,8 +43,9 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._backend_hybrid import fused_sparton_bwd_op
-from ._validation import autocast_canonicalize, validate_forward_inputs
+from .._validation import prepare_forward_inputs
+from ..backward import optimized_bwd_op
+from ._autograd import register_forward
 
 
 # --- kernel -----------------------------------------------------------------
@@ -416,7 +417,7 @@ def _launch_optimized_fwd(
     return _run_kernel(hidden, embed, bias, mask, policy, warp_specialize, limits)
 
 
-# --- custom op + autograd (schema/saved-tensors shared with the other backends) ---------
+# --- custom op + autograd (schema/saved-tensors shared with the other kernels) ---------
 
 
 @torch.library.custom_op(
@@ -434,36 +435,7 @@ def optimized_fwd_op(
     return _launch_optimized_fwd(hidden, embed, bias, mask)
 
 
-@optimized_fwd_op.register_fake
-def _(hidden, embed, bias, mask):
-    B, S, D = hidden.shape
-    V, D2 = embed.shape
-    out_scores = hidden.new_empty((B, V))
-    out_idx = torch.empty((B, V), device=hidden.device, dtype=torch.int64)
-    return out_scores, out_idx
-
-
-def _setup_context(ctx, inputs, output):
-    hidden, embed, bias, mask = inputs
-    scores, idx = output
-    ctx.save_for_backward(scores, idx, hidden, embed, bias, mask)
-
-
-def _backward(ctx, grad_scores, grad_idx):
-    scores, idx, hidden, embed, bias, mask = ctx.saved_tensors
-    hidden_g, embed_g, bias_g = fused_sparton_bwd_op(
-        grad_scores,
-        scores,
-        idx,
-        hidden,
-        embed,
-        bias,
-        mask,
-    )
-    return hidden_g, embed_g, bias_g, None
-
-
-optimized_fwd_op.register_autograd(_backward, setup_context=_setup_context)
+register_forward(optimized_fwd_op, optimized_bwd_op)
 
 
 def optimized_forward(
@@ -472,13 +444,9 @@ def optimized_forward(
     bias: Optional[torch.Tensor],
     mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    hidden, embed, bias = autocast_canonicalize(hidden, embed, bias)
-    validate_forward_inputs(hidden, embed, bias, mask, backend="optimized")
-    hidden = hidden.contiguous()
-    embed = embed.contiguous()
-    mask = mask.contiguous()
-    if bias is not None:
-        bias = bias.contiguous()
+    hidden, embed, bias, mask = prepare_forward_inputs(
+        hidden, embed, bias, mask, kernel="optimized"
+    )
     return optimized_fwd_op(hidden, embed, bias, mask)
 
 

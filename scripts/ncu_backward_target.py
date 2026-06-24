@@ -5,9 +5,9 @@ shapes, dtypes, bias modes, and (optionally) captured index-distribution
 bundles, so the same target serves the M11 before/after counter collection.
 
 Builds forward inputs, obtains ``(max_scores, max_idx)`` through a real
-``fused_sparton_fwd_op`` call (or loads them from a capture bundle), warms the
+``hybrid_fwd_op`` call (or loads them from a capture bundle), warms the
 backward autotune cache, then wraps ``--launches`` direct
-``fused_sparton_bwd_op`` calls in the NVTX range ``bwd_direct/`` **on the main
+``optimized_bwd_op`` calls in the NVTX range ``bwd_direct/`` **on the main
 thread** — autograd's backward worker thread does not inherit NVTX ranges
 (ARCHITECTURE.md §2.5), so ``tensor.backward()`` must not be profiled here.
 
@@ -98,9 +98,9 @@ def main() -> int:
                         help="record index within --bundle")
     parser.add_argument("--launches", type=int, default=3,
                         help="profiled launches inside the NVTX range")
-    parser.add_argument("--impl", type=str, default="current",
+    parser.add_argument("--impl", type=str, default="optimized",
                         help="backward impl from bench_backward.build_impls "
-                        "(current, legacy; prototype names only on the M11 "
+                        "(optimized, mono; prototype names only on the M11 "
                         "T3 tree, commit b5acd9c)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -108,7 +108,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("ncu_backward_target.py requires CUDA")
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
     from bench_backward import build_impls
 
     impl = build_impls([args.impl])[args.impl]
@@ -118,7 +118,7 @@ def main() -> int:
         scores, idx = case.pop("max_scores"), case.pop("max_idx")
     else:
         case = build_synthetic_case(args)
-        scores, idx = sk.fused_sparton_fwd_op(
+        scores, idx = sk.hybrid_fwd_op(
             case["hidden"], case["embed"], case["bias"], case["mask"]
         )
     grad_generator = torch.Generator(device="cuda").manual_seed(args.seed + 1)

@@ -212,7 +212,7 @@ section is the repo-proven process around them.
    selected by `--impls`; the harness numerically verifies every cell against
    production *before* timing it, so a broken prototype cannot produce a timing
    row. Wire the winner into the op only at promotion; retain the loser of record
-   as an explicit, test-pinned legacy reference. Commit the prototypes at the
+   as an explicit, test-pinned reference. Commit the prototypes at the
    decision point so the matrix of record stays reproducible from history (the
    M11 practice; M13 skipped it and the review recorded the gap).
 5. **Pre-register numeric decision rules and exit numbers** (committed before
@@ -276,7 +276,7 @@ section is the repo-proven process around them.
 ## §A.4 Testing Doctrine
 
 - **Tests must prove what they appear to prove.** The suite was green for an
-  entire milestone while only ever exercising the optimized backend's fallback
+  entire milestone while only ever exercising the optimized kernel's fallback
   policy, because every test shape was "tiny" (M9 F3). The class recurred at M13:
   the newly-promoted fast path activates only when destination runs reach the
   chunk size, and no test shape came close — the suite stayed green while only
@@ -297,12 +297,12 @@ section is the repo-proven process around them.
 - **Match assertion strength to input class**: deterministic constructed cases
   (intentional ties, masked winners, dyadic-rational patterns) assert exact
   equality — they pin tie policy. Random-input cases assert the contract
-  (`assert_index_contract`), because backends with different accumulation
+  (`assert_index_contract`), because kernels with different accumulation
   precision legitimately disagree at near-ties. Converting one into the other in
   either direction is a bug.
 - Every validation rule has a `pytest.raises(..., match=...)` test with a stable
   message substring. Error-message templates (see `_validation.py`:
-  `sparton {backend} forward: {arg}{rule}; got {actual}`) are part of the API —
+  `sparton {kernel} forward: {arg}{rule}; got {actual}`) are part of the API —
   tests depend on them; change them deliberately.
 - Single-source gate logic: when a gate script and a test overlap, the test
   imports the script's function (`test_training_parity_smoke_autocast` reuses
@@ -327,8 +327,8 @@ section is the repo-proven process around them.
 - Parametrized cases live in named tables with explicit ids (`FORWARD_CASES`,
   `BACKWARD_CASES`, `VALIDATION_ERROR_CASES`, `NONTINY_FORWARD_CASES`);
   `strict_parametrization_ids` is enabled.
-- Gate availability with fixtures/helpers (`_forward_for_backend`,
-  `_optimized_gluon_availability`), not device-name checks — capability, not
+- Gate availability with fixtures/helpers (`_forward_for_kernel`,
+  `_optimized_availability`), not device-name checks — capability, not
   hardware identity.
 - Tensors built for gradient tests must be autograd leaves: an arithmetic result
   like `-torch.ones(..., requires_grad=True)` is a non-leaf whose `.grad` stays
@@ -390,10 +390,11 @@ Rules:
   structure of the others byte-for-byte where semantics allow. The three forward
   wrappers are intentionally line-for-line parallel; the hybrid F1 bug existed
   precisely because hybrid lacked the wrapper the others had.
-- **One-seam changes**: new cross-backend behavior is one shared helper called at
-  exactly one layer (`autocast_canonicalize` at the top of each wrapper;
-  `_bwd_shared_stages` under both backward designs), never N divergent copies.
-- **No silent fallbacks.** The single sanctioned exception is default-backend
+- **One-seam changes**: new cross-kernel behavior is one shared helper called at
+  exactly one layer (`prepare_forward_inputs` at the top of each wrapper;
+  `_bwd_shared_stages` shared by the optimized backward's two hidden-grad
+  passes), never N divergent copies.
+- **No silent fallbacks.** The single sanctioned exception is default-kernel
   resolution (one-time `RuntimeWarning`, M10). Explicit selections raise with the
   reason. Do not add a second exception — data-dependent algorithm dispatch inside
   an op would also need a host sync, which is why M11/M13 shipped fixed kernel
@@ -418,9 +419,10 @@ Rules:
   item 9).
 - Retired implementations are either deleted or promoted to an explicit,
   test-pinned reference with a role comment naming its removal condition
-  (`legacy_fused_sparton_bwd`: the M11 segmented design since M13) — never left as
-  silent dead code, and never two legacy copies (the baton passes: the displaced
-  design becomes the reference, the older one is deleted in the same change).
+  (`mono`: the restored M2 atomic backward, the production hybrid/naive backward
+  and the optimized↔mono A/B baseline) — never left as
+  silent dead code, and never two retained references (the baton passes: the
+  displaced design becomes the reference, the older one is deleted in the same change).
 - Capability dispatch for fatal-failure APIs (Gluon MMA families abort the process
   at LLVM selection) uses static whitelists probed in subprocesses
   (`probe_mma_matrix.py`), never try/except fallback.
@@ -466,7 +468,7 @@ definition of done. The authoring discipline:
 # §B — Technique layer: kernel optimization on Triton and Gluon
 
 Scope: Triton language/compiler kernels and Triton's experimental Gluon kernel
-language (not NVIDIA Triton Inference Server). **Sparton's own Gluon backends were
+language (not NVIDIA Triton Inference Server). **Sparton's own Gluon kernels were
 evaluated and removed from the package** (the pure-Triton `optimized` forward replaced
 them post-M13; §4.6); the Gluon material in §2 and §5 is retained as a durable
 **technique reference**, not a description of shipped code. Triton and Gluon share a tile-based
@@ -589,7 +591,7 @@ correctness more than it helps.
 ### §4.6 Lessons from the pure-Triton optimized forward (post-M13)
 
 The pure-Triton `optimized` forward (persistent + host-side TMA + measured self-tuner)
-converged after a Gluon detour; the durable, backend-agnostic lessons:
+converged after a Gluon detour; the durable, kernel-agnostic lessons:
 
 1. **Measure the tile, don't derive it.** An offline resource model picked a tile that
    measurement beat by ~14% (the 128-family vs a 64×64 analytic pick). Build a

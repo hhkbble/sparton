@@ -214,7 +214,7 @@ def main() -> int:
         print(
             f"capture summary: reused existing bundle ({len(records)} records, "
             f"train_steps={bundle.get('train_steps')}, "
-            f"backend={bundle.get('backend')}) -> {out_path} | "
+            f"kernel={bundle.get('kernel')}) -> {out_path} | "
             f"mean active {mean_active:.4f} | pass --force to regenerate "
             f"(regenerated bundles contain different records)",
             flush=True,
@@ -257,7 +257,7 @@ def main() -> int:
     bundle = {
         "version": 1,
         "model": args.model,
-        "backend": head.backend,
+        "kernel": head.kernel,
         "dataset": args.dataset,
         "languages": args.languages,
         "train_steps": args.train_steps,
@@ -283,7 +283,7 @@ def main() -> int:
     print(
         f"capture summary: {len(records)} records "
         f"({args.num_batches} batches x {args.batch_size}, train_steps={args.train_steps}, "
-        f"backend={head.backend}) -> {out_path} | "
+        f"kernel={head.kernel}) -> {out_path} | "
         f"mean active {mean_active:.4f}, mean mask density {mean_density:.4f}, "
         f"mean idx top1 share {mean_top1:.4f}",
         flush=True,

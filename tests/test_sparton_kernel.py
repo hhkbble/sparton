@@ -32,16 +32,16 @@ def _optimized_availability() -> tuple[bool, str]:
     if not CUDA_AVAILABLE:
         _OPTIMIZED_AVAILABILITY = (
             False,
-            "Sparton optimized backend tests require a CUDA device",
+            "Sparton optimized kernel tests require a CUDA device",
         )
         return _OPTIMIZED_AVAILABILITY
 
-    from sparton._backend_runtime import is_optimized_backend_available
+    from sparton._runtime import is_optimized_kernel_available
 
-    available, reason = is_optimized_backend_available()
+    available, reason = is_optimized_kernel_available()
     _OPTIMIZED_AVAILABILITY = (
         available,
-        reason if available else f"Sparton optimized backend is unavailable: {reason}",
+        reason if available else f"Sparton optimized kernel is unavailable: {reason}",
     )
     return _OPTIMIZED_AVAILABILITY
 
@@ -60,16 +60,16 @@ def _optimized_autotune_off(monkeypatch) -> None:
     monkeypatch.setenv("SPARTON_OPTIMIZED_AUTOTUNE", "off")
 
 
-ALL_BACKENDS = ("hybrid", "naive", "optimized")
+ALL_KERNELS = ("hybrid", "naive", "optimized")
 
 
-def _forward_for_backend(sparton_kernel, backend: str):
+def _forward_for_kernel(sparton_api, kernel: str):
     # `optimized` (pure-Triton, host-side TMA) is gated on the sm_90+ availability probe.
-    if backend == "optimized":
+    if kernel == "optimized":
         available, reason = _optimized_availability()
         if not available:
             pytest.skip(reason)
-    return getattr(sparton_kernel, f"{backend}_forward")
+    return getattr(sparton_api, f"{kernel}_forward")
 
 FORWARD_CASES = [
     pytest.param(True, torch.float16, id="bias-fp16"),
@@ -149,7 +149,7 @@ def assert_index_contract(
     Wherever the returned score is positive, the chosen sequence index must
     hold a masked input-dtype logit within tolerance of the per-(b, v)
     maximum. Positions with score == 0 carry no index meaning (zero-baseline
-    policy). Backends with different accumulation precision may legitimately
+    policy). Kernels with different accumulation precision may legitimately
     pick different near-tie winners, so exact index equality is asserted only
     in deterministic constructed cases.
     """
@@ -267,8 +267,8 @@ def test_reference_multiplies_mask_values_before_reduction() -> None:
 
 @requires_cuda
 @pytest.mark.cuda
-def test_naive_forward_autotune_configs_include_fixed_baseline(sparton_kernel) -> None:
-    from sparton._backend_naive import get_naive_forward_configs
+def test_naive_forward_autotune_configs_include_fixed_baseline(sparton_api) -> None:
+    from sparton.forward.naive import get_naive_forward_configs
 
     configs = get_naive_forward_configs()
     config_keys = {
@@ -291,7 +291,7 @@ def test_naive_forward_autotune_configs_include_fixed_baseline(sparton_kernel) -
 @pytest.mark.cuda
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_fused_forward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     dtype: torch.dtype,
     use_bias: bool,
@@ -303,7 +303,7 @@ def test_fused_forward_matches_reference(
         use_bias=use_bias,
     )
 
-    scores, idx = sparton_kernel.hybrid_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.hybrid_forward(hidden, embed, bias, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -314,7 +314,7 @@ def test_fused_forward_matches_reference(
 @pytest.mark.cuda
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_naive_forward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     dtype: torch.dtype,
     use_bias: bool,
@@ -326,7 +326,7 @@ def test_naive_forward_matches_reference(
         use_bias=use_bias,
     )
 
-    scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.naive_forward(hidden, embed, bias, mask)
     expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -338,7 +338,7 @@ def test_naive_forward_matches_reference(
 @pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_optimized_forward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     dtype: torch.dtype,
     use_bias: bool,
@@ -350,7 +350,7 @@ def test_optimized_forward_matches_reference(
         use_bias=use_bias,
     )
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -360,7 +360,7 @@ def test_optimized_forward_matches_reference(
 @requires_cuda
 @pytest.mark.cuda
 def test_naive_forward_semantic_cases(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     hidden = torch.zeros((1, 4, 16), device=cuda_device, dtype=torch.float16)
@@ -375,7 +375,7 @@ def test_naive_forward_semantic_cases(
     embed[3, 3] = 1.0
     mask = torch.tensor([[0, 1, 1, 0]], device=cuda_device, dtype=torch.int32)
 
-    scores, idx = sparton_kernel.naive_forward(hidden, embed, None, mask)
+    scores, idx = sparton_api.naive_forward(hidden, embed, None, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, None, mask)
 
     assert_close(scores.float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
@@ -387,7 +387,7 @@ def test_naive_forward_semantic_cases(
 @pytest.mark.cuda
 @pytest.mark.optimized
 def test_optimized_forward_semantic_cases(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     hidden = torch.zeros((1, 4, 16), device=cuda_device, dtype=torch.float16)
@@ -402,7 +402,7 @@ def test_optimized_forward_semantic_cases(
     embed[3, 3] = 1.0
     mask = torch.tensor([[0, 1, 1, 0]], device=cuda_device, dtype=torch.int32)
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, None, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, None, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, None, mask)
 
     assert_close(scores.float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
@@ -414,7 +414,7 @@ def test_optimized_forward_semantic_cases(
 @pytest.mark.cuda
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_naive_forward_handles_tails(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     dtype: torch.dtype,
     use_bias: bool,
@@ -442,7 +442,7 @@ def test_naive_forward_handles_tails(
         dtype=torch.int32,
     )
 
-    scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.naive_forward(hidden, embed, bias, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -454,7 +454,7 @@ def test_naive_forward_handles_tails(
 @pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_optimized_forward_handles_tails(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     dtype: torch.dtype,
     use_bias: bool,
@@ -482,7 +482,7 @@ def test_optimized_forward_handles_tails(
         dtype=torch.int32,
     )
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     expected_scores, expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -493,7 +493,7 @@ def test_optimized_forward_handles_tails(
 @pytest.mark.cuda
 @pytest.mark.optimized
 def test_optimized_forward_handles_multiple_sequence_chunks_small_d(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     B, S, D, V = 1, 129, 16, 32
@@ -513,7 +513,7 @@ def test_optimized_forward_handles_multiple_sequence_chunks_small_d(
     bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator) * 0.05
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     expected_scores, _expected_idx = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
@@ -554,7 +554,7 @@ def _make_nontiny_inputs(
 @pytest.mark.slow
 @pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_FORWARD_CASES)
 def test_naive_forward_nontiny_shapes(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     B: int,
     S: int,
@@ -566,7 +566,7 @@ def test_naive_forward_nontiny_shapes(
     _skip_if_unsupported_dtype(dtype)
     hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
 
-    scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.naive_forward(hidden, embed, bias, mask)
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -577,7 +577,7 @@ def test_naive_forward_nontiny_shapes(
 @pytest.mark.cuda
 @pytest.mark.optimized
 def test_optimized_forward_persistent_multitile(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     monkeypatch,
 ) -> None:
@@ -592,7 +592,7 @@ def test_optimized_forward_persistent_multitile(
     bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator) * 0.1
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
@@ -604,7 +604,7 @@ def test_optimized_forward_persistent_multitile(
 @pytest.mark.optimized
 @pytest.mark.parametrize("force_one_cta", [False, True])
 def test_optimized_forward_warp_specialize_matches_homogeneous(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     monkeypatch,
     force_one_cta: bool,
@@ -627,10 +627,10 @@ def test_optimized_forward_warp_specialize_matches_homogeneous(
         monkeypatch.setenv("SPARTON_OPTIMIZED_NUM_CTAS", "1")
 
     monkeypatch.delenv("SPARTON_OPTIMIZED_WARP_SPECIALIZE", raising=False)
-    base_scores, base_idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    base_scores, base_idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     base_scores, base_idx = base_scores.clone(), base_idx.clone()
     monkeypatch.setenv("SPARTON_OPTIMIZED_WARP_SPECIALIZE", "on")
-    ws_scores, ws_idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    ws_scores, ws_idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
 
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
     assert_close(ws_scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
@@ -645,7 +645,7 @@ def test_optimized_forward_warp_specialize_matches_homogeneous(
 @pytest.mark.optimized
 @pytest.mark.slow
 def test_optimized_forward_autotune_selects_valid_cached_tile(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     monkeypatch,
 ) -> None:
@@ -653,7 +653,7 @@ def test_optimized_forward_autotune_selects_valid_cached_tile(
     # candidate tiles and caches the winner keyed on (D, V, dtype, arch) — NOT B/S. Verify it
     # runs, returns a correct result, caches exactly one entry, and that a different (B, S)
     # with the same (D, V) reuses that entry (B/S excluded from the key).
-    from sparton._backend_optimized import _TILE_CACHE, clear_tile_cache
+    from sparton.forward.optimized import _TILE_CACHE, clear_tile_cache
 
     monkeypatch.setenv("SPARTON_OPTIMIZED_AUTOTUNE", "on")
     clear_tile_cache()
@@ -665,7 +665,7 @@ def test_optimized_forward_autotune_selects_valid_cached_tile(
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
     try:
-        scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+        scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
         expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
         assert_close(scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
         assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(torch.float16))
@@ -680,7 +680,7 @@ def test_optimized_forward_autotune_selects_valid_cached_tile(
         # Different (B, S), same (D, V): must reuse the cached tile (key excludes B/S).
         h2 = torch.randn((1, 128, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
         m2 = (torch.rand((1, 128), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
-        sparton_kernel.optimized_forward(h2, embed, bias, m2)
+        sparton_api.optimized_forward(h2, embed, bias, m2)
         assert len(_TILE_CACHE) == 1, "a different (B,S) must not add a cache entry"
     finally:
         clear_tile_cache()
@@ -692,7 +692,7 @@ def test_optimized_forward_autotune_selects_valid_cached_tile(
 @pytest.mark.slow
 @pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_FORWARD_CASES)
 def test_optimized_forward_nontiny_shapes(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     B: int,
     S: int,
@@ -702,9 +702,9 @@ def test_optimized_forward_nontiny_shapes(
     dtype: torch.dtype,
 ) -> None:
     _skip_if_unsupported_dtype(dtype)
-    # With autotune off (suite default) the backend uses its own self-contained analytic tile;
+    # With autotune off (suite default) the kernel uses its own self-contained analytic tile;
     # assert it resolves and that the autotune sweep has candidates, then check values + index.
-    from sparton._backend_optimized import _analytic_tile, _device_limits, _valid_tiles
+    from sparton.forward.optimized import _analytic_tile, _device_limits, _valid_tiles
 
     limits = _device_limits()
     tile = _analytic_tile(2, limits)
@@ -713,7 +713,7 @@ def test_optimized_forward_nontiny_shapes(
 
     hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
 
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores.float(), expected_scores.float(), **_score_tolerances(dtype))
@@ -729,7 +729,7 @@ BACKWARD_CASES = [
 
 
 def _assert_backward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     forward,
     use_bias: bool,
@@ -767,13 +767,13 @@ def _assert_backward_matches_reference(
 @pytest.mark.cuda
 @pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_fused_backward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
     dtype: torch.dtype,
 ) -> None:
     _assert_backward_matches_reference(
-        sparton_kernel, cuda_device, sparton_kernel.fused_sparton_fwd_op, use_bias, dtype
+        sparton_api, cuda_device, sparton_api.hybrid_fwd_op, use_bias, dtype
     )
 
 
@@ -781,13 +781,13 @@ def test_fused_backward_matches_reference(
 @pytest.mark.cuda
 @pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_naive_backward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
     dtype: torch.dtype,
 ) -> None:
     _assert_backward_matches_reference(
-        sparton_kernel, cuda_device, sparton_kernel.naive_forward, use_bias, dtype
+        sparton_api, cuda_device, sparton_api.naive_forward, use_bias, dtype
     )
 
 
@@ -803,7 +803,7 @@ NONTINY_BACKWARD_CASES = [
 @pytest.mark.slow
 @pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_BACKWARD_CASES)
 def test_fused_backward_nontiny_shapes(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     B: int,
     S: int,
@@ -833,7 +833,7 @@ def test_fused_backward_nontiny_shapes(
     if bias is not None:
         bias.requires_grad_(True)
 
-    scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    scores, idx = sparton_api.hybrid_fwd_op(hidden, embed, bias, mask)
 
     # Pin the forward outputs the expectation conditions on: score values
     # against the reference (values are not tie-ambiguous) and indices via
@@ -886,7 +886,7 @@ def test_fused_backward_nontiny_shapes(
 @pytest.mark.cuda
 @pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
 def test_backward_zero_scores_produce_zero_gradients(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
 ) -> None:
@@ -908,7 +908,7 @@ def test_backward_zero_scores_produce_zero_gradients(
                           requires_grad=True)
     mask = torch.ones((2, 5), device=cuda_device, dtype=torch.int32)
 
-    scores, _ = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    scores, _ = sparton_api.hybrid_fwd_op(hidden, embed, bias, mask)
     assert torch.equal(scores, torch.zeros_like(scores))
 
     scores.backward(torch.randn_like(scores))
@@ -922,7 +922,7 @@ def test_backward_zero_scores_produce_zero_gradients(
 @requires_cuda
 @pytest.mark.cuda
 def test_backward_masked_rows_yield_zero_hidden_gradient(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     """Masked positions (including a fully masked batch row) get exact-zero
@@ -946,7 +946,7 @@ def test_backward_masked_rows_yield_zero_hidden_gradient(
     ref_hidden = _clone_leaf(hidden)
     ref_embed = _clone_leaf(embed)
 
-    scores, _ = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    scores, _ = sparton_api.hybrid_fwd_op(hidden, embed, bias, mask)
     expected_scores, _ = sparton_reference(ref_hidden, ref_embed, None, mask)
     upstream = torch.randn_like(scores)
 
@@ -963,7 +963,7 @@ def test_backward_masked_rows_yield_zero_hidden_gradient(
 
 # The production uniform fast path deposits only when an aligned 64-entry
 # sorted-key chunk is single-destination, i.e. destination runs >= the
-# config family's CHUNK (src/sparton/_backend_hybrid.py,
+# config family's CHUNK (src/sparton/backward/optimized.py,
 # get_uniform_hidden_grad_configs). Every random-input backward test has
 # expected run length V_active/S far below that, so without this case the
 # suite never executes the uniform deposit (the DEVELOPMENT.md M9 F3 class:
@@ -975,7 +975,7 @@ _UNIFORM_PATH_CHUNK = 64
 @pytest.mark.cuda
 @pytest.mark.parametrize("use_bias", [True, False], ids=["bias", "no_bias"])
 def test_backward_uniform_chunk_path_matches_closed_form(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
 ) -> None:
@@ -1004,7 +1004,7 @@ def test_backward_uniform_chunk_path_matches_closed_form(
     mask = torch.ones((B, S), device=cuda_device, dtype=torch.int32)
     mask[0, 0] = 0
 
-    scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+    scores, idx = sparton_api.hybrid_fwd_op(hidden, embed, bias, mask)
     assert bool((scores > 0).all()), "constructed logits must all be active"
     expected_idx = torch.tensor([1, 0], device=cuda_device, dtype=idx.dtype)
     assert torch.equal(idx, expected_idx.unsqueeze(1).expand(B, V)), (
@@ -1024,7 +1024,7 @@ def test_backward_uniform_chunk_path_matches_closed_form(
     assert chunked.shape[0] >= 2 * (V // _UNIFORM_PATH_CHUNK)
 
     grad_out = torch.randn((B, V), device=cuda_device, dtype=torch.float32)
-    hidden_grad, embed_grad, bias_grad = sparton_kernel.fused_sparton_bwd_op(
+    hidden_grad, embed_grad, bias_grad = sparton_api.optimized_bwd_op(
         grad_out, scores, idx, hidden, embed, bias, mask
     )
 
@@ -1051,43 +1051,41 @@ def test_backward_uniform_chunk_path_matches_closed_form(
 @pytest.mark.cuda
 @pytest.mark.slow
 @pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
-def test_backward_matches_legacy_kernel(
-    sparton_kernel,
+def test_backward_mono_matches_optimized(
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
     dtype: torch.dtype,
 ) -> None:
-    """A/B of record for the backward swap (M13: split vs segmented).
-
-    Runs the production backward op (the M13 split pass) and the retained
-    reference (the M11 segmented design, via legacy_fused_sparton_bwd) on
-    identical non-tiny inputs (slow: autotunes both kernel families at this
-    shape). Tolerance sits above the measured atomic-order self-spread of
-    both designs (proxy spread <= 2.4e-5 relative legacy / <= 4.2e-6
-    segmented, DEVELOPMENT.md M11 §7; the M13 §5.5 decision matrix verified 176 cells at
-    rtol=atol=1e-3) and far below any real divergence.
+    """A/B of record: the original M2 atomic backward (``mono``) vs the
+    current best (``optimized``), on identical non-tiny inputs (slow: autotunes
+    the optimized kernel family at this shape). Both compute the same gradient
+    (``grad * exp(-scores)`` scattered to the argmax winner), so they must match
+    within the atomic-order self-spread (verified at rtol=atol=1e-3). This gates
+    that the restored ``mono`` baseline stays faithful to the optimized
+    production backward -- the basis of the original-vs-optimized comparison.
     """
 
     _skip_if_unsupported_dtype(dtype)
     B, S, D, V = 3, 345, 768, 2048
     hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
     with torch.no_grad():
-        scores, idx = sparton_kernel.fused_sparton_fwd_op(hidden, embed, bias, mask)
+        scores, idx = sparton_api.hybrid_fwd_op(hidden, embed, bias, mask)
     grad_out = torch.randn(scores.shape, device=cuda_device, dtype=torch.float32)
 
-    new_grads = sparton_kernel.fused_sparton_bwd_op(
+    optimized_grads = sparton_api.optimized_bwd_op(
         grad_out, scores, idx, hidden, embed, bias, mask
     )
-    legacy_grads = sparton_kernel.legacy_fused_sparton_bwd(
+    mono_grads = sparton_api.mono_bwd_op(
         grad_out, scores, idx, hidden, embed, bias, mask
     )
 
-    for name, new, old in zip(("hidden_grad", "embed_grad", "bias_grad"),
-                              new_grads, legacy_grads):
+    for name, opt, mono in zip(("hidden_grad", "embed_grad", "bias_grad"),
+                               optimized_grads, mono_grads):
         if not use_bias and name == "bias_grad":
-            assert new is None and old is None
+            assert opt is None and mono is None
             continue
-        assert_close(new, old, atol=1e-4, rtol=1e-3, msg=name)
+        assert_close(opt, mono, atol=1e-4, rtol=1e-3, msg=name)
 
 
 AUTOCAST_DTYPES = [
@@ -1101,7 +1099,7 @@ AUTOCAST_DTYPES = [
 @pytest.mark.optimized
 @pytest.mark.slow
 def test_training_parity_smoke_autocast(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     """Short head-only training run: hybrid and optimized stay in lockstep.
@@ -1234,16 +1232,16 @@ def test_bench_host_overhead_shape_parser() -> None:
 
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("kernel", ALL_KERNELS)
 @pytest.mark.parametrize("autocast_dtype", AUTOCAST_DTYPES)
 def test_forward_backward_under_autocast(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
     autocast_dtype: torch.dtype,
 ) -> None:
     _skip_if_unsupported_dtype(autocast_dtype)
-    forward = _forward_for_backend(sparton_kernel, backend)
+    forward = _forward_for_kernel(sparton_api, kernel)
     generator = torch.Generator(device=cuda_device).manual_seed(37)
     # fp32 master tensors, as produced by AMP training setups.
     hidden = torch.randn(
@@ -1300,25 +1298,25 @@ def test_forward_backward_under_autocast(
 @pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_optimized_backward_matches_reference(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
     use_bias: bool,
     dtype: torch.dtype,
 ) -> None:
     _assert_backward_matches_reference(
-        sparton_kernel, cuda_device, sparton_kernel.optimized_forward, use_bias, dtype
+        sparton_api, cuda_device, sparton_api.optimized_forward, use_bias, dtype
     )
 
 
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("backend", ["hybrid", "naive", "optimized"])
+@pytest.mark.parametrize("kernel", ["hybrid", "naive", "optimized"])
 def test_forward_backward_handles_noncontiguous_inputs(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
 ) -> None:
-    forward = _forward_for_backend(sparton_kernel, backend)
+    forward = _forward_for_kernel(sparton_api, kernel)
     generator = torch.Generator(device=cuda_device).manual_seed(23)
     base_hidden = torch.randn(
         (2, 10, 16),
@@ -1369,8 +1367,8 @@ def test_forward_backward_handles_noncontiguous_inputs(
 
 @requires_cuda
 @pytest.mark.cuda
-def test_sparton_head_backend_routing(
-    sparton_kernel,
+def test_sparton_head_kernel_routing(
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     hidden, embed, bias, mask = _make_kernel_inputs(
@@ -1379,15 +1377,15 @@ def test_sparton_head_backend_routing(
         use_bias=True,
     )
 
-    default_head = sparton_kernel.SpartonHead(19, 16, use_bias=True).to(
+    default_head = sparton_api.SpartonHead(19, 16, use_bias=True).to(
         device=cuda_device,
         dtype=torch.float16,
     )
-    hybrid_head = sparton_kernel.SpartonHead(19, 16, use_bias=True, backend="hybrid").to(
+    hybrid_head = sparton_api.SpartonHead(19, 16, use_bias=True, kernel="hybrid").to(
         device=cuda_device,
         dtype=torch.float16,
     )
-    naive_head = sparton_kernel.SpartonHead(19, 16, use_bias=True, backend="naive").to(
+    naive_head = sparton_api.SpartonHead(19, 16, use_bias=True, kernel="naive").to(
         device=cuda_device,
         dtype=torch.float16,
     )
@@ -1400,24 +1398,24 @@ def test_sparton_head_backend_routing(
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
     # M10 promotion: the default is adaptive — optimized where the pure-Triton
-    # TMA backend is available (sm_90+), hybrid (with a one-time warning) elsewhere.
+    # TMA kernel is available (sm_90+), hybrid (with a one-time warning) elsewhere.
     expected_default = "optimized" if _optimized_availability()[0] else "hybrid"
-    assert default_head.backend == expected_default
-    assert hybrid_head.backend == "hybrid"
-    assert naive_head.backend == "naive"
+    assert default_head.kernel == expected_default
+    assert hybrid_head.kernel == "hybrid"
+    assert naive_head.kernel == "naive"
     assert_close(default_head(hidden, mask).float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
     assert_close(hybrid_head(hidden, mask).float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
     assert_close(naive_head(hidden, mask).float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
 
-    with pytest.raises(ValueError, match="Unknown Sparton backend"):
-        sparton_kernel.SpartonHead(19, 16, backend="missing")
+    with pytest.raises(ValueError, match="Unknown Sparton kernel"):
+        sparton_api.SpartonHead(19, 16, kernel="missing")
 
 
 @requires_optimized
 @pytest.mark.cuda
 @pytest.mark.optimized
-def test_sparton_head_optimized_backend_routing(
-    sparton_kernel,
+def test_sparton_head_optimized_kernel_routing(
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     hidden, embed, bias, mask = _make_kernel_inputs(
@@ -1426,7 +1424,7 @@ def test_sparton_head_optimized_backend_routing(
         use_bias=True,
     )
 
-    optimized_head = sparton_kernel.SpartonHead(19, 16, use_bias=True, backend="optimized").to(
+    optimized_head = sparton_api.SpartonHead(19, 16, use_bias=True, kernel="optimized").to(
         device=cuda_device,
         dtype=torch.float16,
     )
@@ -1437,7 +1435,7 @@ def test_sparton_head_optimized_backend_routing(
 
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
-    assert optimized_head.backend == "optimized"
+    assert optimized_head.kernel == "optimized"
     assert_close(optimized_head(hidden, mask).float(), expected_scores.float(), atol=2e-3, rtol=2e-3)
 
 
@@ -1460,18 +1458,18 @@ def test_import_emits_no_stdout(cuda_device: torch.device) -> None:
 
 @requires_cuda
 @pytest.mark.cuda
-def test_sparton_backend_env_selects_default(cuda_device: torch.device) -> None:
+def test_sparton_kernel_env_selects_default(cuda_device: torch.device) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _SRC_PATH
-    env["SPARTON_BACKEND"] = "naive"
+    env["SPARTON_KERNEL"] = "naive"
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sparton.sparton_kernel as sk; "
+                "import sparton.api as sk; "
                 "head = sk.SpartonHead(19, 16); "
-                "print(head.backend)"
+                "print(head.kernel)"
             ),
         ],
         check=True,
@@ -1486,23 +1484,23 @@ def test_sparton_backend_env_selects_default(cuda_device: torch.device) -> None:
 
 @requires_cuda
 @pytest.mark.cuda
-def test_resolve_backend_invalid_kwarg_names_argument(sparton_kernel) -> None:
-    with pytest.raises(ValueError, match=r"'bogus' from backend argument"):
-        sparton_kernel.resolve_backend("bogus")
+def test_resolve_kernel_invalid_kwarg_names_argument(sparton_api) -> None:
+    with pytest.raises(ValueError, match=r"'bogus' from kernel argument"):
+        sparton_api.resolve_kernel("bogus")
 
 
 @requires_cuda
 @pytest.mark.cuda
-def test_resolve_backend_invalid_env_names_env_var(cuda_device: torch.device) -> None:
+def test_resolve_kernel_invalid_env_names_env_var(cuda_device: torch.device) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _SRC_PATH
-    env["SPARTON_BACKEND"] = "bogus"
+    env["SPARTON_KERNEL"] = "bogus"
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sparton.sparton_kernel as sk; "
+                "import sparton.api as sk; "
                 "sk.SpartonHead(19, 16)"
             ),
         ],
@@ -1514,26 +1512,26 @@ def test_resolve_backend_invalid_env_names_env_var(cuda_device: torch.device) ->
     )
 
     assert result.returncode != 0
-    assert "SPARTON_BACKEND environment variable" in result.stderr
+    assert "SPARTON_KERNEL environment variable" in result.stderr
 
 
 @requires_optimized
 @pytest.mark.cuda
 @pytest.mark.optimized
-def test_default_backend_prefers_optimized_when_available(
+def test_default_kernel_prefers_optimized_when_available(
     cuda_device: torch.device,
 ) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _SRC_PATH
-    env.pop("SPARTON_BACKEND", None)
+    env.pop("SPARTON_KERNEL", None)
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sparton.sparton_kernel as sk; "
+                "import sparton.api as sk; "
                 "head = sk.SpartonHead(19, 16); "
-                "print(head.backend)"
+                "print(head.kernel)"
             ),
         ],
         check=True,
@@ -1548,46 +1546,46 @@ def test_default_backend_prefers_optimized_when_available(
 
 @requires_cuda
 @pytest.mark.cuda
-def test_default_backend_falls_back_to_hybrid_with_one_warning(
-    sparton_kernel,
+def test_default_kernel_falls_back_to_hybrid_with_one_warning(
+    sparton_api,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparton._backend_runtime as backend_runtime
+    import sparton._runtime as runtime
 
     monkeypatch.setattr(
-        backend_runtime,
-        "is_optimized_backend_available",
+        runtime,
+        "is_optimized_kernel_available",
         lambda device=None: (False, "forced unavailable for test"),
     )
-    monkeypatch.setattr(sparton_kernel, "_ENV_BACKEND", None)
-    monkeypatch.setattr(sparton_kernel, "_DEFAULT_FALLBACK_WARNED", False)
+    monkeypatch.setattr(sparton_api, "_ENV_KERNEL", None)
+    monkeypatch.setattr(sparton_api, "_DEFAULT_FALLBACK_WARNED", False)
 
     with pytest.warns(RuntimeWarning, match=r"falling back to 'hybrid'"):
-        head = sparton_kernel.SpartonHead(19, 16)
-    assert head.backend == "hybrid"
+        head = sparton_api.SpartonHead(19, 16)
+    assert head.kernel == "hybrid"
 
     # The fallback warning is one-time per process.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        second = sparton_kernel.SpartonHead(19, 16)
-    assert second.backend == "hybrid"
+        second = sparton_api.SpartonHead(19, 16)
+    assert second.kernel == "hybrid"
 
 
 @requires_optimized
 @pytest.mark.cuda
 @pytest.mark.optimized
-def test_sparton_backend_env_selects_optimized_default(cuda_device: torch.device) -> None:
+def test_sparton_kernel_env_selects_optimized_default(cuda_device: torch.device) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _SRC_PATH
-    env["SPARTON_BACKEND"] = "optimized"
+    env["SPARTON_KERNEL"] = "optimized"
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sparton.sparton_kernel as sk; "
+                "import sparton.api as sk; "
                 "head = sk.SpartonHead(19, 16); "
-                "print(head.backend)"
+                "print(head.kernel)"
             ),
         ],
         check=True,
@@ -1603,10 +1601,10 @@ def test_sparton_backend_env_selects_optimized_default(cuda_device: torch.device
 @requires_cuda
 @pytest.mark.cuda
 def test_sparton_head_no_bias_backward_smoke(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
-    head = sparton_kernel.SpartonHead(19, 16, use_bias=False).to(
+    head = sparton_api.SpartonHead(19, 16, use_bias=False).to(
         device=cuda_device,
         dtype=torch.float16,
     )
@@ -1632,7 +1630,7 @@ def test_sparton_head_no_bias_backward_smoke(
 @requires_cuda
 @pytest.mark.cuda
 def test_naive_forward_does_not_materialize_logits(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     B, S, D, V = 4, 64, 64, 4096
@@ -1652,11 +1650,11 @@ def test_naive_forward_does_not_materialize_logits(
     bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator)
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
-    sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    sparton_api.naive_forward(hidden, embed, bias, mask)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    scores, idx = sparton_kernel.naive_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.naive_forward(hidden, embed, bias, mask)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated()
 
@@ -1671,7 +1669,7 @@ def test_naive_forward_does_not_materialize_logits(
 @pytest.mark.cuda
 @pytest.mark.optimized
 def test_optimized_forward_does_not_materialize_logits(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     B, S, D, V = 4, 64, 64, 4096
@@ -1691,11 +1689,11 @@ def test_optimized_forward_does_not_materialize_logits(
     bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator)
     mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
 
-    sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    sparton_api.optimized_forward(hidden, embed, bias, mask)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    scores, idx = sparton_api.optimized_forward(hidden, embed, bias, mask)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated()
 
@@ -1708,22 +1706,25 @@ def test_optimized_forward_does_not_materialize_logits(
 
 @requires_cuda
 @pytest.mark.cuda
-def test_custom_op_schemas_expose_optional_bias(sparton_kernel) -> None:
-    fwd_schema = str(torch.ops.sparton.fused_sparton_fwd.default._schema)
-    bwd_schema = str(torch.ops.sparton.fused_sparton_bwd.default._schema)
+def test_custom_op_schemas_expose_optional_bias(sparton_api) -> None:
+    fwd_schema = str(torch.ops.sparton.hybrid_fwd.default._schema)
+    optimized_bwd_schema = str(torch.ops.sparton.optimized_bwd.default._schema)
+    mono_bwd_schema = str(torch.ops.sparton.mono_bwd.default._schema)
     naive_schema = str(torch.ops.sparton.naive_fwd.default._schema)
 
     assert "Tensor? bias" in fwd_schema
-    assert "Tensor? bias" in bwd_schema
+    assert "Tensor? bias" in optimized_bwd_schema
+    assert "Tensor? bias" in mono_bwd_schema
     assert "Tensor? bias" in naive_schema
-    assert "Tensor?)" in bwd_schema
+    assert "Tensor?)" in optimized_bwd_schema
+    assert "Tensor?)" in mono_bwd_schema
 
 
 @requires_optimized
 @pytest.mark.cuda
 @pytest.mark.optimized
-def test_optimized_custom_op_schema_exposes_optional_bias(sparton_kernel) -> None:
-    _optimized_op = sparton_kernel.optimized_fwd_op
+def test_optimized_custom_op_schema_exposes_optional_bias(sparton_api) -> None:
+    _optimized_op = sparton_api.optimized_fwd_op
     optimized_schema = str(torch.ops.sparton.optimized_fwd.default._schema)
 
     assert "Tensor? bias" in optimized_schema
@@ -1732,19 +1733,19 @@ def test_optimized_custom_op_schema_exposes_optional_bias(sparton_kernel) -> Non
 @requires_cuda
 @pytest.mark.cuda
 @pytest.mark.slow
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("kernel", ALL_KERNELS)
 def test_sparton_head_torch_compile_fullgraph(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
 ) -> None:
-    _forward_for_backend(sparton_kernel, backend)  # skip when unavailable
+    _forward_for_kernel(sparton_api, kernel)  # skip when unavailable
     hidden, embed, bias, mask = _make_kernel_inputs(
         device=cuda_device,
         dtype=torch.float16,
         use_bias=True,
     )
-    head = sparton_kernel.SpartonHead(19, 16, use_bias=True, backend=backend).to(
+    head = sparton_api.SpartonHead(19, 16, use_bias=True, kernel=kernel).to(
         device=cuda_device,
         dtype=torch.float16,
     )
@@ -1853,18 +1854,18 @@ VALIDATION_ERROR_CASES = [
 
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("kernel", ALL_KERNELS)
 @pytest.mark.parametrize(("field", "mutate", "exc", "match"), VALIDATION_ERROR_CASES)
 def test_validation_rejects_bad_inputs(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
     field: str,
     mutate,
     exc: type,
     match: str,
 ) -> None:
-    forward = _forward_for_backend(sparton_kernel, backend)
+    forward = _forward_for_kernel(sparton_api, kernel)
     inputs = _base_validation_inputs(cuda_device)
     inputs[field] = mutate(inputs)
 
@@ -1874,13 +1875,13 @@ def test_validation_rejects_bad_inputs(
 
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("kernel", ALL_KERNELS)
 def test_validation_rejects_cpu_tensors(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
 ) -> None:
-    forward = _forward_for_backend(sparton_kernel, backend)
+    forward = _forward_for_kernel(sparton_api, kernel)
     inputs = {name: tensor.cpu() for name, tensor in _base_validation_inputs(cuda_device).items()}
 
     with pytest.raises(ValueError, match=r"hidden must be a CUDA tensor"):
@@ -1889,13 +1890,13 @@ def test_validation_rejects_cpu_tensors(
 
 @requires_cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("backend", ["naive", "optimized"])
-def test_validation_rejects_fp32_on_fused_backends(
-    sparton_kernel,
+@pytest.mark.parametrize("kernel", ["naive", "optimized"])
+def test_validation_rejects_fp32_on_non_hybrid_kernels(
+    sparton_api,
     cuda_device: torch.device,
-    backend: str,
+    kernel: str,
 ) -> None:
-    forward = _forward_for_backend(sparton_kernel, backend)
+    forward = _forward_for_kernel(sparton_api, kernel)
     inputs = _base_validation_inputs(cuda_device)
     for name in ("hidden", "embed", "bias"):
         inputs[name] = inputs[name].float()
@@ -1907,7 +1908,7 @@ def test_validation_rejects_fp32_on_fused_backends(
 @requires_cuda
 @pytest.mark.cuda
 def test_validation_allows_fp32_hybrid(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     inputs = _base_validation_inputs(cuda_device)
@@ -1916,7 +1917,7 @@ def test_validation_allows_fp32_hybrid(
     bias = inputs["bias"].float()
     mask = inputs["mask"]
 
-    scores, _idx = sparton_kernel.hybrid_forward(hidden, embed, bias, mask)
+    scores, _idx = sparton_api.hybrid_forward(hidden, embed, bias, mask)
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
     assert_close(scores, expected_scores, atol=1e-3, rtol=1e-3)
@@ -1926,7 +1927,7 @@ def test_validation_allows_fp32_hybrid(
 @pytest.mark.cuda
 @pytest.mark.optimized
 def test_optimized_validation_rejects_unaligned_d(
-    sparton_kernel,
+    sparton_api,
     cuda_device: torch.device,
 ) -> None:
     hidden = torch.randn((2, 64, 10), device=cuda_device, dtype=torch.float16)
@@ -1934,4 +1935,4 @@ def test_optimized_validation_rejects_unaligned_d(
     mask = torch.ones((2, 64), device=cuda_device, dtype=torch.int32)
 
     with pytest.raises(ValueError, match=r"multiple of 16 bytes"):
-        sparton_kernel.optimized_forward(hidden, embed, None, mask)
+        sparton_api.optimized_forward(hidden, embed, None, mask)

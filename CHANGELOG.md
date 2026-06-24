@@ -6,6 +6,82 @@ Full evidence (gates, profiles, deviations, known gaps) lives in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the working method in
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
+## 2026-06-25
+
+- **Reduced the backward to two kernels, `{mono, optimized}`, selected
+  per-forward.** The prior `{split (production), segmented (M11 A/B reference)}`
+  pair is gone. **`mono`** is the original M2-era fully-atomic backward, restored
+  verbatim from commit `6e19af3` (`mono_bwd_kernel` in
+  `src/sparton/backward/mono.py`): it loads the saved argmax index and
+  `atomic_add`s `grad·exp(−scores)` (where `scores > 0`) into zero-initialized
+  fp32 hidden/embed/bias gradients — the same exact gradient as `optimized`, an
+  unoptimized full scatter. **`optimized`** is the prior `split` design (uniform +
+  mixed hidden-grad passes + the shared prep/sort/exclusive-owner-embed/gather
+  stages), renamed and moved to `src/sparton/backward/optimized.py` (which
+  absorbed the former `_common.py` stages). The **`segmented`** M11 reference is
+  **deleted** (`backward/split.py`, `backward/segmented.py`, `backward/_common.py`
+  are gone).
+  - **Two custom ops** replace the single `sparton::bwd` / `bwd_op`:
+    `sparton::optimized_bwd` (`optimized_bwd_op`) and `sparton::mono_bwd`
+    (`mono_bwd_op`), with the identical saved-tensor schema and one
+    `register_fake` each. `api.py` exports `mono_bwd_op` + `optimized_bwd_op`
+    (dropping `bwd_op` and `segmented_reference_bwd`).
+  - **Per-forward selection (not a runtime switch):** `forward/_autograd.py` now
+    has `register_forward(op, bwd_op)`; the optimized forward registers
+    `optimized_bwd_op`, the hybrid and naive forwards register `mono_bwd_op`. So
+    `kernel=optimized` runs the optimized backward; `kernel=hybrid`/`naive` runs
+    the mono backward. **Forward selection is unchanged** (optimized stays the
+    default).
+  - **Purpose:** a clean original-vs-optimized end-to-end A/B —
+    `kernel=hybrid` ≈ the original project (original-ish forward + mono backward),
+    `kernel=optimized` = the current best. On captured-real swim-ir (fp16) the
+    optimized backward is **2–3.7× faster** than `mono` (mono ≈ 0.27–0.48× of
+    optimized), gradients matching to ~1e-6; on the sparse synthetic f=0.10
+    short-run regime they are near-parity (mono's zero-block early-exit).
+  - No forward logic, numerics, autotune config lists, or forward op schemas
+    changed; the full pytest suite passes (**135**) and the backward A/B records
+    0 failures. Evidence: DEVELOPMENT.md "Post-M13 — backward reduced to
+    {mono, optimized}"; built system in ARCHITECTURE.md §5.4–§5.5.
+
+- **Renamed the kernel-selection concept from "backend" to "kernel" across the
+  public API (breaking).** `SpartonHead(kernel=...)` (was `backend=`), the
+  `.kernel` attribute (was `.backend`), the `SPARTON_KERNEL` environment
+  variable (was `SPARTON_BACKEND`), the router `resolve_kernel` (was
+  `resolve_backend`), and the training-side `sparton_kernel=` /
+  `--sparton_kernel` (was `sparton_backend=`). The three implementations are now
+  consistently called **kernels** (`hybrid`, `naive`, `optimized`); the word
+  "backend" is retired from the public surface and the docs.
+- **Reorganized `src/sparton` by [direction, variant].** Forward kernels live
+  under `forward/{hybrid,naive,optimized}.py`; the backward variants under
+  `backward/{split,segmented}.py` with their shared stages in
+  `backward/_common.py`. The facade/router `sparton_kernel.py` became `api.py`;
+  `_backend_runtime.py` became `_runtime.py`; device resolution moved to a new
+  `_device.py` (and `DEVICE` is no longer public, kept only as an import-time
+  DEBUG log). **Structural fix:** the shared backward used to live inside the
+  hybrid *forward* module (`_backend_hybrid.py`), so naive/optimized imported it
+  from the hybrid forward; it now lives in the neutral `backward/` package, and
+  `forward/* → backward` is the only cross-package edge (no cycle).
+- **Renamed the torch ops** `sparton::fused_sparton_fwd` →`sparton::hybrid_fwd`
+  and `sparton::fused_sparton_bwd` → `sparton::bwd` (the `naive_fwd` /
+  `optimized_fwd` op strings are unchanged); the Python op symbols are now
+  `hybrid_fwd_op` and `bwd_op`. The autograd saved-tensor set is unchanged, so
+  the backward stays schema-safe.
+- **Removed dead code:** the unused values-only forward + reduction path (zero
+  callers) and the unused `get_slow_forward_configs` (the surviving config
+  getter is `get_hybrid_forward_configs`, formerly `get_fast_forward_configs`;
+  the "fast/slow" naming is gone).
+- **De-duplicated** the three identical per-forward fake/setup/backward
+  registrations into `forward/_autograd.py` (registration is still applied per
+  op) and the three wrapper canonicalization bodies into
+  `_validation.prepare_forward_inputs` — behavior preserved.
+- **Renamed the A/B-reference backward** to `segmented_reference_bwd` and the
+  `bench_backward.py` impl label to `--impls segmented` (the prior name carried
+  a retired term that is no longer used anywhere in the package or docs).
+- No kernel logic, numerics, autotune config lists, or op schemas changed; the
+  full pytest suite passes (**135**). Evidence: DEVELOPMENT.md "Post-M13 —
+  package reorganization + kernel-term rename"; built system in ARCHITECTURE.md
+  (module map, §4.1, §5).
+
 ## 2026-06-24
 
 - **`optimized` forward is now a pure-Triton TMA kernel; all Gluon removed from the package.**
@@ -77,7 +153,8 @@ Full evidence (gates, profiles, deviations, known gaps) lives in
   records improve **1.46–1.60×** over the M11 segmented design; the synthetic
   `f=0.10` short-run regime regresses 6–16% (recorded, **pending maintainer
   ratification**, with a one-commit revert). The M11 segmented design is
-  retained, test-pinned, as `legacy_fused_sparton_bwd`; the M2-era atomic
+  retained, test-pinned, as the A/B reference (named `segmented_reference_bwd`
+  since the 2026-06-25 reorganization); the M2-era atomic
   kernel was deleted. Evidence: [DEVELOPMENT.md](docs/DEVELOPMENT.md) M13.
 - **M12 — forward track closed without kernel work** (milestone complete). The
   production forward kernel profiled tensor-pipe-bound at 92–94% with no

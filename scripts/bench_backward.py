@@ -1,7 +1,7 @@
 """Distribution-aware backward benchmark harness (M11 T2).
 
 Times backward implementations at the op level (each impl allocates its own
-fp32 grad buffers, exactly like ``sparton::fused_sparton_bwd`` — the timing
+fp32 grad buffers, exactly like ``sparton::optimized_bwd`` — the timing
 includes the zero-fills training pays; ncu provides the kernel-level view and
 the two regimes are never compared) over three index-distribution sources:
 
@@ -32,14 +32,14 @@ autograd wrappers pass after the standing ``scores.float().sum()`` loss
 convention); hidden/embed operand values are synthesized — the backward's
 access pattern depends only on scores' sparsity, ``max_idx``, and shapes.
 
-Per cell each impl is verified against ``current`` (``assert_close``,
+Per cell each impl is verified against ``optimized`` (``assert_close``,
 rtol=atol=1e-3) before timing unless ``--no-verify``; ``--determinism`` adds
 the recorded (non-gate) protocol: 5 same-input repeats reporting the max
 relative spread of the grad norms and of a fixed strided-sum loss proxy
 (atomic-order-sensitive linear functional).
 
 Output is one markdown row per (source, cell, dtype, bias, impl) with ms and
-speedup vs ``current``; a provenance header logs versions, GPU, and seed.
+speedup vs ``optimized``; a provenance header logs versions, GPU, and seed.
 Exits non-zero listing verification failures. ``--quick`` runs a small
 development subset; the full matrix is the gate of record. Note that
 ``--quick`` pins contract-relevant axes (``bias=on``, fp16 only): it
@@ -78,20 +78,14 @@ def build_impls(names: list[str]) -> dict[str, callable]:
     grad buffers so timings are op-level and directly comparable.
     """
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     impls: dict[str, callable] = {}
     for name in names:
-        if name == "current":
-            impls[name] = sk.fused_sparton_bwd_op
-        elif name == "legacy":
-            legacy = getattr(sk, "legacy_fused_sparton_bwd", None)
-            if legacy is None:
-                raise RuntimeError(
-                    "impl 'legacy' requires the post-M11-T4 tree "
-                    "(sparton.sparton_kernel.legacy_fused_sparton_bwd)"
-                )
-            impls[name] = legacy
+        if name == "optimized":
+            impls[name] = sk.optimized_bwd_op
+        elif name == "mono":
+            impls[name] = sk.mono_bwd_op
         else:
             bench_dir = str(Path(__file__).resolve().parent)
             if bench_dir not in sys.path:
@@ -105,7 +99,7 @@ def build_impls(names: list[str]) -> dict[str, callable]:
                 ) from exc
             if name not in PROTOTYPES:
                 raise RuntimeError(
-                    f"unknown impl {name!r} (not current/legacy and not in "
+                    f"unknown impl {name!r} (not optimized/mono and not in "
                     f"bwd_prototypes.PROTOTYPES {sorted(PROTOTYPES)})"
                 )
             impls[name] = PROTOTYPES[name]
@@ -249,12 +243,12 @@ def determinism_spread(impl, case, repeats: int = 5) -> dict[str, float]:
     }
 
 
-def verify_against_current(impl, current, case) -> None:
+def verify_against_optimized(impl, optimized, case) -> None:
     got = call_impl(impl, case)
-    want = call_impl(current, case)
+    want = call_impl(optimized, case)
     for name, g, w in zip(("hidden_grad", "embed_grad", "bias_grad"), got, want):
         if (g is None) != (w is None):
-            raise AssertionError(f"{name}: optionality mismatch vs current")
+            raise AssertionError(f"{name}: optionality mismatch vs optimized")
         if g is not None and g.dim() > 0:
             torch.testing.assert_close(g, w, rtol=1e-3, atol=1e-3, msg=name)
 
@@ -334,7 +328,7 @@ def main() -> int:
                         help="synthetic mask densities in percent")
     parser.add_argument("--dtypes", type=str, default="fp16,bf16")
     parser.add_argument("--bias", choices=("both", "on", "off"), default="both")
-    parser.add_argument("--impls", type=str, default="current")
+    parser.add_argument("--impls", type=str, default="optimized")
     parser.add_argument("--active-fraction", type=float, default=None,
                         help="synthetic active fraction (default: mean of real "
                         "bundle stats if given, else 0.10)")
@@ -410,7 +404,7 @@ def main() -> int:
     impls = build_impls(impl_names)
     failures: list[tuple[str, str]] = []
     det_header = " det h/e/proxy |" if args.determinism else ""
-    print(f"| source | cell | dtype | bias | impl | ms | x current |{det_header}", flush=True)
+    print(f"| source | cell | dtype | bias | impl | ms | x optimized |{det_header}", flush=True)
     print(f"|---|---|---|---|---|---|---|{'---|' if args.determinism else ''}", flush=True)
 
     cells = 0
@@ -418,21 +412,21 @@ def main() -> int:
         for dtype_name in dtype_names:
             for bias_on in bias_modes:
                 case = None
-                current_ms = None
+                optimized_ms = None
                 for impl_name in impl_names:
                     impl = impls[impl_name]
                     cell_id = f"{source}/{label}/{dtype_name}/{'bias' if bias_on else 'no_bias'}"
                     try:
                         if case is None:
                             case = case_builder(DTYPES[dtype_name], bias_on)
-                        if impl_name != "current" and not args.no_verify:
-                            verify_against_current(impl, impls.get("current") or
-                                                   build_impls(["current"])["current"], case)
+                        if impl_name != "optimized" and not args.no_verify:
+                            verify_against_optimized(impl, impls.get("optimized") or
+                                                   build_impls(["optimized"])["optimized"], case)
                         ms = bench_ms(lambda: call_impl(impl, case),
                                       warmup=args.warmup, rep=args.rep)
-                        if impl_name == "current":
-                            current_ms = ms
-                        ratio = (current_ms / ms) if current_ms else float("nan")
+                        if impl_name == "optimized":
+                            optimized_ms = ms
+                        ratio = (optimized_ms / ms) if optimized_ms else float("nan")
                         det = ""
                         if args.determinism:
                             spread = determinism_spread(impl, case)

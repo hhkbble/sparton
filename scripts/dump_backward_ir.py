@@ -1,8 +1,8 @@
 """Dump the backward kernels' autotune selections and per-config IR/SASS.
 
-The standing config+lowering visibility tool for the split backward
+The standing config+lowering visibility tool for the optimized backward
 (METHODOLOGY.md §6.1–§6.2; promoted from the M13-T0 session probe). For each
-requested shape it runs one production `fused_sparton_bwd_op` call, reads
+requested shape it runs one production `optimized_bwd_op` call, reads
 the autotuner selections host-side (cache-hit selections print nothing
 under TRITON_PRINT_AUTOTUNING — the M12 lesson), then warmup-compiles each
 selected configuration and writes `ttgir`/`ptx`/SASS with per-config
@@ -122,8 +122,14 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("dump_backward_ir.py requires CUDA")
 
-    import sparton.sparton_kernel as sk
-    from sparton import _backend_hybrid as bh
+    import sparton.api as sk
+    from sparton.backward.optimized import (
+        bwd_gather_payload_kernel,
+        bwd_prep_kernel,
+        embed_grad_kernel,
+        mixed_hidden_grad_kernel,
+        uniform_hidden_grad_kernel,
+    )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -140,9 +146,9 @@ def main() -> int:
             print(f"SKIP {name}: bundle missing under {bundle_dir} "
                   f"(see scripts/capture_index_distributions.py)", flush=True)
             continue
-        uni_before = dict(bh.uniform_hidden_grad_kernel.cache)
-        emb_before = dict(bh.embed_grad_kernel.cache)
-        sk.fused_sparton_bwd_op(
+        uni_before = dict(uniform_hidden_grad_kernel.cache)
+        emb_before = dict(embed_grad_kernel.cache)
+        sk.optimized_bwd_op(
             case["grad_out"], case["max_scores"], case["max_idx"],
             case["hidden"], case["embed"], case["bias"], case["mask"])
         torch.cuda.synchronize()
@@ -151,8 +157,8 @@ def main() -> int:
         dtype = case["hidden"].dtype
         print(f"== {name} (D={D} V={V} {dtype})", flush=True)
         for kernel, before, label in (
-            (bh.uniform_hidden_grad_kernel, uni_before, "uniform"),
-            (bh.embed_grad_kernel, emb_before, "embed"),
+            (uniform_hidden_grad_kernel, uni_before, "uniform"),
+            (embed_grad_kernel, emb_before, "embed"),
         ):
             for key, cfg in kernel.cache.items():
                 if key not in before:
@@ -178,7 +184,7 @@ def main() -> int:
             if tag in seen:
                 continue
             seen.add(tag)
-            compiled = bh.uniform_hidden_grad_kernel.fn.warmup(
+            compiled = uniform_hidden_grad_kernel.fn.warmup(
                 keys_ptr=i32, g_ptr=f32, v_ptr=i32, embed_ptr=elt,
                 hidden_grad_ptr=f32, n_active_ptr=i32, total=8, batch_size=1,
                 seq_len=8, vocab_size=8, hidden_dim=D, CHUNK=kw['CHUNK'],
@@ -192,7 +198,7 @@ def main() -> int:
             mtag = f"mixed__{name}__GR{granule}_SUB{sub}_BD128_w4_s2"
             if mtag not in seen:
                 seen.add(mtag)
-                compiled = bh.mixed_hidden_grad_kernel.warmup(
+                compiled = mixed_hidden_grad_kernel.warmup(
                     keys_ptr=i32, g_ptr=f32, v_ptr=i32, embed_ptr=elt,
                     hidden_grad_ptr=f32, total=8, batch_size=1, seq_len=8,
                     vocab_size=8, hidden_dim=D, GRANULE=granule, SUB=sub,
@@ -204,7 +210,7 @@ def main() -> int:
             if tag in seen:
                 continue
             seen.add(tag)
-            compiled = bh.embed_grad_kernel.fn.warmup(
+            compiled = embed_grad_kernel.fn.warmup(
                 g_ptr=f32, idx_ptr=i32, hidden_ptr=elt, embed_grad_ptr=f32,
                 bias_grad_ptr=f32, batch_size=1, seq_len=8, hidden_dim=D,
                 vocab_size=V, HAS_BIAS=True, BLOCK_B=kw['BLOCK_B'],
@@ -214,13 +220,13 @@ def main() -> int:
             dump_compiled(tag, compiled, out_dir, args.nvdisasm, failures)
 
     f16 = torch.empty(8, device=dev, dtype=torch.float16)
-    compiled = bh.bwd_prep_kernel.warmup(
+    compiled = bwd_prep_kernel.warmup(
         scores_ptr=f16, grad_ptr=f32, idx_ptr=i64, g_ptr=f32, idx32_ptr=i32,
         keys_ptr=i32, n_active_ptr=i32, total=8, seq_len=8, vocab_size=8,
         num_rows=8, BLOCK=1024, grid=(1,))
     dump_compiled("prep__fp16_BLOCK1024", compiled, out_dir, args.nvdisasm,
                   failures)
-    compiled = bh.bwd_gather_payload_kernel.warmup(
+    compiled = bwd_gather_payload_kernel.warmup(
         perm_ptr=i64, g_full_ptr=f32, g_sorted_ptr=f32, v_sorted_ptr=i32,
         total=8, vocab_size=8, BLOCK=1024, grid=(1,))
     dump_compiled("payload__BLOCK1024", compiled, out_dir, args.nvdisasm,

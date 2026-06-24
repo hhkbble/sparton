@@ -84,16 +84,16 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("ncu_forward_target.py requires CUDA")
-    from sparton._backend_runtime import is_optimized_backend_available
+    from sparton._runtime import is_optimized_kernel_available
 
-    available, reason = is_optimized_backend_available()
+    available, reason = is_optimized_kernel_available()
     if not available:
         raise RuntimeError(
-            "ncu_forward_target.py requires the optimized backend "
+            "ncu_forward_target.py requires the optimized kernel "
             f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 
-    import sparton.sparton_kernel as sk
+    import sparton.api as sk
 
     case = build_synthetic_case(args)
 

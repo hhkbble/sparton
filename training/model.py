@@ -65,7 +65,7 @@ class ProjectionPyTorch(nn.Module):
 class ProjectionSparton(nn.Module):
     """Wraps the MLM transform + SpartonHead (Triton kernel) with weight tying."""
 
-    def __init__(self, transform, decoder, sparton_backend=None):
+    def __init__(self, transform, decoder, sparton_kernel=None):
         super().__init__()
         self.transform = transform
 
@@ -78,7 +78,7 @@ class ProjectionSparton(nn.Module):
             vocab_size,
             hidden_dim,
             use_bias=True,
-            backend=sparton_backend,
+            kernel=sparton_kernel,
         ).to(device=device)
         self.sparton_head.tie_weights(decoder)
 
@@ -96,9 +96,9 @@ class SpladeModel(nn.Module):
         model_name_or_path: HuggingFace model identifier or local path
         head: "torch", "sparton", or "compiled" (torch.compile'd PyTorch head)
         model_kwargs: optional dict passed to from_pretrained
-        sparton_backend: optional Sparton backend name for head="sparton"
+        sparton_kernel: optional Sparton kernel name for head="sparton"
             ("hybrid", "naive", or "optimized"); None keeps the Sparton
-            default resolution (SPARTON_BACKEND env var or "hybrid")
+            default resolution (SPARTON_KERNEL env var or "hybrid")
     """
 
     def __init__(
@@ -106,7 +106,7 @@ class SpladeModel(nn.Module):
         model_name_or_path,
         head="torch",
         model_kwargs=None,
-        sparton_backend=None,
+        sparton_kernel=None,
     ):
         super().__init__()
         self.head = head
@@ -130,7 +130,7 @@ class SpladeModel(nn.Module):
             self.projection = ProjectionSparton(
                 transform,
                 decoder,
-                sparton_backend=sparton_backend,
+                sparton_kernel=sparton_kernel,
             )
         else:
             raise ValueError(

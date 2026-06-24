@@ -22,6 +22,6 @@ def cuda_device() -> torch.device:
 
 
 @pytest.fixture(scope="session")
-def sparton_kernel(cuda_device: torch.device):
+def sparton_api(cuda_device: torch.device):
     pytest.importorskip("triton")
-    return pytest.importorskip("sparton.sparton_kernel")
+    return pytest.importorskip("sparton.api")
