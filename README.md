@@ -13,6 +13,11 @@ Requirements:
 - `torch>=2.7.1`
 - `triton>=3.3.1`
 
+The development environment used for this repository is the NGC container
+image `nvcr.io/nvidia/pytorch:26.05-py3` (torch 2.12 nightly, Triton 3.6.0,
+CUDA 13.2 toolchain) — the validated configuration behind the documented
+benchmarks and tests.
+
 ```bash
 pip install "torch>=2.7.1" "triton>=3.3.1"
 
@@ -47,23 +52,25 @@ See [model.py](training/model.py) for a full example integrating Sparton into a 
 
 ### Backend Selection
 
-`SpartonHead` defaults to the `optimized` Gluon fused-forward backend wherever
-it is available (CUDA sm_80+ plus a Triton with importable
-`triton.experimental.gluon`; validated with Triton 3.6.0). On platforms where
-it is unavailable, the default resolves to the `hybrid` backend with a
-one-time `RuntimeWarning`. This availability-adaptive behavior applies only
-to the *default*: an explicitly selected backend never falls back and raises
-with the reason when unavailable.
+`SpartonHead` defaults to the `optimized` pure-Triton fused-forward backend
+wherever it is available (CUDA sm_90+ plus an importable
+`triton.tools.tensor_descriptor`; validated with Triton 3.7.1). On platforms
+where it is unavailable — including sm_80/sm_89, since the kernel uses host-side
+TMA — the default resolves to the `hybrid` backend with a one-time
+`RuntimeWarning`. This availability-adaptive behavior applies only to the
+*default*: an explicitly selected backend never falls back and raises with the
+reason when unavailable.
 
-The `optimized` forward is a single TMA + `mma_v2` Gluon kernel with bounded
-autotune (a fixed production policy universe pruned at launch from the actual
-CUDA device profile and problem shape). It was promoted to the default after
-the M10 gates in
-[docs/sparton_remaining_work_design_v2.md](docs/sparton_remaining_work_design_v2.md):
-it is faster than hybrid on every measured shape, uses output-only memory
-(~14x less peak than hybrid on the dev shape), and matches the reference on
-the full correctness matrix; evidence in
-[docs/sparton_milestone10_promotion_memo.md](docs/sparton_milestone10_promotion_memo.md).
+The `optimized` forward is a single persistent `@triton.jit` kernel: host-side
+TMA descriptors + a `tl.dot` mainloop + a fused max/argmax/ReLU/log1p epilogue,
+with the tile chosen by a measured self-tuner and warp specialization as a tuned
+dimension. It was promoted to the default after the M10 gates (faster than hybrid
+on every measured shape, output-only memory — ~14x less peak than hybrid on the
+dev shape — and matches the reference on the full correctness matrix) and was
+**reimplemented in pure Triton post-M13, replacing the original Gluon kernel and
+removing Gluon from the package**; design and evidence in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.1 and
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 To pin a backend explicitly (rollback path), pass the constructor argument or
 set the environment variable before importing `sparton`:
@@ -184,7 +191,7 @@ CUDA kernel tests require a CUDA device. In this workspace, Triton/TorchInductor
 
 ## Project Notes
 
-Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). Design and audit notes for the Gluon/backend refactor live in [docs/](docs/), including [sparton_gluon_current_platform_design.md](docs/sparton_gluon_current_platform_design.md), [sparton_gluon_design_review.md](docs/sparton_gluon_design_review.md), and [sparton_milestone2_bias_none_backward_memo.md](docs/sparton_milestone2_bias_none_backward_memo.md).
+Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). The `docs/` directory holds three references for the kernel/backend work: the built architecture in [ARCHITECTURE.md](docs/ARCHITECTURE.md), the development history (milestones M2–M13, with evidence and decisions) in [DEVELOPMENT.md](docs/DEVELOPMENT.md), and the working method plus kernel-optimization technique in [METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Citation
 
@@ -193,6 +200,6 @@ Recent repository changes are tracked in [CHANGELOG.md](CHANGELOG.md). Design an
   title={Sparton: Fast and Memory-Efficient Triton Kernel for Learned Sparse Retrieval},
   author={Thong Nguyen, Cosimo Rulli, Franco Maria Nardini, Rossano Venturini, Andrew Yates},
   year={2026},
-  url={https://github.com/thongnt99/lsr-kernel}
+  url={https://arxiv.org/pdf/2603.25011}
 }
 ```

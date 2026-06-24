@@ -50,9 +50,9 @@ def _default_backend() -> str:
     """
 
     global _DEFAULT_FALLBACK_WARNED
-    from . import _gluon_runtime
+    from . import _backend_runtime
 
-    available, reason = _gluon_runtime.is_gluon_backend_available()
+    available, reason = _backend_runtime.is_optimized_backend_available()
     if available:
         return "optimized"
     if not _DEFAULT_FALLBACK_WARNED:
@@ -88,7 +88,7 @@ def _forward_op_for_backend(backend: str):
     if backend == "naive":
         return naive_forward
     if backend == "optimized":
-        from ._backend_optimized_gluon import optimized_forward
+        from ._backend_optimized import optimized_forward
 
         return optimized_forward
     raise AssertionError(f"unhandled resolved Sparton backend {backend!r}")
@@ -96,7 +96,7 @@ def _forward_op_for_backend(backend: str):
 
 def __getattr__(name: str):
     if name in {"optimized_forward", "optimized_fwd_op"}:
-        from ._backend_optimized_gluon import optimized_forward, optimized_fwd_op
+        from ._backend_optimized import optimized_forward, optimized_fwd_op
 
         return {
             "optimized_forward": optimized_forward,

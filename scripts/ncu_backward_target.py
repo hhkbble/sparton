@@ -9,13 +9,13 @@ Builds forward inputs, obtains ``(max_scores, max_idx)`` through a real
 backward autotune cache, then wraps ``--launches`` direct
 ``fused_sparton_bwd_op`` calls in the NVTX range ``bwd_direct/`` **on the main
 thread** — autograd's backward worker thread does not inherit NVTX ranges
-(design v1 §2.5), so ``tensor.backward()`` must not be profiled here.
+(ARCHITECTURE.md §2.5), so ``tensor.backward()`` must not be profiled here.
 
-Intended invocation (hardened env, serial; see benchmarks/README.md):
+Intended invocation (hardened env, serial; see scripts/README.md):
 
   ncu --nvtx --nvtx-include "bwd_direct/" --launch-skip 1 --launch-count 1 \
-      --metrics <set recorded in the M11 memo> -o <report> \
-      python -u benchmarks/ncu_backward_target.py --dtype fp16 --bias on
+      --metrics <set recorded in DEVELOPMENT.md M11> -o <report> \
+      python -u scripts/ncu_backward_target.py --dtype fp16 --bias on
 
 Prints one summary line; exits non-zero if the backward op fails.
 """

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-# Make `import benchmarks.<script>` resolve as a namespace package regardless
+# Make `import scripts.<script>` resolve as a namespace package regardless
 # of how pytest is invoked (`python -m pytest` adds the CWD; the console
 # script does not).
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)

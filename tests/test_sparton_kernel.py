@@ -11,19 +11,6 @@ import pytest
 import torch
 from torch.testing import assert_close
 
-from sparton._runtime_policy import (
-    DeviceProfile,
-    GluonGemmPolicy,
-    ProblemSpec,
-    derive_optimized_forward_policies,
-    generate_gluon_gemm_policies,
-    gluon_gemm_policy_universe,
-    optimized_forward_fallback_policy,
-    optimized_forward_policy_universe,
-    policy_config_kwargs,
-    torch_device_profile,
-)
-
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_PATH = str(_REPO_ROOT / "src")
@@ -33,45 +20,53 @@ requires_cuda = pytest.mark.skipif(
     not CUDA_AVAILABLE,
     reason="Sparton CUDA kernel tests require a CUDA device",
 )
-requires_optimized_gluon = pytest.mark.usefixtures("optimized_gluon_available")
+requires_optimized = pytest.mark.usefixtures("optimized_available")
 
-_OPTIMIZED_GLUON_AVAILABILITY: tuple[bool, str] | None = None
+_OPTIMIZED_AVAILABILITY: tuple[bool, str] | None = None
 
 
-def _optimized_gluon_availability() -> tuple[bool, str]:
-    global _OPTIMIZED_GLUON_AVAILABILITY
-    if _OPTIMIZED_GLUON_AVAILABILITY is not None:
-        return _OPTIMIZED_GLUON_AVAILABILITY
+def _optimized_availability() -> tuple[bool, str]:
+    global _OPTIMIZED_AVAILABILITY
+    if _OPTIMIZED_AVAILABILITY is not None:
+        return _OPTIMIZED_AVAILABILITY
     if not CUDA_AVAILABLE:
-        _OPTIMIZED_GLUON_AVAILABILITY = (
+        _OPTIMIZED_AVAILABILITY = (
             False,
-            "Sparton optimized Gluon tests require a CUDA device",
+            "Sparton optimized backend tests require a CUDA device",
         )
-        return _OPTIMIZED_GLUON_AVAILABILITY
+        return _OPTIMIZED_AVAILABILITY
 
-    from sparton._gluon_runtime import is_gluon_backend_available
+    from sparton._backend_runtime import is_optimized_backend_available
 
-    available, reason = is_gluon_backend_available()
-    _OPTIMIZED_GLUON_AVAILABILITY = (
+    available, reason = is_optimized_backend_available()
+    _OPTIMIZED_AVAILABILITY = (
         available,
-        reason if available else f"Sparton optimized Gluon backend is unavailable: {reason}",
+        reason if available else f"Sparton optimized backend is unavailable: {reason}",
     )
-    return _OPTIMIZED_GLUON_AVAILABILITY
+    return _OPTIMIZED_AVAILABILITY
 
 
 @pytest.fixture
-def optimized_gluon_available() -> None:
-    available, reason = _optimized_gluon_availability()
+def optimized_available() -> None:
+    available, reason = _optimized_availability()
     if not available:
         pytest.skip(reason)
+
+
+@pytest.fixture(autouse=True)
+def _optimized_autotune_off(monkeypatch) -> None:
+    # The optimized self-tuner's correctness is tile-independent, so default it OFF for the
+    # suite (fast analytic tile). The dedicated tuner test re-enables it.
+    monkeypatch.setenv("SPARTON_OPTIMIZED_AUTOTUNE", "off")
 
 
 ALL_BACKENDS = ("hybrid", "naive", "optimized")
 
 
 def _forward_for_backend(sparton_kernel, backend: str):
+    # `optimized` (pure-Triton, host-side TMA) is gated on the sm_90+ availability probe.
     if backend == "optimized":
-        available, reason = _optimized_gluon_availability()
+        available, reason = _optimized_availability()
         if not available:
             pytest.skip(reason)
     return getattr(sparton_kernel, f"{backend}_forward")
@@ -149,7 +144,7 @@ def assert_index_contract(
     atol: float,
     rtol: float,
 ) -> None:
-    """Index contract of record (design v2 §6.2).
+    """Index contract of record (ARCHITECTURE.md §3.2).
 
     Wherever the returned score is positive, the chosen sequence index must
     hold a masked input-dtype logit within tolerance of the per-(b, v)
@@ -234,32 +229,6 @@ def _grad_tolerances(dtype: torch.dtype) -> dict[str, float]:
     return {"atol": 2e-3, "rtol": 2e-3}
 
 
-def _device_profile(
-    *,
-    sm_count: int = 170,
-    max_threads_per_block: int = 1024,
-    max_threads_per_sm: int = 1536,
-    shared_memory_per_block_optin: int = 101376,
-    shared_memory_per_sm: int = 102400,
-) -> DeviceProfile:
-    return DeviceProfile(
-        sm_count=sm_count,
-        warp_size=32,
-        max_threads_per_block=max_threads_per_block,
-        max_threads_per_sm=max_threads_per_sm,
-        shared_memory_per_block_optin=shared_memory_per_block_optin,
-        shared_memory_per_sm=shared_memory_per_sm,
-        capability_major=12,
-        capability_minor=0,
-        device_name="test-device",
-        shared_memory_per_block=49152,
-        regs_per_sm=65536,
-        l2_cache_size=100663296,
-        memory_bus_width=512,
-        total_memory=34_190_458_880,
-    )
-
-
 def test_reference_keeps_zero_baseline_for_all_negative_logits() -> None:
     logits = torch.full((1, 3, 2), -2.0)
     mask = torch.ones((1, 3), dtype=torch.int32)
@@ -296,162 +265,6 @@ def test_reference_multiplies_mask_values_before_reduction() -> None:
     assert torch.equal(zero_idx, torch.zeros_like(zero_idx))
 
 
-def test_gluon_runtime_import_is_lazy() -> None:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = _SRC_PATH
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys\n"
-                "import sparton._gluon_runtime as gr\n"
-                "print(any(k.startswith('triton.experimental.gluon') for k in sys.modules))\n"
-                "print(gr._capability_mma_family((8, 0)))\n"
-                "try:\n"
-                "    gr._capability_mma_family((7, 5))\n"
-                "except RuntimeError as exc:\n"
-                "    print(type(exc).__name__)\n"
-            ),
-        ],
-        check=True,
-        env=env,
-        cwd=str(_REPO_ROOT),
-        text=True,
-        capture_output=True,
-    )
-
-    lines = result.stdout.strip().splitlines()[-3:]
-    assert lines == ["False", "mma_v2", "RuntimeError"]
-
-
-def test_gluon_policy_generator_prunes_resource_constraints() -> None:
-    device = _device_profile()
-    problem = ProblemSpec(M=4096, N=30522, K=768, dtype_name="fp16")
-
-    policies = generate_gluon_gemm_policies(problem, device)
-
-    assert GluonGemmPolicy(128, 128, 64, 3, 4, 2, 128) in policies
-    assert GluonGemmPolicy(128, 128, 32, 4, 4, 2, 64) in policies
-    assert all(policy.block_n <= 128 for policy in policies)
-    assert all(policy.block_k * problem.element_bytes >= policy.swizzle_byte_width for policy in policies)
-    assert all(policy.shared_memory_bytes(problem.element_bytes) <= device.shared_memory_per_block_optin
-               for policy in policies)
-
-    with_block_n_256 = generate_gluon_gemm_policies(
-        problem,
-        device,
-        include_block_n_256=True,
-    )
-    assert GluonGemmPolicy(128, 256, 32, 3, 4, 2, 64) in with_block_n_256
-
-
-def test_bench_gluon_gemm_autotune_configs_follow_policy_generator() -> None:
-    from types import SimpleNamespace
-
-    from benchmarks.bench_gluon_gemm import (
-        MAX_GEMM_AUTOTUNE_POLICIES,
-        gemm_autotune_configs_for_policies,
-        gemm_autotune_policy_universe,
-        policies_for_args,
-        policy_from_gemm_autotune_config,
-        prune_gemm_autotune_configs,
-    )
-    from sparton._gluon_policy_runtime import (
-        configs_for_policies,
-        policy_from_config,
-        prune_configs_for_policies,
-    )
-
-    args = SimpleNamespace(
-        M=4096,
-        N=30522,
-        K=768,
-        dtype="fp16",
-        device_profile="rtx5090",
-        include_block_n_256=True,
-    )
-
-    universe = gemm_autotune_policy_universe()
-    configs = gemm_autotune_configs_for_policies(universe)
-    shared_configs = configs_for_policies(universe)
-    pruned = prune_gemm_autotune_configs(configs, args)
-    active_policies = policies_for_args(args)
-    shared_pruned = prune_configs_for_policies(configs, active_policies, universe)
-
-    assert universe == gluon_gemm_policy_universe(include_block_n_256=True)
-    assert len(universe) == MAX_GEMM_AUTOTUNE_POLICIES
-    assert len(configs) == len(universe)
-    assert [
-        (
-            config.kwargs,
-            config.num_warps,
-            config.num_stages,
-        )
-        for config in configs
-    ] == [
-        (
-            config.kwargs,
-            config.num_warps,
-            config.num_stages,
-        )
-        for config in shared_configs
-    ]
-    assert [
-        config.kwargs
-        for config in configs
-    ] == [
-        policy_config_kwargs(policy, idx)
-        for idx, policy in enumerate(universe)
-    ]
-    assert [config.kwargs["POLICY_ID"] for config in configs] == list(range(len(configs)))
-    assert [policy_from_gemm_autotune_config(config, universe) for config in configs] == list(universe)
-    assert [policy_from_config(config, universe) for config in configs] == list(universe)
-    assert [policy_from_gemm_autotune_config(config, universe) for config in pruned] == list(active_policies)
-    assert pruned == shared_pruned
-    assert GluonGemmPolicy(128, 256, 32, 3, 4, 2, 64) in active_policies
-
-    args.include_block_n_256 = False
-    pruned_without_256 = prune_gemm_autotune_configs(configs, args)
-    assert all(
-        policy_from_gemm_autotune_config(config, universe).block_n <= 128
-        for config in pruned_without_256
-    )
-
-
-def test_optimized_forward_runtime_policy_derivation() -> None:
-    problem = ProblemSpec(M=4096, N=30522, K=768, dtype_name="fp16")
-    universe = optimized_forward_policy_universe()
-    fallback = optimized_forward_fallback_policy()
-    device = _device_profile()
-
-    policies = derive_optimized_forward_policies(problem, device)
-
-    assert len(universe) == 11
-    assert universe[0] == fallback
-    assert GluonGemmPolicy(128, 256, 32, 3, 4, 2, 64) not in universe
-    assert set(policies).issubset(set(universe))
-    assert fallback in policies
-
-    low_shared = _device_profile(
-        shared_memory_per_block_optin=32_768,
-        shared_memory_per_sm=32_768,
-    )
-    assert all(
-        policy.shared_memory_bytes(problem.element_bytes) <= low_shared.shared_memory_per_block_limit
-        for policy in derive_optimized_forward_policies(problem, low_shared)
-    )
-
-    low_threads = _device_profile(
-        max_threads_per_block=64,
-        max_threads_per_sm=64,
-    )
-    assert derive_optimized_forward_policies(problem, low_threads) == tuple()
-
-    tiny = ProblemSpec(M=10, N=19, K=16, dtype_name="fp16")
-    assert derive_optimized_forward_policies(tiny, device) == (fallback,)
-
-
 @requires_cuda
 @pytest.mark.cuda
 def test_naive_forward_autotune_configs_include_fixed_baseline(sparton_kernel) -> None:
@@ -472,56 +285,6 @@ def test_naive_forward_autotune_configs_include_fixed_baseline(sparton_kernel) -
     assert len(config_keys) > 1
     assert (16, 32, 32, 4, 3) in config_keys
     assert len(config_keys) == len(configs)
-
-
-@requires_optimized_gluon
-@pytest.mark.cuda
-@pytest.mark.optimized_gluon
-def test_optimized_forward_autotune_configs_follow_policy_generator(sparton_kernel) -> None:
-    import sparton._backend_optimized_gluon as optimized
-    from sparton._backend_optimized_gluon import (
-        get_optimized_forward_configs,
-        get_optimized_forward_policies,
-    )
-
-    assert not hasattr(optimized, "_POLICY_BANK_DEVICE")
-    assert not hasattr(optimized, "_POLICY_BANK_PROBLEM")
-
-    device = _device_profile()
-    problem = ProblemSpec(M=4096, N=30522, K=768, dtype_name="fp16")
-    fallback = optimized_forward_fallback_policy()
-
-    policies = get_optimized_forward_policies(problem, device)
-    configs = get_optimized_forward_configs()
-    config_keys = {
-        (
-            config.kwargs["BLOCK_M"],
-            config.kwargs["BLOCK_N"],
-            config.kwargs["BLOCK_K"],
-            config.kwargs["NUM_STAGES"],
-            config.kwargs["WARPS_M"],
-            config.kwargs["WARPS_N"],
-            config.num_warps,
-        )
-        for config in configs
-    }
-
-    assert fallback in policies
-    assert len(configs) > 1
-    assert len({config.kwargs["POLICY_ID"] for config in configs}) == len(configs)
-    assert (
-        fallback.block_m,
-        fallback.block_n,
-        fallback.block_k,
-        fallback.num_stages,
-        fallback.warps_m,
-        fallback.warps_n,
-        fallback.num_warps,
-    ) in config_keys
-    assert set(policies).issubset(set(optimized_forward_policy_universe()))
-
-    tiny = ProblemSpec(M=10, N=19, K=16, dtype_name="fp16")
-    assert get_optimized_forward_policies(tiny, device) == (fallback,)
 
 
 @requires_cuda
@@ -570,9 +333,9 @@ def test_naive_forward_matches_reference(
     assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_optimized_forward_matches_reference(
     sparton_kernel,
@@ -620,9 +383,9 @@ def test_naive_forward_semantic_cases(
     assert torch.equal(idx[:, :4], torch.tensor([[0, 1, 1, 1]], device=cuda_device))
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_optimized_forward_semantic_cases(
     sparton_kernel,
     cuda_device: torch.device,
@@ -686,9 +449,9 @@ def test_naive_forward_handles_tails(
     assert torch.equal(idx, expected_idx)
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), FORWARD_CASES)
 def test_optimized_forward_handles_tails(
     sparton_kernel,
@@ -726,9 +489,9 @@ def test_optimized_forward_handles_tails(
     assert torch.equal(idx, expected_idx)
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_optimized_forward_handles_multiple_sequence_chunks_small_d(
     sparton_kernel,
     cuda_device: torch.device,
@@ -810,9 +573,122 @@ def test_naive_forward_nontiny_shapes(
     assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(dtype))
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
+def test_optimized_forward_persistent_multitile(
+    sparton_kernel,
+    cuda_device: torch.device,
+    monkeypatch,
+) -> None:
+    # Landmine guard: force one persistent CTA to process MANY (b, vocab-tile) tiles
+    # (NUM_CTAS=1) so a missing per-tile running-state reset would leak a prior tile's
+    # max. Multiple s-tiles per tile (S > BLOCK_M) and a V-tail exercise the full loop.
+    monkeypatch.setenv("SPARTON_OPTIMIZED_NUM_CTAS", "1")
+    B, S, D, V = 2, 130, 64, 300  # 2 * ceil(300/64)=10 tiles, one CTA
+    generator = torch.Generator(device=cuda_device).manual_seed(7)
+    hidden = torch.randn((B, S, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    embed = torch.randn((V, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator) * 0.1
+    mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
+
+    scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+
+    assert_close(scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
+    assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(torch.float16))
+
+
+@requires_optimized
+@pytest.mark.cuda
+@pytest.mark.optimized
+@pytest.mark.parametrize("force_one_cta", [False, True])
+def test_optimized_forward_warp_specialize_matches_homogeneous(
+    sparton_kernel,
+    cuda_device: torch.device,
+    monkeypatch,
+    force_one_cta: bool,
+) -> None:
+    # The warp-specialized epilogue (SPARTON_OPTIMIZED_WARP_SPECIALIZE, with autotune off)
+    # must produce the SAME result as the homogeneous baseline. The WS path computes the
+    # strict-tie argmax via tl.max + masked tl.min (two single-result reduces — required
+    # because Triton's auto-WS pass rejects the 2-result combine); the homogeneous path uses
+    # the combine. They are bit-identical by construction. Covers a partially-masked row,
+    # S/V tails, bias, and the persistent NUM_CTAS=1 multi-tile reset (landmine #1).
+    B, S, D, V = 2, 130, 64, 300
+    generator = torch.Generator(device=cuda_device).manual_seed(5)
+    hidden = torch.randn((B, S, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    embed = torch.randn((V, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator) * 0.1
+    mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
+    mask[0, :50] = 0  # a partially-masked leading run
+
+    if force_one_cta:
+        monkeypatch.setenv("SPARTON_OPTIMIZED_NUM_CTAS", "1")
+
+    monkeypatch.delenv("SPARTON_OPTIMIZED_WARP_SPECIALIZE", raising=False)
+    base_scores, base_idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+    base_scores, base_idx = base_scores.clone(), base_idx.clone()
+    monkeypatch.setenv("SPARTON_OPTIMIZED_WARP_SPECIALIZE", "on")
+    ws_scores, ws_idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+
+    expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+    assert_close(ws_scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
+    assert_index_contract(ws_scores, ws_idx, hidden, embed, bias, mask, **_score_tolerances(torch.float16))
+    # max + masked-min == the combine by construction -> bitwise-identical.
+    assert torch.equal(ws_scores, base_scores), "warp-specialized scores differ from homogeneous"
+    assert torch.equal(ws_idx, base_idx), "warp-specialized indices differ from homogeneous"
+
+
+@requires_optimized
+@pytest.mark.cuda
+@pytest.mark.optimized
+@pytest.mark.slow
+def test_optimized_forward_autotune_selects_valid_cached_tile(
+    sparton_kernel,
+    cuda_device: torch.device,
+    monkeypatch,
+) -> None:
+    # The self-tuner (SPARTON_OPTIMIZED_AUTOTUNE=on, the production default) measures the
+    # candidate tiles and caches the winner keyed on (D, V, dtype, arch) — NOT B/S. Verify it
+    # runs, returns a correct result, caches exactly one entry, and that a different (B, S)
+    # with the same (D, V) reuses that entry (B/S excluded from the key).
+    from sparton._backend_optimized import _TILE_CACHE, clear_tile_cache
+
+    monkeypatch.setenv("SPARTON_OPTIMIZED_AUTOTUNE", "on")
+    clear_tile_cache()
+    B, S, D, V = 2, 64, 64, 512
+    generator = torch.Generator(device=cuda_device).manual_seed(3)
+    hidden = torch.randn((B, S, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    embed = torch.randn((V, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+    bias = torch.randn((V,), device=cuda_device, dtype=torch.float16, generator=generator) * 0.1
+    mask = (torch.rand((B, S), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
+
+    try:
+        scores, idx = sparton_kernel.optimized_forward(hidden, embed, bias, mask)
+        expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
+        assert_close(scores.float(), expected_scores.float(), **_score_tolerances(torch.float16))
+        assert_index_contract(scores, idx, hidden, embed, bias, mask, **_score_tolerances(torch.float16))
+
+        assert len(_TILE_CACHE) == 1, "self-tuner must cache exactly one (D,V,dtype,arch) entry"
+        (key,) = list(_TILE_CACHE)
+        policy, warp_specialize = _TILE_CACHE[key]
+        assert key[0] == D and key[1] == V and key[2] == torch.float16
+        assert policy.block_m > 0 and policy.block_n > 0 and policy.block_k > 0
+        assert isinstance(warp_specialize, bool)
+
+        # Different (B, S), same (D, V): must reuse the cached tile (key excludes B/S).
+        h2 = torch.randn((1, 128, D), device=cuda_device, dtype=torch.float16, generator=generator) * 0.3
+        m2 = (torch.rand((1, 128), device=cuda_device, generator=generator) > 0.25).to(torch.int32)
+        sparton_kernel.optimized_forward(h2, embed, bias, m2)
+        assert len(_TILE_CACHE) == 1, "a different (B,S) must not add a cache entry"
+    finally:
+        clear_tile_cache()
+
+
+@requires_optimized
+@pytest.mark.cuda
+@pytest.mark.optimized
 @pytest.mark.slow
 @pytest.mark.parametrize(("B", "S", "D", "V", "use_bias", "dtype"), NONTINY_FORWARD_CASES)
 def test_optimized_forward_nontiny_shapes(
@@ -826,11 +702,14 @@ def test_optimized_forward_nontiny_shapes(
     dtype: torch.dtype,
 ) -> None:
     _skip_if_unsupported_dtype(dtype)
-    # F3 coverage proof: these shapes escape the tiny-problem fallback, so the
-    # runtime-derived candidate set is the non-fallback production bank.
-    problem = ProblemSpec(M=B * S, N=V, K=D, dtype_name="fp16")
-    policies = derive_optimized_forward_policies(problem, torch_device_profile())
-    assert len(policies) > 1
+    # With autotune off (suite default) the backend uses its own self-contained analytic tile;
+    # assert it resolves and that the autotune sweep has candidates, then check values + index.
+    from sparton._backend_optimized import _analytic_tile, _device_limits, _valid_tiles
+
+    limits = _device_limits()
+    tile = _analytic_tile(2, limits)
+    assert tile.block_m > 0 and tile.block_n > 0 and tile.block_k > 0
+    assert _valid_tiles(2, limits), "the measured-autotune sweep must have at least one valid tile"
 
     hidden, embed, bias, mask = _make_nontiny_inputs(cuda_device, B, S, D, V, dtype, use_bias)
 
@@ -1087,7 +966,7 @@ def test_backward_masked_rows_yield_zero_hidden_gradient(
 # config family's CHUNK (src/sparton/_backend_hybrid.py,
 # get_uniform_hidden_grad_configs). Every random-input backward test has
 # expected run length V_active/S far below that, so without this case the
-# suite never executes the uniform deposit (the design v2 F3 class:
+# suite never executes the uniform deposit (the DEVELOPMENT.md M9 F3 class:
 # assert the activation, not just the outputs).
 _UNIFORM_PATH_CHUNK = 64
 
@@ -1185,7 +1064,7 @@ def test_backward_matches_legacy_kernel(
     identical non-tiny inputs (slow: autotunes both kernel families at this
     shape). Tolerance sits above the measured atomic-order self-spread of
     both designs (proxy spread <= 2.4e-5 relative legacy / <= 4.2e-6
-    segmented, M11 memo §7; the M13 decision matrix verified 176 cells at
+    segmented, DEVELOPMENT.md M11 §7; the M13 §5.5 decision matrix verified 176 cells at
     rtol=atol=1e-3) and far below any real divergence.
     """
 
@@ -1217,9 +1096,9 @@ AUTOCAST_DTYPES = [
 ]
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 @pytest.mark.slow
 def test_training_parity_smoke_autocast(
     sparton_kernel,
@@ -1227,11 +1106,11 @@ def test_training_parity_smoke_autocast(
 ) -> None:
     """Short head-only training run: hybrid and optimized stay in lockstep.
 
-    A trimmed version of benchmarks/probe_training_smoke.py (the M10 tier-1
+    A trimmed version of scripts/probe_training_smoke.py (the M10 tier-1
     gate); reuses its run_mode so the gate logic stays single-sourced.
     """
 
-    from benchmarks.probe_training_smoke import run_mode
+    from scripts.probe_training_smoke import run_mode
 
     failures = run_mode(
         mode="bf16",
@@ -1263,7 +1142,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
     cuda_device: torch.device,
     source: str,
 ) -> None:
-    """Pin the synthetic input contract of benchmarks/bench_backward.py.
+    """Pin the synthetic input contract of scripts/bench_backward.py.
 
     The M11 backward harness documents its synthetic regime in its docstring;
     this test single-sources the generator (no duplicated logic) and asserts
@@ -1273,7 +1152,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
     mirroring the forward's zero-baseline semantics.
     """
 
-    from benchmarks.bench_backward import make_synthetic_case
+    from scripts.bench_backward import make_synthetic_case
 
     active_fraction = 0.10
     case = make_synthetic_case(
@@ -1312,7 +1191,7 @@ def test_bench_backward_synthetic_inputs_honor_contract(
 @requires_cuda
 @pytest.mark.cuda
 def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None:
-    """Pin the --mask-density seam of benchmarks/bench_sparton_baseline.py.
+    """Pin the --mask-density seam of scripts/bench_sparton_baseline.py.
 
     The M12-T4 flag must not perturb the canonical rows: at density 1.0 the
     mask is exactly the historical all-ones mask, and because the mask is the
@@ -1320,7 +1199,7 @@ def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None
     density for the same seed.
     """
 
-    from benchmarks.bench_sparton_baseline import ShapeSpec, make_inputs
+    from scripts.bench_sparton_baseline import ShapeSpec, make_inputs
 
     spec = ShapeSpec(batch_size=2, seq_len=64)
     common = dict(dim=32, vocab=128, dtype=torch.float16, seed=7)
@@ -1338,11 +1217,11 @@ def test_bench_baseline_mask_density_contract(cuda_device: torch.device) -> None
 
 
 def test_bench_host_overhead_shape_parser() -> None:
-    """Pin the BxSxDxV CLI contract of benchmarks/bench_host_overhead.py."""
+    """Pin the BxSxDxV CLI contract of scripts/bench_host_overhead.py."""
 
     import argparse
 
-    from benchmarks.bench_host_overhead import parse_shape_list
+    from scripts.bench_host_overhead import parse_shape_list
 
     assert parse_shape_list("8x128x768x1280,32x128x768x30522") == (
         (8, 128, 768, 1280),
@@ -1416,9 +1295,9 @@ def test_forward_backward_under_autocast(
         assert bool(torch.isfinite(leaf.grad).all())
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 @pytest.mark.parametrize(("use_bias", "dtype"), BACKWARD_CASES)
 def test_optimized_backward_matches_reference(
     sparton_kernel,
@@ -1520,9 +1399,9 @@ def test_sparton_head_backend_routing(
 
     expected_scores, _ = sparton_reference(hidden, embed, bias, mask)
 
-    # M10 promotion: the default is adaptive — optimized where the Gluon
-    # backend is available, hybrid (with a one-time warning) elsewhere.
-    expected_default = "optimized" if _optimized_gluon_availability()[0] else "hybrid"
+    # M10 promotion: the default is adaptive — optimized where the pure-Triton
+    # TMA backend is available (sm_90+), hybrid (with a one-time warning) elsewhere.
+    expected_default = "optimized" if _optimized_availability()[0] else "hybrid"
     assert default_head.backend == expected_default
     assert hybrid_head.backend == "hybrid"
     assert naive_head.backend == "naive"
@@ -1534,9 +1413,9 @@ def test_sparton_head_backend_routing(
         sparton_kernel.SpartonHead(19, 16, backend="missing")
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_sparton_head_optimized_backend_routing(
     sparton_kernel,
     cuda_device: torch.device,
@@ -1638,9 +1517,9 @@ def test_resolve_backend_invalid_env_names_env_var(cuda_device: torch.device) ->
     assert "SPARTON_BACKEND environment variable" in result.stderr
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_default_backend_prefers_optimized_when_available(
     cuda_device: torch.device,
 ) -> None:
@@ -1673,11 +1552,11 @@ def test_default_backend_falls_back_to_hybrid_with_one_warning(
     sparton_kernel,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparton._gluon_runtime as gluon_runtime
+    import sparton._backend_runtime as backend_runtime
 
     monkeypatch.setattr(
-        gluon_runtime,
-        "is_gluon_backend_available",
+        backend_runtime,
+        "is_optimized_backend_available",
         lambda device=None: (False, "forced unavailable for test"),
     )
     monkeypatch.setattr(sparton_kernel, "_ENV_BACKEND", None)
@@ -1694,9 +1573,9 @@ def test_default_backend_falls_back_to_hybrid_with_one_warning(
     assert second.backend == "hybrid"
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_sparton_backend_env_selects_optimized_default(cuda_device: torch.device) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _SRC_PATH
@@ -1788,9 +1667,9 @@ def test_naive_forward_does_not_materialize_logits(
     assert peak_extra < logits_bytes
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_optimized_forward_does_not_materialize_logits(
     sparton_kernel,
     cuda_device: torch.device,
@@ -1840,9 +1719,9 @@ def test_custom_op_schemas_expose_optional_bias(sparton_kernel) -> None:
     assert "Tensor?)" in bwd_schema
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_optimized_custom_op_schema_exposes_optional_bias(sparton_kernel) -> None:
     _optimized_op = sparton_kernel.optimized_fwd_op
     optimized_schema = str(torch.ops.sparton.optimized_fwd.default._schema)
@@ -2043,9 +1922,9 @@ def test_validation_allows_fp32_hybrid(
     assert_close(scores, expected_scores, atol=1e-3, rtol=1e-3)
 
 
-@requires_optimized_gluon
+@requires_optimized
 @pytest.mark.cuda
-@pytest.mark.optimized_gluon
+@pytest.mark.optimized
 def test_optimized_validation_rejects_unaligned_d(
     sparton_kernel,
     cuda_device: torch.device,

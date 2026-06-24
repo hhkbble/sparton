@@ -1,14 +1,25 @@
-"""Shape-soak correctness gate for the optimized Gluon forward (M10 gate 5).
+"""Shape-soak correctness gate for the optimized (pure-Triton) forward (M10 gate 5).
 
-Sweeps the design-v2 §5 M10 grid — S in {1, 7, 64, 127, 128, 129, 255, 511},
-B in {1, 2, 5}, D in {768, 1024}, V in {30522, 151936}, bias in {yes, no},
-dtype in {fp16, bf16} — with 75%-density random masks where batch row 0 is
-fully zeroed (the all-zero-row edge; for B=1 the whole batch is masked).
+The `optimized` backend (`src/sparton/_backend_optimized.py`) is the pure-Triton
+persistent fused forward; it is bit-close to `naive` by construction (fp32
+accumulation). Routes through the public `optimized_forward`, so it tests
+whichever tile the backend selects (the self-tuner is defaulted OFF here —
+correctness is tile-independent; see main()).
+
+Sweeps the M10 grid (DEVELOPMENT.md M10) — S in {1, 7, 64, 127, 128, 129, 255,
+511}, B in {1, 2, 5}, D in {768, 1024}, V in {30522, 151936}, bias in {yes, no},
+dtype in {fp16, bf16} — with 75%-density random masks where batch row 0 is fully
+zeroed (the all-zero-row edge; for B=1 the whole batch is masked).
 
 Each case checks scores against a vectorized input-dtype reference and the
-returned indices against the tie-aware index contract of record (design v2
-§6.2): wherever the score is positive, the masked logit at the chosen index
-must be within score tolerance of the per-(b, v) maximum.
+returned indices against the tie-aware index contract of record
+(ARCHITECTURE.md §3.2): wherever the score is positive, the masked logit at the
+chosen index must be within score tolerance of the per-(b, v) maximum.
+
+Honors the optimized env knobs read by the backend launcher
+(``SPARTON_OPTIMIZED_AUTOTUNE`` / ``SPARTON_OPTIMIZED_WARP_SPECIALIZE`` /
+``SPARTON_OPTIMIZED_NUM_CTAS`` / ``SPARTON_OPTIMIZED_CTAS_PER_SM``) — set them
+in the environment to soak a specific variant.
 
 Exits non-zero listing every failing case. Use ``--quick`` for a small smoke
 subset during development; the full sweep is the promotion gate.
@@ -17,6 +28,7 @@ subset during development; the full sweep is the promotion gate.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -108,15 +120,21 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    # Correctness is tile-independent, so the soak runs with the self-tuner OFF (the fast
+    # analytic tile) unless the caller overrides it. The measured-tile path is covered by the
+    # unit tuner test and the benchmark; tuning every (D, V) here would be slow and add
+    # nothing to a correctness gate.
+    os.environ.setdefault("SPARTON_OPTIMIZED_AUTOTUNE", "off")
+
     if not torch.cuda.is_available():
         raise RuntimeError("soak_optimized_correctness.py requires CUDA")
-    from sparton._gluon_runtime import is_gluon_backend_available
+    from sparton._backend_runtime import is_optimized_backend_available
 
-    available, reason = is_gluon_backend_available()
+    available, reason = is_optimized_backend_available()
     if not available:
         raise RuntimeError(
-            "soak_optimized_correctness.py requires the optimized Gluon "
-            f"backend (CUDA sm_80+ and importable triton.experimental.gluon): {reason}"
+            "soak_optimized_correctness.py requires the optimized backend "
+            f"(CUDA sm_90+ and importable triton.tools.tensor_descriptor): {reason}"
         )
 
     import sparton.sparton_kernel as sk
@@ -138,11 +156,22 @@ def main() -> int:
         for S in s_values
         for use_bias in (True, False)
     ]
+    variant = []
+    for env_key in (
+        "SPARTON_OPTIMIZED_AUTOTUNE",
+        "SPARTON_OPTIMIZED_WARP_SPECIALIZE",
+        "SPARTON_OPTIMIZED_NUM_CTAS",
+        "SPARTON_OPTIMIZED_CTAS_PER_SM",
+    ):
+        value = os.environ.get(env_key)
+        if value:
+            variant.append(f"{env_key}={value}")
+    variant_note = (" [" + ", ".join(variant) + "]") if variant else ""
     print(
         f"optimized shape soak: {len(cases)} cases "
         f"(S={s_values} B={b_values} D={d_values} V={v_values} "
         f"bias=y/n dtypes={[str(d) for d in dtypes]}), mask density 75%, "
-        "row 0 fully masked",
+        f"row 0 fully masked{variant_note}",
         flush=True,
     )
 

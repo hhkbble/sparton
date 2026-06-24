@@ -9,10 +9,10 @@ The benchmark runs one row per (B, S) pair with all-ones attention masks by
 default; ``--mask-density p`` switches to seeded Bernoulli(p) masks (M12-T4
 sweep dimension — density 1.0 is byte-identical to the all-ones default and
 leaves every other input draw untouched). The naive backend uses production
-Triton autotune; pass ``--optimized-policy on`` to include the experimental
-Gluon forward with runtime GPU-derived active autotune candidates.
-Needs PYTHONPATH=src and the hardened env prefix from
-docs/sparton_gluon_remaining_work_design.md section 2.4.
+Triton autotune; pass ``--optimized-policy on`` to include the pure-Triton
+``optimized`` forward (persistent grid + measured self-tuner), which honors the
+``SPARTON_OPTIMIZED_*`` env knobs that select its kernel variant.
+Needs PYTHONPATH=src and the hardened env prefix from ARCHITECTURE.md §2.4.
 """
 
 from __future__ import annotations
@@ -92,6 +92,8 @@ def make_inputs(
     dtype: torch.dtype,
     seed: int,
     mask_density: float = 1.0,
+    mask_type: str = "random",
+    min_len_frac: float = 0.25,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = torch.randn(
@@ -105,12 +107,27 @@ def make_inputs(
     embed = torch.randn(vocab, dim, device="cuda", dtype=dtype, generator=generator) * 0.05
     bias = torch.randn(vocab, device="cuda", dtype=dtype, generator=generator) * 0.05
     # The mask is the last generator consumer, so hidden/embed/bias draws are
-    # identical at every density; rand in [0, 1) < 1.0 is all-True, making the
-    # default byte-identical to the historical torch.ones mask.
-    mask = (
-        torch.rand(spec.batch_size, spec.seq_len, device="cuda", generator=generator)
-        < mask_density
-    ).to(torch.int32)
+    # identical across mask configs.
+    if mask_type == "contiguous":
+        # Variable-length sequences right-padded to a common S (the SPLADE/encoder
+        # serving default): per-row real length ~ Uniform[ceil(S*min_len_frac), S],
+        # then positions >= length are padding. A realistic serving workload where
+        # whole aligned chunks land in the padding, unlike the random --mask-density
+        # Bernoulli scatter. The dense forward's runtime is density-independent (M12),
+        # so this is a workload-shape diagnostic, not a forward-latency lever.
+        low = max(1, int(round(spec.seq_len * min_len_frac)))
+        lengths = torch.randint(
+            low, spec.seq_len + 1, (spec.batch_size,), device="cuda", generator=generator
+        )
+        positions = torch.arange(spec.seq_len, device="cuda")
+        mask = (positions[None, :] < lengths[:, None]).to(torch.int32)
+    else:
+        # rand in [0, 1) < 1.0 is all-True, making the default byte-identical to the
+        # historical torch.ones mask.
+        mask = (
+            torch.rand(spec.batch_size, spec.seq_len, device="cuda", generator=generator)
+            < mask_density
+        ).to(torch.int32)
     return hidden, embed, bias, mask
 
 
@@ -139,7 +156,10 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         dtype=dtype,
         seed=args.seed + spec.batch_size * 65537 + spec.seq_len,
         mask_density=args.mask_density,
+        mask_type=args.mask_type,
+        min_len_frac=args.min_len_frac,
     )
+    mask_active_pct = mask.float().mean().item() * 100.0
 
     def hybrid_bias():
         return sk.hybrid_forward(hidden, embed, bias, mask)
@@ -241,6 +261,7 @@ def benchmark_shape(args, spec: ShapeSpec, sk) -> dict[str, object]:
         "optimized_nobias_ms": optimized_nobias_ms,
         "optimized_fwd_bwd_ms": optimized_fwd_bwd_ms,
         "optimized_peak_mib": None if optimized_peak is None else bytes_to_mib(optimized_peak),
+        "mask_active_pct": mask_active_pct,
         "output_mib": bytes_to_mib(output_bytes),
         "logits_mib": bytes_to_mib(logits_bytes),
         "tokens_per_s": tokens / (hybrid_bias_ms / 1000.0),
@@ -272,6 +293,7 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
         ("opt ms", "right"),
         ("opt f+b ms", "right"),
         ("opt MiB", "right"),
+        ("msk%", "right"),
         ("out MiB", "right"),
         ("logits MiB", "right"),
         ("tok/s", "right"),
@@ -296,6 +318,7 @@ def print_rows(rows: Sequence[dict[str, object]]) -> None:
             fmt(row["optimized_nobias_ms"]),
             fmt(row["optimized_fwd_bwd_ms"]),
             fmt(row["optimized_peak_mib"], precision=2),
+            fmt(row["mask_active_pct"], precision=0),
             fmt(row["output_mib"], precision=2),
             fmt(row["logits_mib"], precision=1),
             fmt(row["tokens_per_s"], precision=0),
@@ -311,6 +334,20 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
     parser.add_argument("--dtype", choices=("bf16", "bfloat16", "fp16", "float16"), default="bf16")
     parser.add_argument("--mask-density", type=parse_density, default=1.0)
+    parser.add_argument(
+        "--mask-type",
+        choices=("random", "contiguous"),
+        default="random",
+        help="random: Bernoulli(--mask-density) scatter (density-independence diagnostic). "
+        "contiguous: variable-length right-padding (the realistic serving workload that "
+        "triggers the experiment backend's SPARTON_OPTIMIZED_SKIP_MASKED early exit).",
+    )
+    parser.add_argument(
+        "--min-len-frac",
+        type=parse_density,
+        default=0.25,
+        help="contiguous masks only: per-row real length is Uniform[ceil(S*min_len_frac), S].",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--rep", type=int, default=16)
@@ -334,14 +371,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("default bf16 benchmark requires CUDA BF16 support; pass --dtype fp16")
     if args.optimized_policy == "on":
-        from sparton._gluon_runtime import is_gluon_backend_available
+        from sparton._backend_runtime import is_optimized_backend_available
 
-        available, reason = is_gluon_backend_available()
+        available, reason = is_optimized_backend_available()
         if not available:
             raise RuntimeError(
                 "bench_sparton_baseline.py --optimized-policy on requires the "
-                "optimized Gluon backend (CUDA sm_80+ and importable "
-                f"triton.experimental.gluon): {reason}"
+                "optimized backend (CUDA sm_90+ and importable "
+                f"triton.tools.tensor_descriptor): {reason}"
             )
 
     import sparton.sparton_kernel as sk
@@ -355,11 +392,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"warmup/rep={args.warmup}/{args.rep} naive={args.naive_policy} "
         f"optimized={args.optimized_policy}"
     )
-    mask_note = (
-        "masks are all ones."
-        if args.mask_density == 1.0
-        else f"masks are Bernoulli(p={args.mask_density:g})."
-    )
+    if args.mask_type == "contiguous":
+        mask_note = (
+            f"masks are contiguous right-padding (real length ~ Uniform[{args.min_len_frac:g}*S, S]); "
+            "msk% is the mean active fraction."
+        )
+    elif args.mask_density == 1.0:
+        mask_note = "masks are all ones."
+    else:
+        mask_note = f"masks are Bernoulli(p={args.mask_density:g})."
     print(f"Times are milliseconds per fixed (B, S) row; {mask_note}")
 
     rows = []

@@ -1,0 +1,42 @@
+shape        kernel buffer                          model       measured  resid%
+-- dev_fp16: f=1.0000 runs=3045 chunks_live=30522 mixed=2960 T_d(seg)=6 T_d(emb)=12
+dev_fp16     seg   lts_read sectors           49,221,453     48,861,752    0.7%
+dev_fp16     seg   red sectors                 3,514,752      3,486,240    0.8%
+dev_fp16     seg   dram_read MB (compuls.)             59             68  -14.1%
+dev_fp16     emb   l1 load sectors            49,811,901     49,269,888    1.1%
+dev_fp16     emb   lts_write sectors           2,933,927      2,933,943   -0.0%
+dev_fp16     emb   dram_write MB                      94             53   76.3%
+dev_fp16     seg   t_floor L2/cons/DRAM    0.254 / 0.328 / 0.045 ms   measured(ncu) 0.765 ms   kappa_dram=1.45
+dev_fp16     emb   t_floor L2/cons/DRAM    0.194 / 0.251 / 0.044 ms   measured(ncu) 0.214 ms
+dev_fp16     emb   measured gather L1-absorption alpha = 0.27
+-- corner_bf16: f=1.0000 runs=6124 chunks_live=37984 mixed=6015 T_d(seg)=16 T_d(emb)=16
+corner_bf16  seg   lts_read sectors          171,708,160    170,174,528    0.9%
+corner_bf16  seg   red sectors                 6,429,696      6,396,160    0.5%
+corner_bf16  seg   dram_read MB (compuls.)            340            372   -8.6%
+corner_bf16  emb   l1 load sectors           165,306,368    164,692,224    0.4%
+corner_bf16  emb   lts_write sectors          19,466,800     19,466,812   -0.0%
+corner_bf16  emb   dram_write MB                     622            584    6.6%
+corner_bf16  seg   t_floor L2/cons/DRAM    0.856 / 1.108 / 0.263 ms   measured(ncu) 2.590 ms   kappa_dram=1.20
+corner_bf16  emb   t_floor L2/cons/DRAM    0.863 / 1.117 / 0.411 ms   measured(ncu) 0.759 ms
+corner_bf16  emb   measured gather L1-absorption alpha = 0.04
+-- query_r0: f=1.0000 runs=246 chunks_live=15626 mixed=206 T_d(seg)=12 T_d(emb)=12
+query_r0     seg   lts_read sectors          210,159,659    209,927,708    0.1%
+query_r0     seg   red sectors                 1,547,328      1,546,752    0.0%
+query_r0     seg   dram_read MB (compuls.)            432            751  -42.5%
+query_r0     emb   l1 load sectors           204,001,403    157,306,992   29.7%
+query_r0     emb   lts_write sectors          24,031,442     24,031,459   -0.0%
+query_r0     emb   dram_write MB                     768            727    5.7%
+query_r0     seg   t_floor L2/cons/DRAM    1.025 / 1.327 / 0.502 ms   measured(ncu) 2.800 ms   kappa_dram=1.96
+query_r0     emb   t_floor L2/cons/DRAM    0.390 / 0.505 / 0.506 ms   measured(ncu) 0.626 ms
+query_r0     emb   measured gather L1-absorption alpha = 0.77
+-- doc_r1: f=1.0000 runs=2511 chunks_live=125001 mixed=2426 T_d(seg)=6 T_d(emb)=12
+doc_r1       seg   lts_read sectors          201,117,301    201,263,299   -0.1%
+doc_r1       seg   red sectors                12,482,208     12,460,800    0.2%
+doc_r1       seg   dram_read MB (compuls.)            432            747  -42.1%
+doc_r1       emb   l1 load sectors           204,000,877    200,782,128    1.6%
+doc_r1       emb   lts_write sectors          24,031,442     24,031,455   -0.0%
+doc_r1       emb   dram_write MB                     768            728    5.5%
+doc_r1       seg   t_floor L2/cons/DRAM    1.036 / 1.341 / 0.503 ms   measured(ncu) 3.310 ms   kappa_dram=1.94
+doc_r1       emb   t_floor L2/cons/DRAM    0.831 / 1.075 / 0.509 ms   measured(ncu) 0.895 ms
+doc_r1       emb   measured gather L1-absorption alpha = 0.30
+MODEL_DONE
