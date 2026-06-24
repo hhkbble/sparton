@@ -28,6 +28,13 @@ class LSRModelArguments:
         default="torch",
         metadata={"help": "'torch', 'compiled', or 'sparton' for SpartonHead kernel"},
     )
+    sparton_backend: str = field(
+        default=None,
+        metadata={
+            "help": "Sparton backend for head='sparton' ('hybrid', 'naive', or "
+            "'optimized'); default keeps Sparton's own resolution"
+        },
+    )
 
 
 @dataclass
@@ -228,6 +235,20 @@ class LSRTrainer(Trainer):
             self.control.should_log = True
         super()._maybe_log_save_evaluate(*args, **kwargs)
 
+    def save_model(self, output_dir=None, _internal_call=False):
+        # SpladeModel ties the projection head weight to the backbone word
+        # embeddings; safetensors refuses shared tensors and SpladeModel is a
+        # plain nn.Module, so Trainer._save cannot serialize it. torch.save
+        # handles shared storage natively.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(
+            self.model.state_dict(),
+            os.path.join(output_dir, "pytorch_model.bin"),
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+
 
 def load_swim_ir_dataset(dataset_name, languages, **kwargs):
     """Load and concatenate swim-ir subsets for the given languages."""
@@ -256,6 +277,7 @@ def main():
     model = SpladeModel(
         model_name_or_path=model_args.model_name_or_path,
         head=model_args.head,
+        sparton_backend=model_args.sparton_backend,
     )
 
     # Dataset
