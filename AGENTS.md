@@ -68,9 +68,14 @@ METHODOLOGY.md is the default and the others are its specializations.
   - `backward/optimized.py` — the **optimized** backward (used by the optimized
     forward): the uniform+mixed hidden-grad design (`uniform_hidden_grad_kernel` +
     `mixed_hidden_grad_kernel` + `get_uniform_hidden_grad_configs` +
-    `optimized_bwd`) — a vectorized uniform-chunk streaming pass plus a
-    mixed-chunk segmented scan whose predicates complement at one shared CHUNK
-    granularity — plus the folded shared prep stages (`_bwd_shared_stages` +
+    `optimized_bwd`) — a uniform-chunk streaming pass (its per-chunk reduce is a
+    **dtype-aware** compensated `tl.dot`, so the matmul pipeliner multi-buffers the
+    embed gather via cp.async — L1TEX→L2-bound, range-safe under fp16+bf16 AMP; the
+    `COMP_MODE` constexpr is resolved host-side from `embed.dtype` by
+    `_resolve_uniform_comp_mode`: fp16/fp32 block-scale, bf16 no-scale, and
+    `SPARTON_BWD_COMPENSATE=0` forces non-compensated)
+    plus a mixed-chunk segmented scan whose predicates complement at one shared
+    CHUNK granularity — plus the folded shared prep stages (`_bwd_shared_stages` +
     `bwd_prep_kernel` with a device-side active count + the exclusive-owner
     `embed_grad_kernel` (`get_embed_grad_bwd_configs`) +
     `bwd_gather_payload_kernel`);
@@ -202,6 +207,15 @@ commands are the safety surface those method sections operate within.
 - Numerics contract: forward output follows hidden/logit dtype; `naive`/
   `optimized` accumulate logits in fp32 (more precise than hybrid's
   input-dtype logits — intended); backward gradient buffers are `float32`.
+  The `optimized` uniform reduce's compensation is **dtype-routed** (`COMP_MODE`
+  from `embed.dtype`, `_resolve_uniform_comp_mode`): fp16/fp32 **must** block-scale
+  (g is fp32 and overflows fp16 under AMP loss-scaling — no-scale fp16 NaNs); bf16
+  uses no-scale compensated (its 8-bit exponent already spans fp32 range — ≤
+  block-scale error, ~3% faster). Do **not** collapse the branch to one path (the
+  bf16-hi/fp16-lo unification was measured and refuted — `tl.dot` operand matching
+  degrades the embed ~25000×). `SPARTON_BWD_COMPENSATE=0` opts into a single
+  non-compensated dot (faster, but bf16 ~1e-3 and fp16+AMP range-unsafe) — a
+  deliberate user footgun, warned once.
   Buffer-allocation strategy differs by backward kernel and is part of
   correctness — keep allocation and coverage in lockstep if either changes:
   - **`optimized`**: `hidden_grad` is zero-filled (atomic accumulation;
@@ -235,10 +249,12 @@ commands are the safety surface those method sections operate within.
 - Do not casually change autotune config lists, tile-size heuristics,
   `torch.library.custom_op` signatures, fake registrations, or autograd setup.
   These affect compilation, graph capture, memory behavior, and gradients.
-  In the optimized backward, the uniform kernel's maskless-load fast branch is
-  gated on `hidden_dim % BLOCK_D == 0` at compile time — a new config whose
-  BLOCK_D breaks divisibility silently takes the masked path (correct but
-  slower); a non-multiple-of-SUB CHUNK is caught by the host assert.
+  In the optimized backward, the uniform kernel's embed gather is **always
+  masked** (`other=0.0`): it feeds a `tl.dot`, so masked-out lanes and a
+  non-divisible-`hidden_dim` column tail must read 0, not garbage (the dot has no
+  per-element guard). `BLOCK_D` is the dot's N (keep ≥ 64 and a valid MMA shape
+  with M=`MPAD`=16, K=`CHUNK`=64); `CHUNK` stays 64 (the complement granularity +
+  the dot's K). A non-multiple-of-`SUB` `CHUNK` is caught by the host assert.
 - The hybrid forward has one reduction helper
   (`reduce_seq_max_log1p_relu` in `forward/hybrid.py`): it returns max values
   **plus** indices and is the path autograd needs (the indices feed the saved
@@ -367,11 +383,29 @@ chain, commit-body rules) lives in
   at the autotuned tile shape — DEVELOPMENT.md M12; launcher v2 stays
   deferred, ARCHITECTURE.md §6.7). The optimized forward's backward is the
   **`optimized`** design promoted at M13 (then named `split`; at M13 it measured
-  real records 1.46–1.60× over the since-removed M11 segmented design, with the
-  synthetic f=0.10 short-run regime carrying a recorded 6–16% regression and no
-  real-data representative; residual: uniform-pass LTS ≈ 61–67% (config-dependent)
-  vs the embed kernel's 82–104%, plus the short-run regimes capped by the mixed
-  fraction — DEVELOPMENT.md M13). The hybrid/naive forwards use the **`mono`**
+  real records 1.46–1.60× over the since-removed M11 segmented design). Its
+  uniform pass's per-chunk reduce was then **landed as a block-scaled compensated
+  `tl.dot`** (post-M13, 2026-06-26) — the matmul pipeliner multi-buffers the embed
+  gather via cp.async (L1TEX 83→66, L2 61→77), and the mixed launch was retuned
+  (BLOCK_D 128→64, SUB 64→32, stages 2→3): **~1.11–1.13× end-to-end on real records**,
+  range-safe under fp16+bf16 AMP, gate-clean (135 tests + mono A/B). An exhaustive
+  joint sweep (WS × stages × warps × BLOCK_D × CTA-cap) found no further gain:
+  warp-specialization is structurally unavailable (auto-WS needs TMA-descriptor
+  loads; the dot's embed read is a data-dependent scatter, which also blocks TMA),
+  and the pass is L2-BW-bound so it wants more CTAs, not bigger ones. The reduce was
+  then made **dtype-aware** (2026-06-26): bf16 drops the block-scale (no-scale
+  compensated — ≤ error, exact on representable g, **~2.5–4.5% faster bf16 backward**
+  on captured-real), fp16/fp32 keep it (the bf16-hi/fp16-lo alternative was measured
+  and refuted), and compensation is a user knob
+  (`SPARTON_BWD_COMPENSATE`); the dot-mixed stays closed-negative (cumsum wins on every
+  dtype). A 2026-06-26 re-profile then re-bound the embed kernel as **output-write-DRAM-bound**
+  (V×D fp32 store ≈ all DRAM traffic; the gather is L2-served, compute slack — correcting the
+  old "L2-bound" note) and **removed its never-firing `tl.sum(tl.abs(g))` tile-skip guard**
+  (~3–4% faster on query, +7–33% on the isolated pass; the per-lane gather mask is the only
+  suppression). Residual: uniform-pass L2-BW-bound (~77%) + embed kernel at its output-write
+  floor (DEVELOPMENT.md M13 + the post-M13 dot landing + dtype-aware compensation + embed_grad
+  guard removal).
+  The hybrid/naive forwards use the **`mono`**
   backward (the restored M2 fully-atomic scatter; the optimized↔mono A/B records
   optimized 2–3.7× faster on captured-real). Reopening either track starts from the relevant
   milestone's residual-bottleneck note and a fresh profile of the artifact

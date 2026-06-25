@@ -6,6 +6,49 @@ Full evidence (gates, profiles, deviations, known gaps) lives in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the working method in
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
+## 2026-06-26
+
+- **Optimized backward: removed a never-firing tile-skip guard in `embed_grad_kernel`
+  (~3–4% faster on query records).** A fresh perturbation profile re-binds the embed/bias
+  gradient pass as **output-write-DRAM-bound** (the `V×D` fp32 store is ≈100% of DRAM traffic;
+  ncu 762/768 MB) — not the gather/L2 the old note assumed (the gather is L2-served, 21–39% of
+  time; compute is slack). The `if tl.sum(tl.abs(g)) != 0:` tile-skip guard never fired (an
+  all-zero `[BLOCK_B,BLOCK_V]` tile ~never occurs at B≥16: 0% on real, 0.7% at f=0.01) while
+  costing a per-d-tile reduction (+7–33% on the pass), so it was removed; the per-lane gather
+  mask is the only suppression needed. Same gradients (the guard only skipped no-ops), same op
+  schema/ownership. End-to-end query ~3–4% faster, doc within noise (query-weighted — embed_grad
+  is a larger fraction of the short query backward). Validated: 135 pytest, mono A/B (fp16+bf16,
+  real) 0 failures, compute-sanitizer clean, training smoke identical.
+- **Optimized backward: dtype-aware compensation — bf16 drops the block-scale,
+  ~2.5–4.5% faster bf16 backward on real records.** The uniform reduce's
+  fp32→model-dtype rounding is now compensated per dtype (`COMP_MODE`, resolved from
+  `embed.dtype`): bf16 uses no-scale compensated (its 8-bit exponent already spans the
+  fp32 range, so block-scaling only adds roundings and can *increase* error on
+  exactly-representable g), while fp16/fp32 keep block-scale for AMP range safety.
+  Measured ≤ block-scale error in every regime (exact on representable g) and 3.4–7%
+  faster on the uniform pass in isolation. Compensation is now a **user option**:
+  `SPARTON_BWD_COMPENSATE=0` selects a single non-compensated dot (faster, but
+  bf16-imprecise and fp16+AMP range-unsafe), warned once. The fp16 bf16-hi/fp16-lo
+  alternative was measured and refuted (`tl.dot` operand matching degrades the embed
+  ~25000×); the dot-mixed stays a documented negative on every dtype. Same gradients
+  within tolerance, same op schema/saved-tensors/atomic ownership. Validated: 135
+  pytest, mono A/B (fp16+bf16, synthetic+real), training smoke (AMP parity, bf16
+  rel-diff 0.0024), compute-sanitizer (memcheck/racecheck/initcheck clean).
+- **Optimized backward: uniform-pass reduce → block-scaled compensated `tl.dot`,
+  mixed launch retuned. ~1.11–1.13× faster on real records** (query 2.27→2.04 ms,
+  doc 2.79→2.46 ms), same gradients, same op schema/saved-tensors, same atomic
+  ownership. The uniform pass's per-chunk reduce now feeds a `tl.dot` so the matmul
+  software-pipeliner multi-buffers the embed gather via cp.async (moves it off the
+  L1TEX/load-issue bound onto the L2-BW bound); `g` is block-scaled per chunk so the
+  fp16/bf16 MMA stays range-safe under AMP (fp64 rel err ~3e-7). The mixed pass
+  launch was retuned (BLOCK_D 128→64, SUB 64→32, num_stages 2→3; exact same cumsum).
+  Validated: 135 pytest, mono A/B (fp16+bf16), training smoke (AMP parity),
+  compute-sanitizer (memcheck/racecheck clean). An exhaustive joint sweep
+  (warp-specialization × pipeline × occupancy × CTA-count) found no further gain on
+  this pass — auto-WS/TMA are structurally blocked by the embed gather being a
+  data-dependent scatter (the iron law). Evidence: DEVELOPMENT.md "Post-M13
+  dot-reduction backward landing".
+
 ## 2026-06-25
 
 - **Reduced the backward to two kernels, `{mono, optimized}`, selected

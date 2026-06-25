@@ -1771,3 +1771,430 @@ M13 as `segmented_reference_bwd` while the `split` design shipped behind
 `bwd_op` / `sparton::bwd`. Those names were accurate at their dates and are kept
 as period-accurate record; this section documents their supersession (`split` →
 `optimized`, `segmented` deleted, `mono` restored, `bwd_op` → the two ops above).
+
+## Post-M13 — SpMM / native-primitive backward investigation (2026-06-25)
+
+**Not a milestone** (no code, numerics, autotune lists, or op schemas changed — a
+research spike + teaching write-up only). Question raised while writing the
+backward teaching doc: the backward is mathematically a sparse matrix multiply
+(see the doc's Appendix A — `(scores, idx)` is a selection-sparse logit gradient
+`Gℓ ∈ [B,S,V]` with one nonzero per `(b,v)`), so could a mature industrial
+SpMM / scatter primitive replace the hand-written Triton kernel — possibly faster,
+or at least simpler? Method: two web-research agents (PyTorch-native primitives;
+third-party / GPU libraries + sm_120 availability) cross-checked against
+**on-machine probes** in the project venv; the disposable benchmark is
+`tests/data/runs/spmm_research/bench_spmm.py` (gitignored). Full survey with
+citations was kept in the backward teaching appendix (since retired).
+
+### Finding 1 — the structured-sparse equivalence is exact (correctness)
+
+A pure-PyTorch backward built from `gather` + elementwise + `scatter_add_`
+(the runnable form of Appendix A's einsum) matches `optimized_bwd` to **~2e-7**
+on `B4 S33 D64 V2048` — empirically confirming `hidden_grad`/`embed_grad`/`bias_grad`
+are the three standard matmul-backward contractions of `Gℓ`.
+
+### Finding 2 — native scatter_add is correct but slower *and* VRAM-heavy
+
+`do_bench` op-level (min of 3, warmup), fp16, `f = 1.0` dense, idx uniform:
+
+| impl | dev `B32 S128 D768 V30522` | real-ish `B16 S256 D768 V250002` |
+|---|---|---|
+| `optimized` (kernel) | 1.00 ms · 431 MiB | 2.93 ms · 1466 MiB |
+| `mono` (kernel) | 1.32 ms · 420 MiB | 5.56 ms · 1420 MiB |
+| native `gather+scatter_add` | 12.3 ms · 5972 MiB | tens–hundreds ms (unstable, near-OOM) · 25352 MiB |
+| native chunked (over `V=4096`) | 11.1 ms · 957 MiB | 47.1 ms · 1572 MiB |
+
+The un-fused native form materializes two `[B,V,D]` fp32 intermediates
+(`gather`ed hidden + the `g·embed` product), ~12 GB each at the real-ish shape →
+~25 GB peak (near the 32 GB card limit; the caching allocator thrashes there, so
+its time is unstable — hence the "tens–hundreds ms"). Net: **~12–16× slower and
+~14–17× more VRAM** than the fused kernel. Tiling over `V` (the "chunked" row)
+recovers VRAM to kernel-comparable (957 MiB / 1572 MiB) **but stays ~11–16× slower
+and means hand-writing the kernel's tiling** — i.e. the library convenience that
+motivated the question is gone, and it still does not win. Same memory penalty the
+project avoided in the *forward* by never materializing `[B,S,V]` logits.
+
+### Finding 3 — determinism parity
+
+Native `scatter_add` is non-deterministic by default (run-to-run `hidden_grad`
+spread ~2e-5, atomic order — same character as the kernels' `hidden_grad`, M11 §7 / M13 §6)
+and exactly deterministic under `torch.use_deterministic_algorithms(True)`
+(measured 0.0), which trades speed, not correctness (only `scatter_reduce(prod)` /
+`EmbeddingBag(max)` raise). So "switch to a library to get determinism" holds, but
+at a perf cost, and our kernels already accept the same non-determinism.
+
+### Finding 4 — the closest industrial analog is embedding backward (and it's *our* algorithm)
+
+PyTorch's `embedding_dense_backward` / `_embedding_bag_dense_backward` is a
+**radix-sort + segment-sum** (CUDA source: sort indices → `cub::unique_by_key` →
+`partials_per_segment` → `sum_and_scatter`; the sort exists *for determinism*,
+pytorch#30711). That is the same algorithm class as the **`optimized`** backward
+(sort by destination → segmented reduce; the uniform+mixed passes are a tiled
+segment-sum, `mono` is the unsorted atomic scatter). So we did not invent a novel
+scheme — we specialized the standard vocab-embedding-gradient pattern to the
+one-nonzero-per-`(b,v)` structure and fused it across all three gradients.
+The honest gap that justifies the custom kernel: **the native op that matches our
+memory behavior (`embedding_bag`, which avoids the `[B,V,D]` intermediate) does not
+match our index structure (2-D argmax `s★`, per-half reduction keys); the native
+ops that match our index structure (`scatter_add`/`index_add`) do not match our
+memory behavior.** `torch.compile` fuses `gather`+elementwise but emits a *separate*
+atomic scatter (scatter is a documented Inductor fusion boundary, RFC pytorch#113232
+open; broken under deterministic mode pytorch#101105), so it does not close the gap today.
+
+### Finding 5 — environment availability
+
+On-venv probes: in-core primitives (`scatter_add_`/`scatter_reduce_`/`index_add_`/
+`gather`, `torch.sparse.mm` (cuSPARSE), `torch.segment_reduce`, `torch._grouped_mm`,
+`F.embedding_bag`) all work on sm_120, zero installs. Third-party specialist libs
+(`torch_scatter`/`torch_sparse`/PyG, DGL, FBGEMM) are **not installed**; PyG ships
+`+pt212cu132` wheels with native sm_120 SASS but built against *stable* torch 2.12,
+so ABI-risky against this NGC nightly (classic `undefined symbol`); DGL has no
+CUDA-13/sm_120 build; FBGEMM is cu130/sm_100. Blackwell 2:4 sparse tensor cores
+(`cusparseLt`) are hardware-present on sm_120 but the wrong sparsity class (regular
+2:4 vs our data-dependent selection) — categorically inapplicable.
+
+### Finding 6 — drill-down: the `torch.sparse` conversion tax, and adapting `embedding_bag`
+
+Probed on dev `B32 S128 D768 V30522`
+(`tests/data/runs/spmm_research/probe2_convert_and_embbag.py`); detail in the teaching
+doc's Appendix B.1.1/B.1.2.
+
+- **`torch.sparse` conversion tax = a sort.** Only the *sparse operand* needs building
+  (`embed`/`hidden` stay dense). For `hidden_grad = Gℓ·embed` that operand is `Gℓ`
+  `[B·S, V]`, whose rows (`b·S + s★`) are data-dependent → `to_sparse_csr()` must sort by
+  row + build `crow` (the same sort `optimized` already does). Measured: COO build +
+  `to_sparse_csr` **0.54 ms**, cuSPARSE `sparse.mm` **2.13 ms** → **2.67 ms for `hidden_grad`
+  alone** (vs ~1.0 ms for the whole fused backward), correctness ~2e-7. The conversion alone
+  (~half the fused backward) is pure formatting. Asymmetry: `embed_grad`'s transposed operand
+  `Gℓᵀ` `[V, B·S]` has dense rows (no sort), but then SpMM degenerates to a gather — a general
+  SpMM kernel doing `index_select`'s job (the "overkill" verdict, made concrete).
+- **`embedding_bag` fits `embed_grad` (memory-lean) but not `hidden_grad`.**
+  `embed_grad = Σ_b g·hidden[b,s★]` is exactly `embedding_bag(mode="sum", per_sample_weights)`
+  with table = hidden `[B·S,D]`, index = `b·S+s★`, weight = g, bag = v; setup is a transpose
+  (no sort). Measured: correct to ~2.7e-7, peak **297 MiB** vs the naive `[B,V,D]` gather's
+  **6072 MiB** (~20× leaner — it avoids the intermediate), but 1.2 ms for `embed_grad` alone
+  (already > the whole fused backward). `hidden_grad`'s destinations `(b, s★)` are
+  data-dependent with variable collision sizes, so using `embedding_bag` there still needs the
+  destination sort, and its index roles are transposed vs the stock op (token-id + fixed
+  offsets). Net: simpler code + a real memory win for the `embed_grad` half, but the sort and
+  the cross-gradient fusion remain — consistent with Finding 4.
+
+### Finding 7 — CUDA core vs Tensor Core (can the three compute kernels use tensor cores?)
+
+The three backward kernels (`embed_grad_kernel`, `uniform_hidden_grad_kernel`,
+`mixed_hidden_grad_kernel`) contain **zero `tl.dot`** → they run on **CUDA cores only**
+(compute = `exp`/FMA/`tl.sum`/`tl.cumsum`/`atomic_add`); the forward uses `tl.dot` →
+tensor cores. 【本机实测 · ncu sm_120】`optimized_fwd_kernel` tensor-pipe instructions
+**3,145,728** (DRAM ~8%, compute-bound); `embed_grad_kernel` tensor-pipe instructions
+**0**, L2 throughput **~95%** (memory-bound) — matching §6.5 / §6.6. **Tensor cores would not
+help:** (1) the matmul is sparse (density `1/S`) → a dense MMA wastes ≈`S`× MACs
+(`S` = 128–256 here), far exceeding the ~order-of-magnitude tensor-core throughput edge;
+2:4 structured / block-sparse / grouped-GEMM don't fit the one-nonzero-per-column selection;
+(2) the kernels are memory-bound (gather/scatter/L2), and MMA only raises *compute*
+throughput; (3) arithmetic intensity ≈ 1 (no operand reuse for MMA to amortize). This is the
+architectural dual of the tensor-core forward — detail in the teaching doc's Appendix C.
+
+### Finding 8 — multi-dimensional L2 binder analysis (what "L2-bound" actually means)
+
+Pressed on "what causes the L2 bottleneck," profiled multi-dimensionally
+(`tests/data/runs/spmm_research/probe3_l2_analysis.py` + `ncu_target.py`), leading with
+sector **counts** + achieved bandwidth + **wall-clock perturbations** because sm_120 L2 SOL%
+is denominator-suspect (Blackwell-SOL note). Detail in the teaching doc's Appendix D.
+
+- **Two different binders, not one.** Per-kernel (real-ish `B16 S256 D768 V250002`, do_bench):
+  `uniform_hidden_grad` 1.26 ms (~43%, dominant), `embed_grad` 0.88 ms (~30%),
+  `mixed_hidden_grad` 0.53 ms (~18%), `torch.sort` ~0.24 ms (~8%).
+- **`embed_grad` = L2-bandwidth-bound by the hidden gather.** ncu: 218.2M L2 sectors (89%
+  reads), L1 hit **4.8%** / L2 hit **88.4%** (gather misses L1, collision re-reads served by
+  L2), DRAM only 768 MB / 42%. Achieved L2 BW = 6.98 GB / 0.914 ms = **7.64 TB/s** = the card's
+  L2 ceiling (saturated). Perturbations: NO_GATHER **0.54×** (gather is the binder), LOAD_ONLY
+  0.95× and FMA_INJECT free to ×4 (compute is *not* the binder), time ∝ D. This also resolves
+  the M13 §4 conservative floor: real L2 BW ≈ **7.6 TB/s**, not the 6.6 used there.
+- **`uniform_hidden_grad` = L2-latency-exposed, NOT bandwidth.** Similar 194M L2 sectors but
+  achieves only **4.37 TB/s** (57% of embed's 7.64 ceiling) and the highest memory-latency
+  stalls (`long_scoreboard` 14.4 vs embed's 6.7); `lts__throughput` SOL ~60% (matches §6.6's
+  61–67%). The persistent grid-stride loop's serialized per-chunk chain (keys→min/max→
+  uniformity→`embed` gather→reduce→atomic) exposes latency without saturating bandwidth.
+- **Falsification respected:** each conclusion lists the dimension that would refute it
+  (compute-bound signs absent for embed; uniform never reaches the bandwidth ceiling), and a
+  single SOL% (embed's 107% — a >100% artifact) would have mislabeled both. Residual levers:
+  embed at the L2 floor → cut gather re-read traffic (collision locality); uniform → ILP /
+  occupancy to hide latency, not bandwidth.
+
+### Finding 9 — memory-hierarchy reuse: smem usage + duplicate-read factors
+
+Following "low L1 hit → is smem unused, and how often is the same row re-read?" (ncu, real-ish;
+detail in teaching-doc Appendix E):
+
+- **smem is used only as reduction scratch, not a data cache.** `shared_ld`/`shared_st`
+  instructions are nonzero (embed 16.1M/7.1M, uniform 21.8M/23.3M) — the `tl.sum`/`tl.cumsum`
+  cross-warp exchange — but the gathered `hidden`/`embed` tiles flow through **global loads**
+  (l1tex 205M/208M sectors) → registers, never staged in smem. So **0× of the data reuse is
+  captured in smem**, and L1 captures only **4.8%/9.3%** (scattered gather + no staging) → the
+  reuse falls to L2.
+- **Duplicate-read factors (measured):** `hidden` is re-read **~977× (=V/S)**, `embed`
+  **~16× (=B)**. Where each duplicate is served diverges on working-set fit (L2 = **96 MiB**):
+  `hidden` (6.3 MB) **fits** → ~977× reuse served almost entirely by L2 (L2 hit 88.4%), DRAM
+  read ~1× (the 768 MB DRAM is the embed_grad fp32 *write*, not hidden). `embed` (384 MB)
+  **exceeds** L2 → ~14× from L2 but ~**2.3× spills to DRAM** (DRAM read ≈ 888 MB ≈ 2.3× the
+  384 MB unique).
+- **Lever:** the reuse is pinned at L2 (the App-D binder), not L1/smem. Capturing it in-SM needs
+  group-by-destination staging for `hidden` (its 977× reuse is cross-CTA/cross-SM today because
+  embed_grad uses the unsorted (b,v) grid, so per-SM smem can't catch it) or V-blocking for
+  `embed` (to cluster its 16× cross-batch reuse). Both are profile-first, not committed.
+
+### Decision
+
+Keep the hand-written `optimized` backward for production (wins on both time and
+VRAM at SPLADE's `V` scale). The native `gather+scatter_add` form is a good
+**correctness oracle / maintenance-cost baseline** (≈10 lines, zero deps,
+deterministic-capable; the runnable cousin of Appendix A's einsum). Re-evaluate if
+`torch.compile` lands single-pass scatter fusion (pytorch#113232). No production
+change; teaching doc gains Appendix B.
+
+## Post-M13 — dot-reduction backward landing (2026-06-26)
+
+**Stack: RTX 5090 / sm_120 / torch 2.12 / Triton 3.7.1 / CUDA 13.2** (re-measured;
+the M11/M13 numbers above were Triton 3.6.0 — different stack, not smoothed). Full
+experimental record lives in the gitignored scratch (`tests/data/runs/bwd_opt/`);
+user-visible summary in [../CHANGELOG.md](../CHANGELOG.md) 2026-06-26.
+
+### What landed
+`optimized.py` uniform pass: the per-chunk reduce `sum_k g[k]·embed[v[k],:]`
+(previously a `tl.sum` over the gathered embed tile) is now a **block-scaled
+compensated `tl.dot`** — `g` as a `[MPAD=16, CHUNK=64]` matrix (only row 0 live) ×
+the gathered `[CHUNK, BLOCK_D]` embed tile. Plus the **mixed launch retune**
+(BLOCK_D 128→64, SUB 64→32, num_stages 2→3; kernel body unchanged, exact same
+cumsum). Op schema, saved-tensor set, and atomic ownership unchanged (schema-safe
+in-place swap). Autotune family re-tuned for the dot (winner BLOCK_D=128/s3/w4 added
+— the old `tl.sum` family lacked it).
+
+### Mechanism (why it's faster)
+Feeding the gathered tile to a `tl.dot` lets the matmul software-pipeliner
+multi-buffer it via **cp.async → smem** (confirmed in the landed SASS: the uniform
+kernel emits `LDGSTS`, vs the old `tl.sum`'s synchronous `LDG`). This moves the
+uniform pass off the **L1TEX/load-issue bound onto the L2-BW bound** (ncu, doc:
+L1TEX 83→66, L2 61→77, SM 37→79). **Range-safety:** `g` is fp32; casting it straight
+to fp16 overflows under AMP loss-scaling (GradScaler 2^16) and underflows on large
+scores, so it is block-scaled per chunk (`s=max|g|`, `gs=g/s`, hi/lo fp16 split, `×s`)
+— fp16 *and* bf16 safe, fp64 rel err ~3e-7 (≈ the prior `tl.sum`).
+
+### Measured (real records, bench_backward, end-to-end op)
+| record | old optimized | landed | speedup |
+|---|---|---|---|
+| query S24 | 2.27 ms | 2.04 ms | **1.11×** |
+| doc S192  | 2.79 ms | 2.46 ms | **1.13×** |
+
+Per-pass (profile_baseline, landed): the mixed retune is the larger relative win
+(query mixed 155→92 µs, doc 370→239 µs); the dot trims the uniform; embed_grad
+unchanged at its reuse floor. `mono` A/B preserved (optimized 2.3–4× faster).
+
+### Squeeze round — WS / TMA / persistent all tried, none help (mechanistic, not one bad set)
+Per the directive to exhaust persistent / tensor-descriptor(TMA) / warp-specialization
+*jointly* before landing (`tests/data/runs/bwd_opt/probe_uniform_dot_opt.py`: WS ×
+stages{2–5} × warps{4,8} × BLOCK_D{64,128,256} × CTA-cap{256–4096}):
+- **Best = BLOCK_D=128 / stages=3 / warps=4 / cap=4096** = the landed config. Nothing beat it.
+- **Persistent "more per CTA" (lower CTA-cap) is monotonically WORSE** — the pass is
+  L2-BW-bound, so it wants *more* concurrent CTAs (outstanding loads), not fewer-with-more-work.
+- **Warp specialization: 192/192 configs fail to compile.** Root-caused with 3 minimal
+  kernels: auto-WS fails even without the atomic and even with contiguous pointer loads;
+  it only compiles when the operand comes from a **TMA-descriptor `.load()`** (as the
+  forward does). So pure-Triton auto-WS *requires* TMA loads.
+- **TMA: structurally inapplicable.** `TensorDescriptor.load([off])` is a contiguous box;
+  the uniform pass reads `embed[v[chunk],:]` — 64 dest-sorted v's scattered across all V,
+  not a box. TMA-gather is Gluon-only (removed at M13). WS+TMA are blocked by the *same*
+  iron-law scatter that blocks Track B's load-once. (The matmul-densify formulation reads
+  embed contiguously so TMA/WS apply, but its S× MAC waste is an algorithmic floor — doc
+  192× — so it can't beat production and regresses doc; not viable.)
+
+### Validation gates (all green)
+- Full pytest: **135 passed** — incl. `test_backward_uniform_chunk_path_matches_closed_form`
+  (atol=1e-4, *forces the uniform path*), `test_backward_mono_matches_optimized` (fp16+bf16 × bias),
+  nontiny shapes, autocast, noncontiguous.
+- `bench_backward --impls optimized,mono,dot_bs_mix` real query+doc fp16+bf16: **0 failures**;
+  `dot_bs_mix` ≈ 0.99–1.00× the landed `optimized` (faithful inlining of the validated prototype).
+- `bench_backward --sources uniform,zipf` SYNTHETIC (f=0.10, mixed-dominant ~40% regime), fp16+bf16:
+  **0 failures** for the safe impls; `optimized` is faster than `mono` (~1.02–1.17×) and faster than
+  the *fixed-config* `dot_bs_mix` prototype (the landed uniform autotune adapts the config to the
+  synthetic shape — cross-regime robustness). The fp16-only `dot_fp16_mix` is ~1.06–1.11× faster here
+  (the dot-mixed advantage is large where mixed dominates) but **fails the bf16 verify** (unsafe), and
+  the range-safe `dot_bs_bsmix` (block-scaled dot-mixed) is ~3–8% *slower* than the landed cumsum
+  mixed — so no production-grade (fp16+bf16+AMP-safe + ≤1e-4-precise) dot-mixed beats the exact cumsum
+  on either regime (precise dot ⇒ hi/lo 2-dot overhead; fast dot ⇒ imprecise/unsafe). Cumsum stays.
+- `probe_training_smoke` (fp16+bf16 AMP, 150 steps): loss 2.78→0.011, optimized/hybrid parity
+  rel-diff ≤ 0.0034 — the block-scale range-safety holds end-to-end.
+- `dump_backward_ir`: compiles with the new `MPAD` signature + retuned mixed (0 failures).
+- compute-sanitizer (B4 S33 D64 V2048, non-divisible-D path): **memcheck 0 errors, racecheck 0
+  hazards**. initcheck flags a benign false-positive on `embed_grad.norm()`'s internal cudaMemcpy
+  (`torch.empty` output + masked vectorized stores; `mono`'s zero-init output is clean) — an
+  allocator NaN-poison test confirms embed_grad/bias_grad/hidden_grad are fully written (no NaN
+  leaks), so coverage is complete; the flag is independent of this change (embed kernel untouched).
+
+### Residual / what's next
+Uniform pass now L2-BW-bound (~77%); embed_grad (27–31%) at its hidden-reuse traffic floor
+(perturbation: NO_GATHER slower, COMPUTE_2X free) [refined 2026-06-26 to **output-write-DRAM-bound**
+— see "embed_grad guard removal" below]. The v-ordered "read embed once" win
+(262 µs load floor, 5.6× under production) is real but un-capturable on this GPU (RMW wall +
+99 KB smem hard cap — NOT the 228 KB the prior handover assumed). Reopening needs a
+≥228 KB datacenter Blackwell + hand-written CUDA/CUTLASS single-writer segmented SpMM (cross-framework).
+
+**RESOLVED 2026-06-26 — dtype-aware compensation (see the next memo).** The dtype-blind
+compensation flagged here was settled empirically and landed: bf16 now uses NO-SCALE
+compensated (≤ block-scale error, exact on representable g, ~3% faster), fp16/fp32 keep
+block-scale, and compensation became a user option (`SPARTON_BWD_COMPENSATE`). The
+"bf16-hi/fp16-lo for fp16" idea was **measured and REFUTED** — `tl.dot`'s operand-dtype
+matching forces `e→bf16` (7 mantissa bits), ~25000× worse; block-scale stays the fp16 path.
+The dot-mixed revisit is likewise closed-negative for bf16 (no-scale dot-mixed still loses
+to cumsum). Full evidence below.
+
+## Post-M13 — dtype-aware compensation (2026-06-26)
+
+**Stack: RTX 5090 / sm_120 / torch 2.12 / Triton 3.7.1 / CUDA 13.2.** Resolves the
+"compensation is dtype-blind" suboptimality flagged after the dot-reduction landing. Full
+experimental record in the gitignored scratch (`tests/data/runs/bwd_opt/`:
+`probe_dtype_compensation.py`, `probe_comp_uniform_speed.py`); user summary in
+[../CHANGELOG.md](../CHANGELOG.md) 2026-06-26.
+
+### The question
+The dot-reduction landing used ONE reduce path for both dtypes — block-scaled compensated
+(per-chunk `s=max|g|`, `gs=g/s`, model-dtype hi/lo, `×s`). Two hypotheses to settle
+empirically **before** touching the core: (1) bf16 needs no block-scale (its 8-bit exponent
+already spans g's fp32 range); (2) a cleaner fp16 split is bf16-hi / fp16-lo.
+
+### What the measurement showed
+`probe_dtype_compensation.py` — pure-torch model of the per-chunk reduce, relative L2 error
+vs an fp64 reference (e at model dtype is the real weight, so error is operand-rounding only),
+4000 chunks/cell across normal/amp/wide/**nice**(exactly-representable)/outlier g-regimes:
+
+| model | variant | median relerr | note |
+|---|---|---|---|
+| bf16 | block-scale | 2.2e-6 | the landed path |
+| bf16 | no-scale comp | 2.4e-6 | = block-scale on random; **0.0 on representable g** |
+| fp16 | block-scale | 6.3e-8 | excellent, range-safe |
+| fp16 | bf16hi/fp16lo | 1.7e-3 | **~25000× WORSE — refuted** |
+
+- **Hypothesis 1 CONFIRMED (with nuance).** bf16 no-scale is ≤ block-scale error in every
+  regime: equal on random/gaussian g (~2.2e-6, nothing exactly representable), and strictly
+  better — down to EXACT (0.0) — on representable g (the `nice` regime), because block-scale's
+  `g/s` breaks an otherwise-exact value. So block-scaling bf16 injects gratuitous error for
+  zero range benefit. This is the mechanism the maintainer intuited; it is *hidden* on messy
+  data and *visible* on clean data.
+- **Hypothesis 2 REFUTED.** bf16-hi/fp16-lo is ~25000× worse for fp16: `tl.dot` needs matching
+  operand dtypes, so the bf16 hi-term forces `e→bf16` (7 mantissa bits) and that degraded embed
+  dominates (~1.7e-3, ≈ plain bf16). The fp16 lo-term corrects g, not e. fp16 block-scale (which
+  keeps e at full fp16) is far better and stays. fp16 no-scale/non-comp confirm the AMP range
+  failure (3806/4000 inf).
+
+### Speed
+`probe_comp_uniform_speed.py` — uniform kernel only, identical bd/w/s, order-rotated +
+warmup-discarded (RTX 5090 do_bench is order/thermal-biased): no-scale (COMP=1) is **3.4–7.0%
+faster** than block-scale on the uniform pass (it drops the per-chunk max-reduce + `1/s` + `×s`),
+dtype-independent (pure arithmetic removal). The earlier end-to-end bench showing no-scale
+*slower* was the autotuner confound (production `optimized` autotunes; the prototype is
+fixed-config). End-to-end bf16 (bench_backward, same real records, same seed, COMP 2→1):
+
+| record | block-scale ms | no-scale ms | speedup |
+|---|---|---|---|
+| query S24 | 2.075 | 1.985 | 1.045× |
+| query S32 ×2 | 2.106 / 2.048 | 2.045 / 1.983 | 1.030 / 1.033× |
+| doc S192 ×2 / S256 | 2.402 / 2.324 / 2.482 | 2.339 / 2.255 / 2.421 | 1.027 / 1.031 / 1.025× |
+
+**~2.5–4.5% faster bf16 backward end-to-end on captured-real, every record.** (These
+end-to-end rows are single-shot per record, so they carry the card's run-to-run do_bench
+noise; the order-rotated repeated-median **3.4–7% uniform-pass** figure is the rigorous
+number — the end-to-end table corroborates its direction and rough magnitude, and the win
+is consistent across all six records.)
+
+### What landed
+`optimized.py` uniform reduce gains a `COMP_MODE: tl.constexpr` (2=block-scale, 1=no-scale comp,
+0=non-comp) routed host-side by `_resolve_uniform_comp_mode(embed.dtype)`: **bf16 → 1, fp16/fp32
+→ 2**. fp16/fp32 are byte-identical to the prior landing (only bf16 changes). Compensation is now
+a user knob: `SPARTON_BWD_COMPENSATE=0` selects COMP_MODE=0 (faster, but bf16 ~1e-3 imprecise and
+fp16+AMP range-unsafe) with a one-time `RuntimeWarning`. Op schema, saved-tensor set, atomic
+ownership, and the complement invariant are unchanged.
+
+### dot-mixed revisit (closed — documented negative, now for bf16 too)
+The block-scale tax (3–7%) was why the range-safe dot-mixed (`dot_bs_bsmix`) lost to cumsum at
+the dot-reduction landing. Removing it (no-scale comp dot-mixed, `dot_comp_dotcomp`, bf16) does
+NOT fix it: slower-or-equal to cumsum on synthetic (75/100% density) AND every real record. The
+dot-mixed's only speed win (`dot_fp16_mix`, 6–11%) came purely from being a SINGLE
+non-compensated dot (unsafe); with compensation (2 dots) it always loses. Cumsum stays the mixed
+pass on every dtype/regime.
+
+### Validation (all green)
+- pytest **135 passed** (forced-uniform-path, bf16+fp16 × bias, autocast, noncontiguous,
+  mono-matches-optimized).
+- bench_backward optimized vs mono, fp16+bf16, synthetic (uniform,zipf) + real: **0 failures**.
+- probe_training_smoke (fp16+bf16 AMP, 300 steps): optimized↔hybrid parity rel-diff fp16 0.0004,
+  **bf16 0.0024** — the no-scale path is range-safe under real GradScaler.
+- compute-sanitizer (B4 S33 D64 V2048, both dtypes): memcheck/racecheck/initcheck **0 errors**.
+- dump_backward_ir: 0 failures; SASS confirms `cm1` (bf16) / `cm2` (fp16) routing, both LDGSTS.
+- `SPARTON_BWD_COMPENSATE=0`: routes COMP_MODE=0, warns once, executes finite.
+
+### Residual
+bf16 is now error-optimal (≤ block-scale, exact on representable g) and ~3% faster; fp16 stays
+block-scale-bound (the scale tax is the price of fp16 range safety — no cheaper range-safe scheme
+survives, bf16hi/fp16lo refuted). The uniform pass remains L2-BW-bound and embed_grad at its reuse
+floor (unchanged by this work).
+
+## Post-M13 — embed_grad guard removal + bound re-profile (2026-06-26)
+
+**Stack: RTX 5090 / sm_120 / torch 2.12 / Triton 3.7.1 / CUDA 13.2.** Prompted by two maintainer
+questions on `embed_grad_kernel`: could its reduce use `tl.dot`, and is `if tl.sum(tl.abs(g)) != 0:`
+the best guard? Both led to a fresh profile that corrects a stale bound. Scratch:
+`tests/data/runs/bwd_opt/probe_embed_grad_guard.py`, `probe_embed_grad_bound.py`, `ncu_embed_grad.py`.
+User summary: [../CHANGELOG.md](../CHANGELOG.md) 2026-06-26.
+
+### Can the reduce be a tl.dot? No.
+`embed_grad[v,d] = Σ_b g[b,v]·hidden[b, idx[b,v], d]` is the einsum `bv,bvd→vd` — `v` is a BATCH axis
+(each v gathers its own `[B,D]` hidden slice via the per-(b,v) idx), not a contraction. It's a batched
+GEMV, not a shared-operand GEMM; `tl.dot` can't express it in one call (a per-v loop would be M=1,
+15/16 MMA padding, K=B≤32, and lose the `[BLOCK_V,BLOCK_D]` vectorization). Moot anyway — see the bound.
+
+### Bound re-profile (corrects the stale "L2-bound at 85%")
+Per the RTX 5090 SOL caveat (L2 %s denominator-suspect), the binder is do_bench perturbation, ncu
+corroborates. On real query+doc, no-guard kernel, fixed cfg:
+- **compute is pure slack**: compute_2x/4x = 1.00–1.05× (doubling the multiply-reduce is free).
+- **the hidden gather is secondary**: NO_GATHER recovers only 21% (query) / 39% (doc); it issues
+  6.1 GB of loads from a 0.6–4.7 MB footprint (1300–10000× reuse → L2-served, not DRAM).
+- **the floor is the V×D fp32 OUTPUT WRITE**: NO_GATHER's ~460 µs floor = 768 MB at DRAM BW;
+  **ncu `dram__bytes.sum = 762 MB ≈ the 768 MB write`** (≈100% of DRAM traffic), DRAM SOL 62%.
+
+So embed_grad is **output-write-DRAM-bound**, not gather/L2-bound as the old note said (it conflated
+the L2 gather with the DRAM write). The write is the irreducible gradient itself; the only lever is
+fewer output bytes (bf16 output → 384 MB), a numerics-contract change, out of scope. No compute
+reformulation can help (slack) — which is also why the `tl.dot` question is moot.
+
+### The guard was a pessimization — removed
+`probe_embed_grad_guard.py` (3 variants at identical cfg, order-rotated; skip rate computed host-side):
+| case | skip rate | no-guard | sum-guard | max-guard | guard cost |
+|---|---|---|---|---|---|
+| real-query | 0.0% | 601 µs | 712 | 711 | +18% |
+| real-doc | 0.0% | 782 µs | 836 | 837 | +7% |
+| uniform/zipf f=0.10 | 0.0% | 114 µs | 149 | 149 | +30% |
+| uniform f=0.01 | 0.7% | 112 µs | 149 | 149 | +33% |
+
+The guard skips only a WHOLE all-zero `[BLOCK_B,BLOCK_V]` tile, which needs no active vocab in the
+window across all BLOCK_B batch rows — at B≥16 that ~never happens (0% on real act=1.0; 0.7% even at
+f=0.01). Meanwhile it costs a `[BLOCK_B,BLOCK_V]` reduction **recomputed per d-tile** (12× for D=768)
+for a skip that never fires. `sum` and `max` are identical (the spelling never mattered — the guard's
+existence did). Removed; the per-lane `gather_mask=(g!=0)` is the actual (and only needed) suppression
+— inactive lanes read 0 and contribute 0.
+
+### Measured (end-to-end, real, bf16, same seed, guard→no-guard)
+Query (r0–r2): 1.985→1.927, 2.045→1.954, 1.983→1.898 = **~3–4% faster**. Doc (r3–r5): 2.339→2.327,
+2.255→2.248, 2.421→2.413 = **~0.3–0.5% (within noise)**. The win is **query-weighted**: embed_grad is a
+meaningful fraction of the short query backward, a small fraction of the doc backward (uniform/mixed-
+dominated). Strict not-worse, dtype-independent. (A mixed-dtype `--dtypes fp16,bf16` run showed a
+2.97 ms spike on the first 1–2 bf16 cells — a COMP_MODE recompile/autotune warmup artifact, gone under
+matching bf16-only conditions; not a regression.)
+
+### Validation (all green)
+pytest **135 passed**; bench_backward optimized-vs-mono fp16+bf16 real **0 failures** (gradients
+unchanged — the guard only skipped no-ops); compute-sanitizer (B4 S33 D64 V2048, both dtypes)
+memcheck/racecheck/initcheck **0 errors** (the now-unconditional gather is fully masked for inactive
+lanes); dump_backward_ir 0 failures; training smoke fp16 0.0004 / bf16 0.0024 (identical to before).
+
+### Residual
+embed_grad is at its **output-write floor** (768 MB fp32, ~430 µs DRAM, irreducible without a
+bf16-output contract change). Compute slack, gather L2-served. No further Triton lever.

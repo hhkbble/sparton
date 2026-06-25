@@ -569,14 +569,28 @@ fp32 from the saved `(scores, idx, hidden, embed, bias)`. Stages:
    passes consume. (Stages 1–3 are the `_bwd_shared_stages` helper, folded into
    `backward/optimized.py` alongside the two hidden-grad passes.)
 4. **Two complementary hidden-grad passes** at one shared CHUNK granularity:
-   - a **vectorized uniform-chunk streaming pass**
-     (`uniform_hidden_grad_kernel`): branch-free, pipelined; deposits exactly
-     the single-destination chunks. Autotuned, but **CHUNK is pinned to 64**
-     across the family.
+   - a **uniform-chunk streaming pass** (`uniform_hidden_grad_kernel`):
+     branch-free, pipelined; deposits exactly the single-destination chunks.
+     Its per-chunk reduce `sum_k g[k]·embed[v[k],:]` is a **dtype-aware
+     compensated `tl.dot`** (`g` as a `[MPAD=16, CHUNK]` matrix with only row 0
+     live × the gathered `[CHUNK, BLOCK_D]` embed tile): feeding the gathered
+     tile to a dot lets the matmul software-pipeliner multi-buffer it via
+     cp.async, relieving the L1TEX/load-issue bound (→ L2-BW-bound) and
+     overlapping the reduce. `g` is fp32 and enters the model-dtype MMA via a
+     hi/lo split for fp32-grade precision; how it is brought into operand range
+     is the `COMP_MODE` constexpr, resolved host-side from the dtype
+     (`_resolve_uniform_comp_mode`): **fp16/fp32 block-scale** (per-chunk
+     `s=max|g|`, `×s`) because g overflows fp16 under AMP loss-scaling, **bf16
+     skips the scale** (its 8-bit exponent already spans fp32 range — faster and
+     ≤ error). Both range-safe under fp16+bf16 AMP. `SPARTON_BWD_COMPENSATE=0`
+     opts into a single non-compensated dot (faster, precision-degraded, unsafe).
+     Autotuned (`BLOCK_D` = the dot's N, ≥64), but **CHUNK is pinned to 64** (the
+     complement granularity *and* the dot's K).
    - a **mixed-chunk segmented scan** (`mixed_hidden_grad_kernel`): deposits
      exactly the rest (the run-boundary chunks). It is **not** autotuned — it
      runs at the uniform winner's `best_config` CHUNK as its `GRANULE`,
-     processing each granule in `SUB`-row segmented-scan tiles.
+     processing each granule in `SUB`-row segmented-scan tiles (launch retuned
+     to BLOCK_D=64 / SUB=32 / num_stages=3).
 
    `hidden_grad` is zero-filled; the two passes contribute ~two partial-sum
    atomics per destination run (the atomic structure is preserved from the M11
@@ -736,6 +750,46 @@ residual:** the uniform-pass LTS ≈ 61–67% (config-dependent) vs the embed
 kernel's 82–104%, plus the short-run regimes capped by the mixed fraction.
 Atomics are no longer a bottleneck anywhere (L2 reduction sectors down 27.7×
 dev / 51.7× corner / 264× real query record vs pre-M11).
+
+**Post-M13 dot landing (2026-06-26).** The uniform pass's per-chunk reduce was
+landed as a block-scaled compensated `tl.dot` (the matmul pipeliner multi-buffers
+the embed gather via cp.async): it moves the uniform pass off the L1TEX/load-issue
+bound onto the L2-BW bound (L1TEX 83→66, L2 61→77, SM 37→79; the landed SASS shows
+`LDGSTS` cp.async on the gather). The mixed launch was retuned (BLOCK_D 128→64,
+SUB 64→32, num_stages 2→3, exact same cumsum). Net **~1.11–1.13× end-to-end on real
+records** (query 2.27→2.04 ms, doc 2.79→2.46 ms), range-safe under fp16+bf16 AMP,
+gate-clean (135 tests + mono A/B). An exhaustive joint sweep (warp-specialization ×
+num_stages × num_warps × BLOCK_D × CTA-cap) found no further gain on this pass:
+auto-WS structurally requires TMA-descriptor loads, which the data-dependent
+scattered embed gather cannot be (the same iron-law scatter that blocks load-once;
+TMA-gather is Gluon-only), and the pass being L2-BW-bound wants *more* concurrent
+CTAs, not larger ones. **New terminal backward residual:** uniform pass L2-BW-bound
+(~77%) + the embed kernel at its output-write-DRAM-bound floor (DEVELOPMENT.md
+"Post-M13 dot backward"; bound refined from "L2-bound" + guard removed 2026-06-26, see below).
+
+**Post-M13 dtype-aware compensation (2026-06-26).** The single block-scaled reduce above
+is now dtype-routed (`COMP_MODE`, host-side from `embed.dtype`): **bf16 uses no-scale
+compensated** (its exponent already spans g's fp32 range, so block-scaling only adds a
+max-reduce + `1/s` + `×s`, and can *increase* error on representable g) — measured ≤
+block-scale error in every regime and **~2.5–4.5% faster bf16 backward** on captured-real;
+**fp16/fp32 keep block-scale** (the price of fp16 range safety; the bf16-hi/fp16-lo
+alternative was refuted — `tl.dot` operand matching degrades the embed ~25000×). The
+mixed pass stays the exact cumsum (the dot-mixed loses on every dtype/regime). Compensation
+is a user knob (`SPARTON_BWD_COMPENSATE=0` → non-compensated, faster, unsafe). Gate-clean
+(135 tests, mono A/B, training-smoke AMP parity, compute-sanitizer). Evidence:
+DEVELOPMENT.md "dtype-aware compensation".
+
+**Post-M13 embed_grad guard removal + bound correction (2026-06-26).** A fresh perturbation
+profile (do_bench NO_GATHER / COMPUTE_Nx, ncu corroboration) re-binds embed_grad and **corrects
+the "hidden-reuse / L2-bound" note above**: it is **output-write-DRAM-bound** — the V×D fp32 store
+is ≈100% of DRAM traffic (ncu 762/768 MB), the hidden gather is L2-served and only 21–39% of time,
+and compute is pure slack. (So the `tl.dot`-reduce question is moot — no compute lever exists, and
+the reduce is a batched GEMV `bv,bvd→vd`, not a GEMM.) The never-firing `tl.sum(tl.abs(g))` tile-skip
+guard was **removed**: it skipped only all-zero `[BLOCK_B,BLOCK_V]` tiles (~never at B≥16: 0% on real,
+0.7% at f=0.01) while costing a per-d-tile reduction (+7–33% on the pass). End-to-end **~3–4% faster on
+query**, within-noise on doc (query-weighted — embed_grad is a larger fraction of the short query
+backward). The per-lane `gather_mask=(g!=0)` is the only suppression. Gate-clean (135 tests, mono A/B,
+sanitizer, training smoke). Evidence: DEVELOPMENT.md "embed_grad guard removal".
 
 ### 6.7 Operative deferral: host launch overhead
 

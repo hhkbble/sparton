@@ -2,7 +2,11 @@
 
 The current best hidden-grad design: a branch-free uniform-chunk streaming pass over
 single-destination chunks plus a run-boundary scan over the rest, fed by a shared prep
-pipeline. Mechanism and measured evidence: docs/DEVELOPMENT.md (M13 backward).
+pipeline. The uniform pass expresses its per-chunk reduce as a dtype-aware compensated
+tl.dot so the matmul software-pipeliner multi-buffers the embed gather via cp.async
+(L1TEX->L2-bound; range-safe for fp16+bf16 under AMP -- fp16 block-scales, bf16 skips the
+scale). Mechanism and measured evidence: docs/DEVELOPMENT.md (M13 backward, the post-M13
+dot-reduction landing, and the dtype-aware compensation refinement).
 
 Prep stages (before the hidden-grad pass), inside the custom op:
   1. ``bwd_prep_kernel``: ``g = grad_out * exp(-scores)`` where ``scores > 0`` (the
@@ -16,10 +20,62 @@ shared CHUNK granularity so each contribution is deposited once, which is why th
 kernel is NOT autotuned and runs at the uniform winner's CHUNK.
 """
 
+import os
+import warnings
+from typing import Optional, Tuple
+
 import triton
 import triton.language as tl
 import torch
-from typing import Optional, Tuple
+
+# One-time guard for the non-compensated opt-out warning. Fires on the first backward
+# call that selects it, never at import -- preserves the silent-import invariant.
+_WARNED_NO_COMP = False
+
+
+def _compensation_enabled() -> bool:
+    """Whether the uniform reduce compensates g's fp32->model-dtype rounding (default ON).
+
+    Opt out with SPARTON_BWD_COMPENSATE=0/off/false/no to select the faster
+    non-compensated reduce -- precision-degraded (bf16 ~1e-3) and fp16+AMP
+    range-unsafe. A user-facing knob (maintainer request, 2026-06-26).
+
+    Deliberately a DENYLIST (unrecognized value -> compensation ON), unlike the
+    forward's default-on allowlist flags: this guards fp16 range safety, so a typo
+    must NOT silently disable it. Do not "unify" this to an allowlist.
+    """
+    return os.environ.get("SPARTON_BWD_COMPENSATE", "on").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+def _resolve_uniform_comp_mode(embed_dtype) -> int:
+    """Pick the dtype-aware uniform-reduce compensation mode (the COMP_MODE constexpr).
+
+    The reduce ``sum_k g[k]*embed[v[k]]`` runs as a model-dtype ``tl.dot``; ``g`` is
+    fp32 and must be brought into the operand dtype. How depends on the dtype's
+    exponent range (2026-06-26 study, DEVELOPMENT.md "dtype-aware compensation"):
+
+      2 = block-scaled compensated -- fp16 (and fp32): g overflows fp16 under AMP
+          loss-scaling, so a per-chunk ``s=max|g|`` scales it into range (``*s`` restores).
+      1 = no-scale compensated     -- bf16: its 8-bit exponent already spans the fp32
+          range, so block-scaling buys no range safety, only adds a max-reduce + ``1/s``
+          + ``*s`` (and can *increase* error on exactly-representable g). hi/lo only.
+      0 = non-compensated          -- opt-out only (single dot, fastest, unsafe).
+    """
+    global _WARNED_NO_COMP
+    if not _compensation_enabled():
+        if not _WARNED_NO_COMP:
+            _WARNED_NO_COMP = True
+            warnings.warn(
+                "SPARTON_BWD_COMPENSATE is off: the optimized backward's uniform "
+                "reduce is non-compensated -- faster, but bf16 gradients are ~1e-3 "
+                "imprecise and fp16+AMP is range-unsafe (may produce NaN/Inf).",
+                RuntimeWarning, stacklevel=2,
+            )
+        return 0
+    if embed_dtype == torch.bfloat16:
+        return 1
+    return 2
 
 
 @triton.jit
@@ -95,8 +151,13 @@ def get_embed_grad_bwd_configs():
 # embed_grad[v-tile, d-tile] patch and loops over the batch, so the stores
 # need no atomics and no zero-initialized output (every element is written
 # exactly once by construction — the d-axis is program_id(0) so consecutive
-# CTAs share one v-tile's g/idx stream in L2). g != 0 is a correct skip
-# condition regardless of why g is zero: a zero g contributes nothing.
+# CTAs share one v-tile's g/idx stream in L2). Inactive (g==0) lanes are masked
+# out of the gather and contribute 0, so the per-lane mask is the only
+# suppression needed -- there is NO tile-level skip guard: the pass is
+# output-write-DRAM-bound (V*D fp32 stores ~= the entire DRAM traffic; ncu 762/768
+# MB) with compute slack, and an all-zero [BLOCK_B,BLOCK_V] g-tile ~never occurs at
+# B>=16, so a `tl.sum(tl.abs(g))` guard only adds a per-d-tile reduction for a skip
+# that never fires (measured 2026-06-26: +7-33% on the pass — do not re-add it).
 @triton.autotune(
     configs=get_embed_grad_bwd_configs(),
     key=['batch_size', 'vocab_size', 'hidden_dim'],
@@ -136,19 +197,20 @@ def embed_grad_kernel(
         bv_offs = offs_b[:, None] * vocab_size + offs_v[None, :]
 
         g = tl.load(g_ptr + bv_offs, mask=bv_mask, other=0.0)
-        if tl.sum(tl.abs(g)) != 0:
-            idx = tl.load(idx_ptr + bv_offs, mask=bv_mask, other=0).to(tl.int64)
-            h_offs = (
-                offs_b[:, None, None] * (seq_len * hidden_dim)
-                + idx[:, :, None] * hidden_dim
-                + offs_d[None, None, :]
-            )
-            gather_mask = (g != 0)[:, :, None] & mask_d[None, None, :]
-            hidden_tile = tl.load(hidden_ptr + h_offs, mask=gather_mask, other=0.0).to(tl.float32)
-            acc_e += tl.sum(hidden_tile * g[:, :, None], axis=0)
-            if HAS_BIAS:
-                if pid_d == 0:
-                    acc_bias += tl.sum(g, axis=0)
+        idx = tl.load(idx_ptr + bv_offs, mask=bv_mask, other=0).to(tl.int64)
+        h_offs = (
+            offs_b[:, None, None] * (seq_len * hidden_dim)
+            + idx[:, :, None] * hidden_dim
+            + offs_d[None, None, :]
+        )
+        # Inactive (g==0) lanes read 0 (other=0.0) and contribute 0 — the per-lane
+        # mask is the only suppression needed (no tile-level guard; see header).
+        gather_mask = (g != 0)[:, :, None] & mask_d[None, None, :]
+        hidden_tile = tl.load(hidden_ptr + h_offs, mask=gather_mask, other=0.0).to(tl.float32)
+        acc_e += tl.sum(hidden_tile * g[:, :, None], axis=0)
+        if HAS_BIAS:
+            if pid_d == 0:
+                acc_bias += tl.sum(g, axis=0)
 
     vd_offs = offs_v[:, None] * hidden_dim + offs_d[None, :]
     tl.store(embed_grad_ptr + vd_offs, acc_e, mask=vd_mask)
@@ -256,20 +318,27 @@ def _bwd_shared_stages(
 
 
 def get_uniform_hidden_grad_configs():
-    # Branch-free streaming kernel. CHUNK is pinned to 64 across the family:
-    # the mixed fraction scales with the shared granule (m ~ runs*CHUNK/N),
-    # so a larger uniform-side CHUNK silently multiplies the mixed pass's
-    # coverage and forces its scan tile register-heavy (measured at
-    # GRANULE=256 as a 1.30 ms mixed pass doing ~3% of the work — DEVELOPMENT.md
-    # M13 §5.4 item 4). At CHUNK=64 the extra chunk-partial atomics are ~2% of
-    # kernel bytes on the doc shape — the cheaper side of the trade by an
-    # order of magnitude.
+    # Branch-free streaming kernel whose per-chunk reduce is a dtype-aware
+    # compensated tl.dot (the matmul software-pipeliner multi-buffers the embed
+    # gather via cp.async, relieving the L1TEX/load-issue bound -> L2-BW-bound).
+    # CHUNK is pinned to 64 across the family (it is also the dot's K): the mixed
+    # fraction scales with the shared granule (m ~ runs*CHUNK/N), so a larger
+    # uniform-side CHUNK silently multiplies the mixed pass's coverage and forces
+    # its scan tile register-heavy (GRANULE=256 measured a 1.30 ms mixed pass
+    # doing ~3% of the work — DEVELOPMENT.md M13 §5.4 item 4). BLOCK_D is the dot's
+    # N (>= 64, a valid MMA shape with M=MPAD=16, K=CHUNK=64). The 2026-06-26 joint
+    # sweep (probe_uniform_dot_opt.py: WS x stages x warps x BLOCK_D x CTA-cap)
+    # found BLOCK_D=128 / num_stages=3 / num_warps=4 the winner on real query+doc;
+    # warp specialization is structurally unavailable here (auto-WS needs
+    # TMA-descriptor loads, the dot's embed gather is a data-dependent scatter) and
+    # a smaller persistent CTA grid measured worse (the pass is L2-BW-bound and
+    # wants more concurrent CTAs).
     return [
-        triton.Config({'CHUNK': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
-        triton.Config({'CHUNK': 64, 'BLOCK_D': 64}, num_stages=2, num_warps=8),
-        triton.Config({'CHUNK': 64, 'BLOCK_D': 128}, num_stages=3, num_warps=8),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 128}, num_stages=3, num_warps=4),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 128}, num_stages=4, num_warps=4),
         triton.Config({'CHUNK': 64, 'BLOCK_D': 128}, num_stages=2, num_warps=4),
-        triton.Config({'CHUNK': 64, 'BLOCK_D': 256}, num_stages=2, num_warps=8),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'CHUNK': 64, 'BLOCK_D': 256}, num_stages=3, num_warps=8),
     ]
 
 
@@ -278,10 +347,21 @@ def get_uniform_hidden_grad_configs():
 # chunk-partial atomic per single-destination chunk and suppresses the
 # atomic otherwise. Mixed chunks (and the live/sentinel seam) are completed
 # by mixed_hidden_grad_kernel; the two predicates are exact complements at
-# the shared CHUNK granularity so each contribution is deposited exactly
-# once. Suppression is folded into the load MASKS, not a branch: a branch
-# around the tile load re-anchors its layout and de-vectorizes the gather
-# (DEVELOPMENT.md M13 §5.4 items 1 and 6).
+# the shared CHUNK granularity so each contribution is deposited exactly once.
+#
+# The per-chunk reduce sum_k g[k]*embed[v[k],:] is expressed as a tl.dot
+# (g as a [MPAD, CHUNK] matrix with only row 0 live, times the gathered
+# [CHUNK, BLOCK_D] embed tile): feeding the gathered tile to a dot lets the
+# matmul software-pipeliner multi-buffer it via cp.async -> async-copy into
+# smem, relieving the L1TEX/load-issue bound and overlapping the reduce
+# (L1TEX 83->66, L2 61->77; DEVELOPMENT.md "Post-M13 dot backward"). g is fp32
+# and must enter the model-dtype MMA; how is DTYPE-AWARE (COMP_MODE, resolved
+# host-side by _resolve_uniform_comp_mode -- 2026-06-26 study). fp16 BLOCK-SCALES
+# (per-chunk s=max|g|, hi/lo split, *s) because g overflows fp16 under AMP; bf16
+# skips the scale (its exponent already spans fp32 range) for a faster, never-worse
+# hi/lo reduce. Both are range-safe + fp32-grade (fp64 rel err ~2e-6, ~= the prior
+# tl.sum). Suppression stays folded into the load MASK (always-masked, since the dot
+# consumes the tile and a non-divisible-D tail must be zero-padded, not garbage).
 @triton.autotune(
     configs=get_uniform_hidden_grad_configs(),
     key=['batch_size', 'seq_len', 'vocab_size', 'hidden_dim'],
@@ -302,6 +382,8 @@ def uniform_hidden_grad_kernel(
     hidden_dim: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    MPAD: tl.constexpr,        # dot M-pad (16 = MMA min M); only row 0 of g carries the reduce
+    COMP_MODE: tl.constexpr,   # 2=block-scaled (fp16), 1=no-scale comp (bf16), 0=non-comp (opt-out)
 ):
     pid_chunk = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -312,6 +394,7 @@ def uniform_hidden_grad_kernel(
 
     offs_d = (pid_d * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
     mask_d = offs_d < hidden_dim
+    m_rows = tl.arange(0, MPAD)
 
     for chunk in tl.range(pid_chunk, n_chunks, num_ctas):
         offs_i = chunk * CHUNK + tl.arange(0, CHUNK)
@@ -323,14 +406,43 @@ def uniform_hidden_grad_kernel(
         row_on = in_range & is_uniform
         g = tl.load(g_ptr + offs_i, mask=row_on, other=0.0)
         v = tl.load(v_ptr + offs_i, mask=row_on, other=0).to(tl.int64)
+        # Gather the chunk's embed rows (always-masked: the dot consumes this tile,
+        # so masked-out lanes / the non-divisible-D column tail must read 0).
         a_ptrs = embed_ptr + v[:, None] * hidden_dim + offs_d[None, :]
-        if hidden_dim % BLOCK_D == 0:
-            val = tl.load(a_ptrs, mask=row_on[:, None], other=0.0).to(tl.float32)
+        e_tile = tl.load(a_ptrs, mask=row_on[:, None] & mask_d[None, :], other=0.0)
+        # Dtype-aware compensated reduce as a tl.dot (the matmul software-pipeliner
+        # multi-buffers the embed gather via cp.async). g[CHUNK] is placed on row 0 of
+        # an [MPAD, CHUNK] matrix; the 2-term hi/lo split recovers fp32-grade precision
+        # through the model-dtype MMA. COMP_MODE varies only how g enters operand range.
+        if COMP_MODE == 2:
+            # Block-scaled (fp16/fp32 range safety): g is fp32 and overflows fp16 under
+            # AMP loss-scaling, so per-chunk s=max|g| brings it into range; *s restores
+            # magnitude. s guards an all-zero-g chunk.
+            gabs = tl.max(tl.where(row_on, tl.abs(g), 0.0))
+            s = tl.where(gabs > 0.0, gabs, 1.0)
+            gs = g * (1.0 / s)
+            g_hi = gs.to(e_tile.dtype)
+            g_lo = (gs - g_hi.to(tl.float32)).to(e_tile.dtype)
+            ghi = tl.where(m_rows[:, None] == 0, g_hi[None, :], 0.0).to(e_tile.dtype)
+            glo = tl.where(m_rows[:, None] == 0, g_lo[None, :], 0.0).to(e_tile.dtype)
+            out = (tl.dot(ghi, e_tile, out_dtype=tl.float32)
+                   + tl.dot(glo, e_tile, out_dtype=tl.float32)) * s
+        elif COMP_MODE == 1:
+            # No-scale compensated (bf16): bf16's exponent already spans the fp32 range,
+            # so the hi/lo split alone is range-safe -- no max-reduce, no 1/s, no *s
+            # (which would only add roundings, increasing error on representable g).
+            g_hi = g.to(e_tile.dtype)
+            g_lo = (g - g_hi.to(tl.float32)).to(e_tile.dtype)
+            ghi = tl.where(m_rows[:, None] == 0, g_hi[None, :], 0.0).to(e_tile.dtype)
+            glo = tl.where(m_rows[:, None] == 0, g_lo[None, :], 0.0).to(e_tile.dtype)
+            out = (tl.dot(ghi, e_tile, out_dtype=tl.float32)
+                   + tl.dot(glo, e_tile, out_dtype=tl.float32))
         else:
-            val = tl.load(a_ptrs, mask=row_on[:, None] & mask_d[None, :],
-                          other=0.0).to(tl.float32)
-        val = val * g[:, None]
-        partial = tl.sum(val, axis=0)
+            # Non-compensated (opt-out): a single dot, fastest, but precision-degraded
+            # (bf16 ~1e-3) and fp16+AMP range-unsafe. Resolved host-side; never default.
+            g_mat = tl.where(m_rows[:, None] == 0, g[None, :], 0.0).to(e_tile.dtype)
+            out = tl.dot(g_mat, e_tile, out_dtype=tl.float32)
+        partial = tl.sum(tl.where(m_rows[:, None] == 0, out, 0.0), axis=0)
         tl.atomic_add(
             hidden_grad_ptr + keys_min.to(tl.int64) * hidden_dim + offs_d,
             partial, mask=is_uniform & mask_d, sem="relaxed",
@@ -454,17 +566,19 @@ def optimized_bwd(
         seq_len=S,
         vocab_size=V,
         hidden_dim=D,
+        MPAD=16,
+        COMP_MODE=_resolve_uniform_comp_mode(embed.dtype),
     )
 
     # The mixed pass must run at the uniform kernel's selected granularity
     # (complement invariant — see the kernel comments); the selection is
-    # read host-side from the autotuner, no sync. Its working tile and
-    # launch shape are fixed (SUB <= 64 rows, BLOCK_D=128, 4 warps): the
-    # pass covers only mixed granules, so it stays off the critical path
-    # at the 168-register class instead of inheriting the uniform winner's
-    # shape.
+    # read host-side from the autotuner, no sync. Its working tile and launch
+    # shape are fixed and retuned (SUB=32, BLOCK_D=64, 4 warps, 3 stages — the
+    # 2026-06-26 sweep; the old 128/64/2 was register-bound, +1.34–1.65× on the
+    # mixed pass, exact same cumsum): the pass covers only mixed granules, so it
+    # stays off the critical path rather than inheriting the uniform winner's shape.
     granule = uniform_hidden_grad_kernel.best_config.kwargs['CHUNK']
-    sub = min(granule, 64)
+    sub = min(granule, 32)
     # The complement invariant is config-family-conventional; make it
     # self-enforcing against future config edits (a non-multiple GRANULE
     # would truncate the mixed kernel's static_range and drop lanes).
@@ -482,8 +596,8 @@ def optimized_bwd(
         hidden_dim=D,
         GRANULE=granule,
         SUB=sub,
-        BLOCK_D=128,
+        BLOCK_D=64,
         num_warps=4,
-        num_stages=2,
+        num_stages=3,
     )
     return hidden_grad, embed_grad, bias_grad

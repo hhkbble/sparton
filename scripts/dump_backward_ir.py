@@ -124,6 +124,7 @@ def main() -> int:
 
     import sparton.api as sk
     from sparton.backward.optimized import (
+        _resolve_uniform_comp_mode,
         bwd_gather_payload_kernel,
         bwd_prep_kernel,
         embed_grad_kernel,
@@ -179,8 +180,9 @@ def main() -> int:
         elt = torch.empty(8, device=dev, dtype=dtype)
         kw = cfg.kwargs
         if label == "uniform":
+            comp_mode = _resolve_uniform_comp_mode(dtype)  # production mode for this dtype
             tag = (f"uniform__{name}__CHUNK{kw['CHUNK']}_BD{kw['BLOCK_D']}"
-                   f"_w{cfg.num_warps}_s{cfg.num_stages}")
+                   f"_w{cfg.num_warps}_s{cfg.num_stages}_cm{comp_mode}")
             if tag in seen:
                 continue
             seen.add(tag)
@@ -188,21 +190,21 @@ def main() -> int:
                 keys_ptr=i32, g_ptr=f32, v_ptr=i32, embed_ptr=elt,
                 hidden_grad_ptr=f32, n_active_ptr=i32, total=8, batch_size=1,
                 seq_len=8, vocab_size=8, hidden_dim=D, CHUNK=kw['CHUNK'],
-                BLOCK_D=kw['BLOCK_D'], num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages, grid=(1, 1))
+                BLOCK_D=kw['BLOCK_D'], MPAD=16, COMP_MODE=comp_mode,
+                num_warps=cfg.num_warps, num_stages=cfg.num_stages, grid=(1, 1))
             dump_compiled(tag, compiled, out_dir, args.nvdisasm, failures)
             # The mixed pass runs at the uniform winner's granularity
-            # (complement invariant) with its fixed launch shape.
+            # (complement invariant) with its fixed retuned launch shape.
             granule = kw['CHUNK']
-            sub = min(granule, 64)
-            mtag = f"mixed__{name}__GR{granule}_SUB{sub}_BD128_w4_s2"
+            sub = min(granule, 32)
+            mtag = f"mixed__{name}__GR{granule}_SUB{sub}_BD64_w4_s3"
             if mtag not in seen:
                 seen.add(mtag)
                 compiled = mixed_hidden_grad_kernel.warmup(
                     keys_ptr=i32, g_ptr=f32, v_ptr=i32, embed_ptr=elt,
                     hidden_grad_ptr=f32, total=8, batch_size=1, seq_len=8,
                     vocab_size=8, hidden_dim=D, GRANULE=granule, SUB=sub,
-                    BLOCK_D=128, num_warps=4, num_stages=2, grid=(1,))
+                    BLOCK_D=64, num_warps=4, num_stages=3, grid=(1,))
                 dump_compiled(mtag, compiled, out_dir, args.nvdisasm, failures)
         else:
             tag = (f"embed__{name}__BB{kw['BLOCK_B']}_BV{kw['BLOCK_V']}"
